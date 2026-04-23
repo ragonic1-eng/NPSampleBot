@@ -1,0 +1,20 @@
+# Secrets — never commit
+.env
+service_account.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs
+*.log
+
+# Local investigation / one-off scripts
+_*.py
+_*.csv
+_*.json
+NPSampleBotSkills/
+SETUP.md
+run.bat

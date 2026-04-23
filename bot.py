@@ -408,6 +408,67 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Diagnostic: bypasses auth, directly reports what the bot can read
+    from the Authorized Users tab. Used to debug 'not authorized' problems."""
+    u = update.effective_user
+    your_id = str(u.id)
+    your_uname = (u.username or "").lstrip("@").lower()
+
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    lines = [
+        "<b>🩺 Diagnostic report</b>",
+        f"Bot version: <code>{h(config.BOT_VERSION)}</code>",
+        f"Your ID: <code>{h(your_id)}</code>",
+        f"Your username: <code>@{h(your_uname or '(none)')}</code>",
+        "",
+        f"SA JSON env: <code>{'SET' if sa_json else 'MISSING'} (len={len(sa_json)})</code>",
+        f"OPS_SHEET_ID: <code>{h(config.OPS_SHEET_ID[:12] + '…' if config.OPS_SHEET_ID else 'MISSING')}</code>",
+    ]
+
+    try:
+        users = await asyncio.to_thread(sheets.load_users, True)
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"\n❌ <b>load_users() failed:</b> <code>{h(str(e)[:300])}</code>")
+        await send(update, "\n".join(lines))
+        return
+
+    lines.append(f"\n✅ Loaded <b>{len(users)}</b> row(s) from Authorized Users tab.")
+
+    if users:
+        # Show column headers actually present in the sheet.
+        headers = list(users[0].keys())
+        lines.append(f"Columns: <code>{h(', '.join(headers))}</code>")
+
+    # Look for matching row.
+    match_idx = -1
+    for i, row in enumerate(users, start=2):  # sheet row numbers start at 2
+        rid = str(row.get("Telegram User ID", "")).strip()
+        rname = str(row.get("Telegram Username", "")).lstrip("@").lower().strip()
+        if rid == your_id or (rname and rname == your_uname):
+            match_idx = i
+            active = str(row.get("Active", "")).strip()
+            lines.append(
+                f"\n🎯 Found you at sheet row <b>{i}</b>:\n"
+                f"  • ID cell: <code>{h(rid or '(empty)')}</code>\n"
+                f"  • Username cell: <code>{h(rname or '(empty)')}</code>\n"
+                f"  • Active cell: <code>{h(active or '(empty)')}</code>"
+            )
+            if active.lower() not in {"y", "yes", "true", "1"}:
+                lines.append(f"⚠️ Active is <b>{h(active)}</b> — must be <code>Y</code> to authorize.")
+            break
+    if match_idx == -1:
+        lines.append(
+            "\n❌ <b>Your ID/username is NOT in the sheet.</b>\n"
+            "Add a row to the 'Authorized Users' tab with:\n"
+            f"  • Telegram Username: <code>@{h(your_uname)}</code>\n"
+            f"  • Telegram User ID: <code>{h(your_id)}</code>\n"
+            "  • Active: <code>Y</code>"
+        )
+
+    await send(update, "\n".join(lines))
+
+
 async def cmd_reload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _authorized(update):
         return
@@ -2467,6 +2528,7 @@ def main():
     app.add_handler(CommandHandler("samples", cmd_samples))
     app.add_handler(CommandHandler("bulk", cmd_bulk))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)

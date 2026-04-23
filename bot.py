@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -332,9 +333,10 @@ async def _authorized(update: Update) -> bool:
         # first hit.
         ok = await asyncio.to_thread(sheets.is_user_authorized, user.id, user.username)
     except Exception as e:  # noqa: BLE001
-        log.exception("auth check failed: %s", e)
+        log.exception("auth check failed for uid=%s uname=%s: %s", user.id, user.username, e)
         ok = False
     if not ok:
+        log.warning("auth denied: uid=%s uname=%s", user.id, user.username)
         await send(
             update,
             "🔒 You are not authorized to use this bot.\n\n"
@@ -2429,6 +2431,22 @@ def main():
             log.error(e)
         raise SystemExit("Fix your .env and re-run.")
 
+    # Startup diagnostics — shows in Railway logs so we can verify config.
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    log.info(
+        "DIAG: GOOGLE_SERVICE_ACCOUNT_JSON=%s (len=%d)",
+        "SET" if sa_json else "MISSING",
+        len(sa_json),
+    )
+    log.info(
+        "DIAG: OPS_SHEET_ID=%s",
+        (config.OPS_SHEET_ID[:12] + "…") if config.OPS_SHEET_ID else "MISSING",
+    )
+    log.info(
+        "DIAG: SEASONING_SHEET_ID=%s",
+        (config.SEASONING_SHEET_ID[:12] + "…") if config.SEASONING_SHEET_ID else "MISSING",
+    )
+
     log.info("Ensuring ops tabs exist…")
     try:
         sheets.ensure_ops_tabs()
@@ -2458,7 +2476,8 @@ def main():
     # will refill on demand.
     log.info("Pre-warming caches…")
     try:
-        sheets.load_users()
+        users = sheets.load_users()
+        log.info("DIAG: Authorized Users tab loaded — %d row(s)", len(users))
         sheets.load_seasonings()
         sheets.load_customer_master()
         sheets.load_customers()

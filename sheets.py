@@ -399,6 +399,87 @@ def _open_master():
     return _get_client().open_by_key(config.SEASONING_SHEET_ID)
 
 
+# ---- Sync metadata (last /updatesamplelist run) ----
+
+_SYNC_META_TAB = "_sync_meta"
+_SYNC_KEY_LAST_RUN = "sample_master_last_sync_utc"
+
+
+def _open_sync_meta_ws():
+    """Get (or create+hide) the tiny _sync_meta tab used for cooldown state.
+
+    Two-column layout: col A = key, col B = ISO UTC timestamp. We hide it so
+    it doesn't clutter the user's tab bar but still accepts programmatic R/W.
+    """
+    sh = _open_master()
+    try:
+        return sh.worksheet(_SYNC_META_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=_SYNC_META_TAB, rows=20, cols=2)
+        ws.update(range_name="A1", values=[["key", "value"]])
+        try:
+            # Hide the tab from the user's UI — cosmetic only.
+            sh.batch_update(
+                {
+                    "requests": [
+                        {
+                            "updateSheetProperties": {
+                                "properties": {
+                                    "sheetId": ws.id,
+                                    "hidden": True,
+                                },
+                                "fields": "hidden",
+                            }
+                        }
+                    ]
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("Could not hide _sync_meta tab: %s", e)
+        return ws
+
+
+def get_last_sample_sync():
+    """Return the UTC datetime of the last successful /updatesamplelist run,
+    or ``None`` if we've never recorded one."""
+    import datetime as _d
+    try:
+        ws = _open_sync_meta_ws()
+        for row in ws.get_all_values()[1:]:  # skip header
+            if len(row) >= 2 and row[0].strip() == _SYNC_KEY_LAST_RUN:
+                raw = row[1].strip()
+                if not raw:
+                    return None
+                try:
+                    return _d.datetime.fromisoformat(raw)
+                except ValueError:
+                    return None
+    except Exception as e:  # noqa: BLE001
+        log.warning("get_last_sample_sync failed: %s", e)
+    return None
+
+
+def set_last_sample_sync(when) -> None:
+    """Upsert the last-run timestamp (UTC ISO) into _sync_meta."""
+    import datetime as _d
+    try:
+        ws = _open_sync_meta_ws()
+        iso = (
+            when.astimezone(_d.timezone.utc).replace(microsecond=0).isoformat()
+            if when.tzinfo
+            else when.replace(microsecond=0).isoformat() + "+00:00"
+        )
+        rows = ws.get_all_values()
+        for i, row in enumerate(rows[1:], start=2):  # header is row 1
+            if len(row) >= 1 and row[0].strip() == _SYNC_KEY_LAST_RUN:
+                ws.update(range_name=f"A{i}:B{i}", values=[[_SYNC_KEY_LAST_RUN, iso]])
+                return
+        ws.append_row([_SYNC_KEY_LAST_RUN, iso])
+    except Exception as e:  # noqa: BLE001
+        # Never let meta-write failure abort a successful sync.
+        log.warning("set_last_sample_sync failed: %s", e)
+
+
 def load_sample_master() -> tuple[list[str], list[list[str]]]:
     """Return (header, rows) for the master tab. Creates tab if missing."""
     sh = _open_master()

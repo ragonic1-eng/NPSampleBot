@@ -421,9 +421,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines += [
             "",
             "<b>Admin</b>",
-            "/updatesamplelist — sync Sample Master List 2024-Present from MMS",
+            "/updatesamplelist — sync Sample Master List 2024-Present from MMS "
+            "(24h cooldown; append <code>force</code> to override)",
         ]
     await send(update, "\n".join(lines))
+
+
+SAMPLE_SYNC_COOLDOWN_HOURS = 24
 
 
 async def cmd_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -432,6 +436,9 @@ async def cmd_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     Fetches Sample Date Out from SAMPLE_UPDATE_START (default 2026-03-01)
     through today, upserts by Product Code, and fills Flavour Profile +
     Taste describe via Claude for genuinely new products only.
+
+    Rate-limited: refuses to re-sync within 24h of the last successful run
+    unless invoked as ``/updatesamplelist force``.
     """
     if not await _authorized(update):
         return
@@ -439,10 +446,14 @@ async def cmd_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if not _is_update_sample_owner(user):
         await send(update, "🔒 This command is restricted.")
         return
-    await _run_update_sample_list(update, ctx)
+    args = (ctx.args if hasattr(ctx, "args") else []) or []
+    force = any(a.lower() in {"force", "now", "--force"} for a in args)
+    await _run_update_sample_list(update, ctx, force=force)
 
 
-async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def _run_update_sample_list(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, force: bool = False
+):
     import datetime as _dt
 
     import mms_client
@@ -451,6 +462,31 @@ async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if not config.MMS_PASSWORD:
         await send(update, "⚠️ MMS_PASSWORD is not configured. Set it on Railway and redeploy.")
         return
+
+    # 24h cooldown — skip only if not forced.
+    if not force:
+        last = await asyncio.to_thread(sheets.get_last_sample_sync)
+        if last is not None:
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            age = now_utc - last
+            cooldown = _dt.timedelta(hours=SAMPLE_SYNC_COOLDOWN_HOURS)
+            if age < cooldown:
+                remaining = cooldown - age
+                hrs = int(remaining.total_seconds() // 3600)
+                mins = int((remaining.total_seconds() % 3600) // 60)
+                await send(
+                    update,
+                    "ℹ️ <b>Sample Master List is already up to date.</b>\n\n"
+                    f"Last synced: <b>{last.strftime('%d %b %Y %H:%M UTC')}</b>\n"
+                    f"Next auto-sync allowed in: <b>{hrs}h {mins}m</b>\n\n"
+                    "<i>MMS rarely changes within 24h, so we skip to save your "
+                    "API quota. If you truly need a fresh pull (e.g. you just "
+                    "edited MMS), run:</i>\n"
+                    "<code>/updatesamplelist force</code>",
+                )
+                return
 
     try:
         start_date = _dt.datetime.strptime(config.SAMPLE_UPDATE_START, "%Y-%m-%d").date()
@@ -549,6 +585,13 @@ async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     t_out = usage["output_tokens"]
     cost_usd = (t_in / 1_000_000) * 1.0 + (t_out / 1_000_000) * 5.0
 
+    # Record the successful run so the 24h cooldown starts ticking.
+    sync_time = datetime.now(timezone.utc)
+    try:
+        await asyncio.to_thread(sheets.set_last_sample_sync, sync_time)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not record last-sync timestamp: %s", e)
+
     lines = [
         "✅ <b>Sample Master List updated.</b>",
         "",
@@ -564,6 +607,10 @@ async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         f"↳ Input tokens: <b>{t_in:,}</b>",
         f"↳ Output tokens: <b>{t_out:,}</b>",
         f"💵 Est. cost: <b>US$ {cost_usd:.4f}</b>",
+        "",
+        f"<i>Next auto-sync allowed after "
+        f"{(sync_time + _dt.timedelta(hours=SAMPLE_SYNC_COOLDOWN_HOURS)).strftime('%d %b %Y %H:%M UTC')} "
+        f"· use /updatesamplelist force to bypass.</i>",
     ]
     await _set("\n".join(lines))
 

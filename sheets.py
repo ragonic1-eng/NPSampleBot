@@ -359,3 +359,158 @@ def load_sample_log(force: bool = False) -> list[dict[str, Any]]:
     out = ws.get_all_records()
     _samples_cache = (now, out)
     return out
+
+
+# ---------- Sample Master List 2024-Present (populated from MMS) ----------
+
+SAMPLE_MASTER_TAB = "Sample Master List 2024-Present"
+SAMPLE_MASTER_COLS = [
+    "Seasoning Name",
+    "Code",
+    "Country",
+    "Sales",
+    "R&D Price (USD)",
+    "Flavour Profile",
+    "Taste describe",
+]
+
+
+def _open_master():
+    """The sample-master tab lives inside the same file as SEASONING_SHEET_ID."""
+    return _get_client().open_by_key(config.SEASONING_SHEET_ID)
+
+
+def load_sample_master() -> tuple[list[str], list[list[str]]]:
+    """Return (header, rows) for the master tab. Creates tab if missing."""
+    sh = _open_master()
+    try:
+        ws = sh.worksheet(SAMPLE_MASTER_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(
+            title=SAMPLE_MASTER_TAB, rows=6000, cols=len(SAMPLE_MASTER_COLS)
+        )
+        ws.update(range_name="A1", values=[SAMPLE_MASTER_COLS])
+        return SAMPLE_MASTER_COLS[:], []
+
+    vals = ws.get_all_values()
+    if not vals:
+        ws.update(range_name="A1", values=[SAMPLE_MASTER_COLS])
+        return SAMPLE_MASTER_COLS[:], []
+
+    header = [str(c).strip() for c in vals[0]]
+    # Self-heal missing columns.
+    missing = [c for c in SAMPLE_MASTER_COLS if c not in header]
+    if missing:
+        header = header + missing
+        if ws.col_count < len(header):
+            ws.add_cols(len(header) - ws.col_count)
+        ws.update(range_name="A1", values=[header])
+
+    rows = [list(r) + [""] * (len(header) - len(r)) for r in vals[1:]]
+    return header, rows
+
+
+def upsert_sample_master(
+    incoming: list[dict[str, str]],
+    blurb_fn=None,
+) -> tuple[int, int]:
+    """Upsert rows into 'Sample Master List 2024-Present' keyed on Code.
+
+    ``incoming`` items look like::
+        {
+          "Seasoning Name": ..., "Code": ...,
+          "Country": ..., "Sales": ..., "R&D Price (USD)": ...,
+        }
+
+    Behaviour:
+      - Existing Code → refresh Seasoning Name / Country / Sales / Price with
+        the latest values. Flavour Profile and Taste describe are preserved
+        if already populated; filled via ``blurb_fn(code, name)`` if blank.
+      - New Code → append with a fresh Flavour Profile + Taste describe.
+      - Order in the sheet is preserved; new rows append at the bottom.
+
+    ``blurb_fn(code, name) -> (flavour_profile, taste_describe)`` is called
+    only when we actually need a blurb. Pass ``None`` to leave blanks.
+
+    Returns ``(added, updated)``.
+    """
+    header, existing_rows = load_sample_master()
+    # Ensure every canonical column has an index in the header.
+    idx = {name: header.index(name) for name in SAMPLE_MASTER_COLS}
+
+    # Build a lookup of existing rows by Code.
+    by_code: dict[str, int] = {}
+    for i, row in enumerate(existing_rows):
+        code = (row[idx["Code"]] if idx["Code"] < len(row) else "").strip()
+        if code:
+            by_code[code.upper()] = i
+
+    added = 0
+    updated = 0
+    for item in incoming:
+        code = (item.get("Code") or "").strip()
+        if not code:
+            continue
+        name = (item.get("Seasoning Name") or "").strip()
+        country = (item.get("Country") or "").strip()
+        sales = (item.get("Sales") or "").strip()
+        price = (item.get("R&D Price (USD)") or "").strip()
+
+        key = code.upper()
+        if key in by_code:
+            r = existing_rows[by_code[key]]
+            # Widen row to header length if needed.
+            if len(r) < len(header):
+                r = r + [""] * (len(header) - len(r))
+                existing_rows[by_code[key]] = r
+            changed = False
+            for col, val in (
+                ("Seasoning Name", name),
+                ("Country", country),
+                ("Sales", sales),
+                ("R&D Price (USD)", price),
+            ):
+                if val and r[idx[col]] != val:
+                    r[idx[col]] = val
+                    changed = True
+            # Fill blurb fields only if currently blank.
+            if blurb_fn is not None and name:
+                if not r[idx["Flavour Profile"]].strip() or not r[idx["Taste describe"]].strip():
+                    fp, td = blurb_fn(code, name)
+                    if fp and not r[idx["Flavour Profile"]].strip():
+                        r[idx["Flavour Profile"]] = fp
+                        changed = True
+                    if td and not r[idx["Taste describe"]].strip():
+                        r[idx["Taste describe"]] = td
+                        changed = True
+            if changed:
+                updated += 1
+        else:
+            new_row = [""] * len(header)
+            new_row[idx["Seasoning Name"]] = name
+            new_row[idx["Code"]] = code
+            new_row[idx["Country"]] = country
+            new_row[idx["Sales"]] = sales
+            new_row[idx["R&D Price (USD)"]] = price
+            if blurb_fn is not None and name:
+                fp, td = blurb_fn(code, name)
+                new_row[idx["Flavour Profile"]] = fp
+                new_row[idx["Taste describe"]] = td
+            existing_rows.append(new_row)
+            by_code[key] = len(existing_rows) - 1
+            added += 1
+
+    # Single batch write covering every data row.
+    sh = _open_master()
+    ws = sh.worksheet(SAMPLE_MASTER_TAB)
+    needed = len(existing_rows) + 1
+    if ws.row_count < needed:
+        ws.add_rows(needed - ws.row_count)
+
+    end_col = gspread.utils.rowcol_to_a1(1, len(header)).rstrip("1")
+    if existing_rows:
+        ws.update(
+            range_name=f"A2:{end_col}{len(existing_rows) + 1}",
+            values=existing_rows,
+        )
+    return added, updated

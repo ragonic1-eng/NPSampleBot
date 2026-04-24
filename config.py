@@ -29,6 +29,18 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 
 DRAFT_TIMEOUT_MINUTES = int(os.getenv("DRAFT_TIMEOUT_MINUTES", "30"))
 
+# MMS3 — credentials for /updatesamplelist (sync Sample Master List from MMS).
+# Only visible to the ragonic-gated command, never exposed to other users.
+MMS_USER = os.getenv("MMS_USER", "Alex").strip()
+MMS_PASSWORD = os.getenv("MMS_PASSWORD", "").strip()
+
+# Telegram username (without @) allowed to use /updatesamplelist.
+UPDATE_SAMPLE_OWNER = os.getenv("UPDATE_SAMPLE_OWNER", "ragonic").lstrip("@").lower()
+
+# Start date for /updatesamplelist — Mar 2026 overlap (catches late-arriving
+# rows from March that weren't in the historical PDF backfill).
+SAMPLE_UPDATE_START = os.getenv("SAMPLE_UPDATE_START", "2026-03-01").strip()
+
 # Tab names inside OPS_SHEET_ID
 TAB_CUSTOMERS = "Customers"
 TAB_SALES_LOG = "Sample request list from sales"

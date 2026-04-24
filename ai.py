@@ -117,6 +117,61 @@ async def _ask(prompt: str, max_tokens: int = 200, http_timeout: float = 20) -> 
         return "", 0, 0
 
 
+# ---------- Sample-master taste blurbs (V1.0.2 /updatesamplelist) ----------
+
+def _prompt_for_taste_blurb(code: str, name: str) -> str:
+    return (
+        "You are cataloging a seasoning product for an R&D reference sheet.\n"
+        f"Product code: {code}\n"
+        f"Product name: {name}\n\n"
+        "Return STRICT JSON only (no prose, no markdown fences), shape:\n"
+        "{\n"
+        '  "flavour_profile": "<6-10 word descriptor, e.g. \'Creamy cheese · mild chili heat\'>",\n'
+        '  "taste_describe": "<<=30 word sensory description using concrete keywords like '
+        "'vinegar sourness', 'capsicum chili spiciness', 'umami', 'smoky char', 'buttery', "
+        "'toasted garlic', 'lactic tang'. Describe the ACTUAL taste, no marketing fluff.>\"\n"
+        "}"
+    )
+
+
+def taste_blurb_sync(code: str, name: str) -> tuple[str, str]:
+    """Synchronous Claude-Haiku call used from the gspread thread.
+
+    Returns ("", "") on any failure so the sheet write never aborts. Haiku is
+    used (not Sonnet) because we typically hit this 3-20 times per run.
+    """
+    import config as _config
+
+    if not _config.ANTHROPIC_API_KEY or not name:
+        return "", ""
+    client = _claude()
+    if client is None:
+        return "", ""
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=200,
+            messages=[{"role": "user", "content": _prompt_for_taste_blurb(code, name)}],
+        )
+        text = "".join(
+            b.text for b in msg.content if getattr(b, "type", "") == "text"
+        ).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1:
+            return "", ""
+        data = json.loads(text[start : end + 1])
+        fp = str(data.get("flavour_profile", "")).strip()
+        td = str(data.get("taste_describe", "")).strip()
+        words = td.split()
+        if len(words) > 30:
+            td = " ".join(words[:30])
+        return fp, td
+    except Exception as e:  # noqa: BLE001
+        log.warning("taste_blurb_sync failed for %s: %s", code, e)
+        return "", ""
+
+
 # ---------- Bulk-paste parser (V0.4.0) ----------
 
 def _prompt_for_bulk_parse(

@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from telegram import (
+    BotCommand,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -349,23 +351,32 @@ async def _authorized(update: Update) -> bool:
 
 # --------------------------- commands ---------------------------
 
+def _is_update_sample_owner(user) -> bool:
+    """True only for the Telegram username allowed to run /updatesamplelist."""
+    uname = (getattr(user, "username", "") or "").lstrip("@").lower()
+    return bool(uname) and uname == config.UPDATE_SAMPLE_OWNER
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _authorized(update):
         return
     user = update.effective_user
     # Don't start a draft yet — wait for the user to pick "new request".
     state.clear(user.id)
+    menu = [
+        [("➕ Raise a new sample request", "menu:new")],
+        [("📄 Paste bulk request (multi-seasoning)", "menu:bulk")],
+        [("📋 Check samples I raised", "menu:samples")],
+    ]
+    if _is_update_sample_owner(user):
+        menu.append([("🔄 Update Sample Master List (MMS)", "menu:updsample")])
     await send(
         update,
         "👋 <b>Welcome to NPSampleBot</b>\n\n"
         f"⏱ Idle timeout: {config.DRAFT_TIMEOUT_MINUTES} min · "
         "◀ Back / ✖ Cancel anytime · /edit to jump to review\n\n"
         "What would you like to do?",
-        kb([
-            [("➕ Raise a new sample request", "menu:new")],
-            [("📄 Paste bulk request (multi-seasoning)", "menu:bulk")],
-            [("📋 Check samples I raised", "menu:samples")],
-        ]),
+        kb(menu),
     )
 
 
@@ -387,16 +398,150 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await send(
-        update,
-        "<b>NPSampleBot commands</b>\n"
-        "/start — main menu (new request or check samples)\n"
-        "/bulk — paste a multi-seasoning email and let me split it for you\n"
-        "/samples — list samples you've raised (today / this month)\n"
-        "/edit — jump to the draft review to change any field\n"
-        "/cancel — discard the current draft\n"
-        "/reload — refresh seasoning & customer lists from Google Sheets\n"
+    user = update.effective_user
+    lines = [
+        "<b>NPSampleBot — commands</b>",
+        "",
+        "<b>Main flow</b>",
+        "/start — main menu (new request · bulk paste · check samples)",
+        "/bulk — paste a multi-seasoning email, I split it into items",
+        "/samples — list samples you've raised (today / this month)",
+        "",
+        "<b>Drafting</b>",
+        "/edit — jump to the draft review to change any field",
+        "/cancel — discard the current draft",
+        "",
+        "<b>Utilities</b>",
+        "/reload — refresh seasoning & customer lists from Google Sheets",
         "/whoami — show your Telegram ID & username",
+        "/diag — diagnostic (shows what the bot can read from the Users tab)",
+        "/help — this message",
+    ]
+    if _is_update_sample_owner(user):
+        lines += [
+            "",
+            "<b>Admin</b>",
+            "/updatesamplelist — sync Sample Master List 2024-Present from MMS",
+        ]
+    await send(update, "\n".join(lines))
+
+
+async def cmd_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Sync 'Sample Master List 2024-Present' from MMS (ragonic-only).
+
+    Fetches Sample Date Out from SAMPLE_UPDATE_START (default 2026-03-01)
+    through today, upserts by Product Code, and fills Flavour Profile +
+    Taste describe via Claude for genuinely new products only.
+    """
+    if not await _authorized(update):
+        return
+    user = update.effective_user
+    if not _is_update_sample_owner(user):
+        await send(update, "🔒 This command is restricted.")
+        return
+    await _run_update_sample_list(update, ctx)
+
+
+async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    import datetime as _dt
+
+    import mms_client
+    import requests
+
+    if not config.MMS_PASSWORD:
+        await send(update, "⚠️ MMS_PASSWORD is not configured. Set it on Railway and redeploy.")
+        return
+
+    try:
+        start_date = _dt.datetime.strptime(config.SAMPLE_UPDATE_START, "%Y-%m-%d").date()
+    except ValueError:
+        start_date = _dt.date(2026, 3, 1)
+    end_date = _dt.date.today()
+
+    status = await update.effective_chat.send_message(
+        f"⏳ Logging into MMS…\nSyncing <b>{start_date.strftime('%d %b %Y')}</b> → "
+        f"<b>{end_date.strftime('%d %b %Y')}</b>\n\n<i>{config.BOT_VERSION}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    async def _set(msg: str) -> None:
+        try:
+            await status.edit_text(msg + f"\n\n<i>{config.BOT_VERSION}</i>", parse_mode=ParseMode.HTML)
+        except Exception:  # noqa: BLE001
+            pass
+
+    session = requests.Session()
+    try:
+        ok = await asyncio.to_thread(
+            mms_client.login, session, config.MMS_USER, config.MMS_PASSWORD
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("MMS login error: %s", e)
+        await _set(f"❌ MMS login error: <code>{h(str(e)[:200])}</code>")
+        return
+    if not ok:
+        await _set("❌ MMS login failed — check MMS_USER / MMS_PASSWORD env vars.")
+        return
+
+    await _set("✅ Logged into MMS.\n⏳ Fetching sample submissions…")
+    t0 = datetime.now(timezone.utc)
+    try:
+        rows = await asyncio.to_thread(
+            mms_client.fetch_all_samples, session, start_date, end_date
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("MMS fetch error: %s", e)
+        await _set(f"❌ MMS fetch failed: <code>{h(str(e)[:200])}</code>")
+        return
+
+    fetch_secs = (datetime.now(timezone.utc) - t0).total_seconds()
+    await _set(
+        f"✅ Pulled <b>{len(rows)}</b> MMS rows in {fetch_secs:.0f}s.\n"
+        "⏳ Dedup + upsert into Google Sheets…"
+    )
+
+    # Dedupe by Product Code — latest Sample Date Out wins (same rule as backfill).
+    best: dict[str, mms_client.SampleRow] = {}
+    for r in rows:
+        code = (r.product_code or "").strip()
+        if not code:
+            continue
+        d = r.sample_date_out_as_date() or _dt.date(1900, 1, 1)
+        prev = best.get(code)
+        if prev is None or (prev.sample_date_out_as_date() or _dt.date(1900, 1, 1)) < d:
+            best[code] = r
+
+    incoming = [
+        {
+            "Seasoning Name": r.product_name,
+            "Code": r.product_code,
+            "Country": r.country,
+            "Sales": r.sales,
+            "R&D Price (USD)": r.rd_price,
+        }
+        for r in best.values()
+    ]
+
+    t1 = datetime.now(timezone.utc)
+    try:
+        added, updated = await asyncio.to_thread(
+            sheets.upsert_sample_master, incoming, ai.taste_blurb_sync
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("Sheet upsert failed: %s", e)
+        await _set(f"❌ Sheet upsert failed: <code>{h(str(e)[:200])}</code>")
+        return
+
+    upsert_secs = (datetime.now(timezone.utc) - t1).total_seconds()
+    total_secs = (datetime.now(timezone.utc) - t0).total_seconds()
+    await _set(
+        f"✅ <b>Sample Master List updated.</b>\n\n"
+        f"Window: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}\n"
+        f"MMS rows pulled: <b>{len(rows)}</b>\n"
+        f"Unique products: <b>{len(incoming)}</b>\n"
+        f"➕ Added: <b>{added}</b>\n"
+        f"🔁 Refreshed: <b>{updated}</b>\n"
+        f"⏱ Fetch {fetch_secs:.0f}s · Upsert {upsert_secs:.0f}s · Total {total_secs:.0f}s"
     )
 
 
@@ -1356,6 +1501,14 @@ async def _handle_menu_callback(update, ctx, action: str):
         return
     if action == "bulk":
         await _start_bulk(update, ctx)
+        return
+    if action == "updsample":
+        # Ragonic-only guard — defense in depth; button is already hidden
+        # for everyone else at cmd_start.
+        if not _is_update_sample_owner(user):
+            await send(update, "🔒 This command is restricted.")
+            return
+        await _run_update_sample_list(update, ctx)
         return
 
 
@@ -2564,6 +2717,32 @@ def main():
     app.add_handler(CommandHandler("bulk", cmd_bulk))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("updatesamplelist", cmd_update_sample_list))
+
+    # Register Telegram's native blue slash-command menu so users see every
+    # function the bot offers when they tap '/'. /updatesamplelist is NOT in
+    # the default list (it's restricted), but we'll add it for @ragonic below
+    # via post_init once the bot is running.
+    async def _install_commands(application: Application) -> None:
+        default_cmds = [
+            BotCommand("start", "Main menu — new request / bulk / samples"),
+            BotCommand("bulk", "Paste a multi-seasoning email, I split it"),
+            BotCommand("samples", "List samples you've raised"),
+            BotCommand("edit", "Jump to the draft review to change a field"),
+            BotCommand("cancel", "Discard the current draft"),
+            BotCommand("reload", "Refresh seasoning / customer lists"),
+            BotCommand("whoami", "Show your Telegram ID & username"),
+            BotCommand("diag", "Diagnostics"),
+            BotCommand("help", "Show all commands"),
+        ]
+        try:
+            await application.bot.set_my_commands(
+                default_cmds, scope=BotCommandScopeDefault()
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("set_my_commands (default) failed: %s", e)
+
+    app.post_init = _install_commands
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)

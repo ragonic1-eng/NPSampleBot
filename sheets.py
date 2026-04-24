@@ -370,9 +370,28 @@ SAMPLE_MASTER_COLS = [
     "Country",
     "Sales",
     "R&D Price (USD)",
+    "Sample Date Out",
     "Flavour Profile",
     "Taste describe",
 ]
+
+
+def _parse_iso_date(s: str):
+    """Best-effort parse of Sample Date Out strings. Returns ``date`` or None.
+
+    Accepts ISO (YYYY-MM-DD), ``dd-MMM-yyyy`` (MMS style like ``02-Apr-2024``),
+    ``dd/mm/yyyy`` and a couple of other common shapes. Never raises.
+    """
+    import datetime as _d
+    s = (s or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d %b %Y", "%d-%m-%Y"):
+        try:
+            return _d.datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def _open_master():
@@ -455,6 +474,7 @@ def upsert_sample_master(
         country = (item.get("Country") or "").strip()
         sales = (item.get("Sales") or "").strip()
         price = (item.get("R&D Price (USD)") or "").strip()
+        date_out = (item.get("Sample Date Out") or "").strip()
 
         key = code.upper()
         if key in by_code:
@@ -473,6 +493,15 @@ def upsert_sample_master(
                 if val and r[idx[col]] != val:
                     r[idx[col]] = val
                     changed = True
+            # Sample Date Out: only overwrite if incoming is strictly newer —
+            # prevents an older PDF re-parse from clobbering a newer MMS date.
+            if date_out:
+                existing_date = _parse_iso_date(r[idx["Sample Date Out"]])
+                new_date = _parse_iso_date(date_out)
+                if new_date is not None and (existing_date is None or new_date > existing_date):
+                    if r[idx["Sample Date Out"]] != date_out:
+                        r[idx["Sample Date Out"]] = date_out
+                        changed = True
             # Fill blurb fields only if currently blank.
             if blurb_fn is not None and name:
                 if not r[idx["Flavour Profile"]].strip() or not r[idx["Taste describe"]].strip():
@@ -492,6 +521,7 @@ def upsert_sample_master(
             new_row[idx["Country"]] = country
             new_row[idx["Sales"]] = sales
             new_row[idx["R&D Price (USD)"]] = price
+            new_row[idx["Sample Date Out"]] = date_out
             if blurb_fn is not None and name:
                 fp, td = blurb_fn(code, name)
                 new_row[idx["Flavour Profile"]] = fp

@@ -511,6 +511,10 @@ async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         if prev is None or (prev.sample_date_out_as_date() or _dt.date(1900, 1, 1)) < d:
             best[code] = r
 
+    def _iso(r: mms_client.SampleRow) -> str:
+        d = r.sample_date_out_as_date()
+        return d.isoformat() if d else (r.sample_date_out or "").strip()
+
     incoming = [
         {
             "Seasoning Name": r.product_name,
@@ -518,6 +522,7 @@ async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             "Country": r.country,
             "Sales": r.sales,
             "R&D Price (USD)": r.rd_price,
+            "Sample Date Out": _iso(r),
         }
         for r in best.values()
     ]

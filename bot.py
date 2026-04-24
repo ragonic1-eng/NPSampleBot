@@ -528,6 +528,7 @@ async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ]
 
     t1 = datetime.now(timezone.utc)
+    ai.reset_blurb_usage()  # so the totals below only reflect THIS run
     try:
         added, updated = await asyncio.to_thread(
             sheets.upsert_sample_master, incoming, ai.taste_blurb_sync
@@ -539,15 +540,32 @@ async def _run_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     upsert_secs = (datetime.now(timezone.utc) - t1).total_seconds()
     total_secs = (datetime.now(timezone.utc) - t0).total_seconds()
-    await _set(
-        f"✅ <b>Sample Master List updated.</b>\n\n"
-        f"Window: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}\n"
-        f"MMS rows pulled: <b>{len(rows)}</b>\n"
-        f"Unique products: <b>{len(incoming)}</b>\n"
-        f"➕ Added: <b>{added}</b>\n"
-        f"🔁 Refreshed: <b>{updated}</b>\n"
-        f"⏱ Fetch {fetch_secs:.0f}s · Upsert {upsert_secs:.0f}s · Total {total_secs:.0f}s"
-    )
+
+    # Claude Haiku token accounting (only blurb calls — we don't hit Claude
+    # anywhere else in this flow). Haiku 4.5 rates are USD 1 / 1M input,
+    # USD 5 / 1M output. Show an estimated cost so the user sees the spend.
+    usage = ai.get_blurb_usage()
+    t_in = usage["input_tokens"]
+    t_out = usage["output_tokens"]
+    cost_usd = (t_in / 1_000_000) * 1.0 + (t_out / 1_000_000) * 5.0
+
+    lines = [
+        "✅ <b>Sample Master List updated.</b>",
+        "",
+        f"Window: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}",
+        f"MMS rows pulled: <b>{len(rows)}</b>",
+        f"Unique products: <b>{len(incoming)}</b>",
+        f"➕ Added: <b>{added}</b>",
+        f"🔁 Refreshed: <b>{updated}</b>",
+        f"⏱ Fetch {fetch_secs:.0f}s · Upsert {upsert_secs:.0f}s · Total {total_secs:.0f}s",
+        "",
+        "<b>Anthropic API usage (Haiku 4.5)</b>",
+        f"🤖 Claude calls: <b>{usage['calls']}</b>",
+        f"↳ Input tokens: <b>{t_in:,}</b>",
+        f"↳ Output tokens: <b>{t_out:,}</b>",
+        f"💵 Est. cost: <b>US$ {cost_usd:.4f}</b>",
+    ]
+    await _set("\n".join(lines))
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

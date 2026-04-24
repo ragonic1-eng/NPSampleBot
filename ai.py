@@ -119,6 +119,27 @@ async def _ask(prompt: str, max_tokens: int = 200, http_timeout: float = 20) -> 
 
 # ---------- Sample-master taste blurbs (V1.0.2 /updatesamplelist) ----------
 
+# Cumulative Claude usage counter for the taste-blurb helper. The
+# /updatesamplelist flow resets this at the start of each run and reads
+# it at the end so the bot can tell the user how many tokens were spent.
+import threading as _threading
+
+_blurb_usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+_blurb_usage_lock = _threading.Lock()
+
+
+def reset_blurb_usage() -> None:
+    with _blurb_usage_lock:
+        _blurb_usage["calls"] = 0
+        _blurb_usage["input_tokens"] = 0
+        _blurb_usage["output_tokens"] = 0
+
+
+def get_blurb_usage() -> dict[str, int]:
+    with _blurb_usage_lock:
+        return dict(_blurb_usage)
+
+
 def _prompt_for_taste_blurb(code: str, name: str) -> str:
     return (
         "You are cataloging a seasoning product for an R&D reference sheet.\n"
@@ -153,6 +174,11 @@ def taste_blurb_sync(code: str, name: str) -> tuple[str, str]:
             max_tokens=200,
             messages=[{"role": "user", "content": _prompt_for_taste_blurb(code, name)}],
         )
+        # Track token usage so /updatesamplelist can report it to the user.
+        with _blurb_usage_lock:
+            _blurb_usage["calls"] += 1
+            _blurb_usage["input_tokens"] += getattr(msg.usage, "input_tokens", 0) or 0
+            _blurb_usage["output_tokens"] += getattr(msg.usage, "output_tokens", 0) or 0
         text = "".join(
             b.text for b in msg.content if getattr(b, "type", "") == "text"
         ).strip()

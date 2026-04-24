@@ -117,6 +117,37 @@ def top_seasonings(
     return pooled[:limit]
 
 
+def find_by_code(code: str, seasonings: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Look up a seasoning by its exact product code (case-insensitive).
+
+    Tries suffix-trim fallback for coded variants — e.g. if the user pastes
+    ``S-6AUH2-12-Y1`` but the master only stores ``S-6AUH2-12`` or
+    ``S-6AUH2``, we still resolve it. Same rule the V0.4.0 bulk parser uses.
+
+    Returns ``None`` when nothing matches — callers should then fall back
+    to fuzzy name matching.
+    """
+    q = (code or "").strip().upper()
+    if not q:
+        return None
+    # Exact match first.
+    for s in seasonings:
+        c = str(s.get("code", "")).strip().upper()
+        if c and c == q:
+            return s
+    # Suffix-trim fallback: S-6AUH2-12-Y1 → S-6AUH2-12 → S-6AUH2.
+    trimmed = q
+    while "-" in trimmed:
+        trimmed = trimmed.rsplit("-", 1)[0]
+        if not trimmed:
+            break
+        for s in seasonings:
+            c = str(s.get("code", "")).strip().upper()
+            if c and c == trimmed:
+                return s
+    return None
+
+
 def top_companies(query: str, customers: list[dict[str, str]], limit: int = 3) -> list[dict[str, str]]:
     if not query.strip() or not customers:
         return []

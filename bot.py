@@ -1022,6 +1022,31 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         await _advance(update, ctx, d)
         return
 
+    # Code-first match: if the user pasted a product code (exact or suffix-trim
+    # variant), skip fuzzy name search and ask them to confirm the single hit.
+    # Much clearer UX than burying the code match inside a fuzzy-name list.
+    code_hit = matcher.find_by_code(text, seasonings)
+    if code_hit:
+        ctx.user_data["seasoning_candidates"] = [code_hit]
+        ctx.user_data["seasoning_query"] = text
+        cat = code_hit.get("category") or ""
+        cat_str = f" · <i>{h(cat)}</i>" if cat else ""
+        price = code_hit.get("price") or "—"
+        code = code_hit.get("code") or "—"
+        msg = (
+            f"🎯 <b>Code match</b> for <code>{h(text)}</code>:\n\n"
+            f"<b>{h(code_hit['name'])}</b>{cat_str}\n"
+            f"    code <code>{h(code)}</code> · {h(price)}\n\n"
+            "Use this product?"
+        )
+        buttons = [
+            [("✅ Yes, use it", "ssn:0")],
+            [("🔍 No, search by name", "ssn:retry")],
+            nav_row(include_back=False),
+        ]
+        await send(update, msg, kb(buttons))
+        return
+
     # Fuzzy-match a pool of 30, then return the 5 cheapest. matcher also
     # parses price filters like "below 4.5 usd" / "under $3" out of the query.
     top = matcher.top_seasonings(text, seasonings, limit=5, pool=30)
@@ -1419,6 +1444,16 @@ async def _handle_nav(update, ctx, d: state.Draft, action: str):
 
 
 async def _handle_seasoning_pick(update, ctx, d: state.Draft, payload: str):
+    if payload == "retry":
+        # User rejected the code match — prompt them to type a name instead.
+        ctx.user_data.pop("seasoning_candidates", None)
+        await send(
+            update,
+            "OK — type the <b>product name</b> (or a hint like "
+            "<i>cheese below 4.5 usd</i>) and I'll search the catalog.",
+            kb([nav_row(include_back=False)]),
+        )
+        return
     if payload == "raw":
         d.data["seasoning"] = ctx.user_data.get("seasoning_query", "")
         d.matched_code = ""

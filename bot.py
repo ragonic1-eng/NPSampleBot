@@ -270,6 +270,28 @@ def _mark_stuck_reminder(user_id: int) -> None:
     _stuck_reminder_users.add(user_id)
 
 
+# --- group-chat hijack protection ---
+# When the bot replies with inline buttons in a group, we remember which user
+# the message was sent FOR. If a different user taps those buttons, we refuse
+# the click and send a fresh nudge instead of clobbering the original user's
+# UI. Bounded so memory doesn't grow without limit; cleared on bot restart
+# (acceptable — owners get repopulated as users interact again).
+_KB_OWNER_CAP = 500
+_kb_owners: dict[tuple[int, int], int] = {}
+
+
+def _register_kb_owner(chat_id: int | None, message_id: int | None, user_id: int | None) -> None:
+    if chat_id is None or message_id is None or user_id is None:
+        return
+    _kb_owners[(chat_id, message_id)] = user_id
+    while len(_kb_owners) > _KB_OWNER_CAP:
+        _kb_owners.pop(next(iter(_kb_owners)), None)
+
+
+def _kb_owner(chat_id: int, message_id: int) -> int | None:
+    return _kb_owners.get((chat_id, message_id))
+
+
 async def send(
     update: Update,
     text: str,
@@ -282,22 +304,35 @@ async def send(
     The version + token-usage footer is OFF by default — sales reps don't need
     to read internal metadata on every reply. Pass `with_footer=True` only on
     debug/admin surfaces (/diag, /help, /whoami).
+
+    If the message has inline buttons, the originating user is recorded so
+    on_callback can refuse cross-user clicks in group chats.
     """
     full = f"{text}\n\n{_footer(update)}" if with_footer else text
     user = update.effective_user
     stuck = bool(user and user.id in _stuck_reminder_users)
+    sent_msg = None
     if update.callback_query and not stuck:
         try:
             await update.callback_query.edit_message_text(
                 full, reply_markup=markup, parse_mode=ParseMode.HTML
             )
-            return
+            sent_msg = update.callback_query.message
         except Exception:  # noqa: BLE001 — fall through and send new message
             pass
-    if stuck and user:
-        _stuck_reminder_users.discard(user.id)
-    chat = update.effective_chat
-    await chat.send_message(full, reply_markup=markup, parse_mode=ParseMode.HTML)
+    if sent_msg is None:
+        if stuck and user:
+            _stuck_reminder_users.discard(user.id)
+        chat = update.effective_chat
+        sent_msg = await chat.send_message(
+            full, reply_markup=markup, parse_mode=ParseMode.HTML
+        )
+    if markup is not None and sent_msg is not None and user is not None:
+        _register_kb_owner(
+            getattr(getattr(sent_msg, "chat", None), "id", None),
+            getattr(sent_msg, "message_id", None),
+            user.id,
+        )
 
 
 def _effective_comment(d: state.Draft) -> str:
@@ -785,15 +820,20 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle a photo upload — OCR for product codes, then auto-/pp each one."""
+    """Handle a photo upload — OCR for product codes, then auto-/pp each one.
+
+    GATED: only fires if the user explicitly opted into a scan via /scan or the
+    main-menu Scan button. Without this gate, every photo any user posts in a
+    group chat would trigger OCR (token spam, scan-result spam).
+    """
     if not await _authorized(update):
         return
     msg = update.effective_message
     if not msg or not msg.photo:
         return
-    # Clear the menu/scan flag — we accept any photo as a scan request, but
-    # this lets `awaiting_scan_photo` reset cleanly for the next interaction.
-    ctx.user_data.pop("awaiting_scan_photo", None)
+    # Opt-in gate — pop is single-use, so each /scan accepts ONE photo.
+    if not ctx.user_data.pop("awaiting_scan_photo", None):
+        return
 
     chat = update.effective_chat
     notice = await chat.send_message(
@@ -1688,6 +1728,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data or ""
     user_id = update.effective_user.id
+    chat = update.effective_chat
+
+    # Group-chat hijack guard: if this message was sent for someone else
+    # (different user_id stored as the kb owner), refuse the click. Sends a
+    # fresh nudge so the original owner's UI stays intact.
+    if chat and chat.type in ("group", "supergroup") and q.message:
+        owner = _kb_owner(chat.id, q.message.message_id)
+        if owner is not None and owner != user_id:
+            await chat.send_message(
+                "🚫 That's not your message — those buttons belong to another user. "
+                "Type /start to begin your own session.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
     # "Add another seasoning" fires right after submit, when the draft is gone.
     # Handle before the no-draft guard.
@@ -1727,17 +1781,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     d = state.get(user_id)
     if not d:
+        # In a group chat, this branch fires when user B taps user A's
+        # buttons. We must NOT edit the original message (would clobber A's
+        # view) — send a fresh nudge instead so A's draft stays visible.
+        chat = update.effective_chat
         if state.consume_expired_flag(user_id):
-            await send(
-                update,
-                f"⏰ <b>Draft input expired</b> (no reply for {config.DRAFT_TIMEOUT_MINUTES} min), "
-                "please kindly redo — send /start to begin a new request.",
+            await chat.send_message(
+                f"⏰ Your draft expired (no reply for {config.DRAFT_TIMEOUT_MINUTES} min). "
+                "Type /start to begin a new one.",
+                parse_mode=ParseMode.HTML,
             )
         else:
-            await send(
-                update,
-                "No draft in progress.",
-                kb([[("🏠 Main menu", "menu:home")]]),
+            await chat.send_message(
+                "🚫 That's not your draft. Type /start to begin your own.",
+                parse_mode=ParseMode.HTML,
             )
         return
     d.touch()

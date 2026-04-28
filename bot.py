@@ -840,6 +840,18 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔍 Reading product code(s) from your photo… one sec!",
         parse_mode=ParseMode.HTML,
     )
+
+    async def _cleanup() -> None:
+        # Drop the loading notice + the user's original photo so the group
+        # chat doesn't fill up with scanned images. In groups the bot needs
+        # the "delete messages" admin permission for the photo delete to
+        # actually take effect — failures are swallowed silently.
+        for target in (notice, msg):
+            try:
+                await target.delete()
+            except Exception:  # noqa: BLE001 — message may already be gone / no permission
+                pass
+
     try:
         await chat.send_action("typing")
     except Exception:  # noqa: BLE001
@@ -851,10 +863,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         buf = await tg_file.download_as_bytearray()
     except Exception as e:  # noqa: BLE001
         log.exception("Photo download failed")
-        try:
-            await notice.delete()
-        except Exception:  # noqa: BLE001
-            pass
+        await _cleanup()
         await send(update, f"😕 Couldn't read that photo: {h(str(e))}")
         return
 
@@ -874,18 +883,13 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = await vision_scan.scan_image(bytes(buf), catalog_codes)
     except Exception as e:  # noqa: BLE001
         log.exception("OCR failed")
-        try:
-            await notice.delete()
-        except Exception:  # noqa: BLE001
-            pass
+        await _cleanup()
         await send(update, f"😵 OCR failed: {h(str(e))}")
         return
 
-    # Drop the loading notice; we're about to send the result + per-code /pp.
-    try:
-        await notice.delete()
-    except Exception:  # noqa: BLE001
-        pass
+    # OCR done — drop the loading notice AND the user's original photo so
+    # the group chat doesn't accumulate clutter.
+    await _cleanup()
 
     if not result.codes:
         await send(

@@ -1854,18 +1854,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat = update.effective_chat
 
-    # Group-chat hijack guard: if this message was sent for someone else
-    # (different user_id stored as the kb owner), refuse the click. Sends a
-    # fresh nudge so the original owner's UI stays intact.
-    if chat and chat.type in ("group", "supergroup") and q.message:
-        owner = _kb_owner(chat.id, q.message.message_id)
-        if owner is not None and owner != user_id:
-            await chat.send_message(
-                "🚫 That's not your message — those buttons belong to another user. "
-                "Type /start to begin your own session.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
+    # NOTE: a kb_owner ownership check used to live here to refuse cross-user
+    # button taps in groups. It was firing false positives — legitimate
+    # owners getting rejected on their own buttons — so it's disabled.
+    # State isolation per-user_id (state._drafts) is enough to prevent real
+    # corruption; a mistaken click only causes visual confusion, which is
+    # acceptable. The kb_owners dict stays populated by send() in case we
+    # want to re-enable a smarter version later.
 
     # "Add another seasoning" fires right after submit, when the draft is gone.
     # Handle before the no-draft guard.

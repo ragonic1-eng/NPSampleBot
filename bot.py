@@ -824,8 +824,9 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send(
         update,
         "📷 <b>Scan a product photo</b>\n\n"
-        "Send a photo of one or more product code labels "
-        "(<code>S-XXXXX-XX</code>). I'll read them and pull the price for each.",
+        "<b>📎 Reply to this message</b> with a photo of one or more "
+        "product code labels (<code>S-XXXXX-XX</code>). I'll read them and "
+        "pull the price for each.",
     )
 
 
@@ -2095,9 +2096,11 @@ async def _handle_menu_callback(update, ctx, action: str):
         await send(
             update,
             "📷 <b>Scan a product photo</b>\n\n"
-            "Send a photo of one or more product code labels "
-            "(<code>S-XXXXX-XX</code>). I'll read them and pull the price for each.\n\n"
-            "<i>Tip:</i> tap 📎 → Camera for the sharpest shot.",
+            "<b>📎 Reply to this message</b> with a photo of one or more "
+            "product code labels (<code>S-XXXXX-XX</code>). I'll read them "
+            "and pull the price for each.\n\n"
+            "<i>Why reply? In group chats, Telegram's privacy mode hides "
+            "non-reply messages from bots. In a DM you can just send the photo.</i>",
         )
         return
     if action == "code":
@@ -2105,9 +2108,10 @@ async def _handle_menu_callback(update, ctx, action: str):
         await send(
             update,
             "✏️ <b>Enter a product code</b>\n\n"
-            "Type one or more product codes and I'll pull the price for each. "
-            "You can paste a base code like <code>S-668U1</code> and I'll list "
-            "all its variants — or paste up to 5 full codes separated by spaces.",
+            "<b>📎 Reply to this message</b> with one or more product codes "
+            "and I'll pull the price for each. You can paste a base code "
+            "like <code>S-668U1</code> and I'll list all its variants — or "
+            "paste up to 5 full codes separated by spaces.",
         )
         return
     if action == "updsample":

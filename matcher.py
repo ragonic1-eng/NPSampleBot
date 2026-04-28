@@ -142,16 +142,26 @@ def top_seasonings(
         for i, s in enumerate(candidates)
     }
 
-    # Combined scorer: max(WRatio, token_set_ratio).
-    #  - WRatio handles typos and continuous-substring matches well
-    #  - token_set_ratio is order-insensitive ("spicy korean noodle" should
-    #    score the same as "korean spicy noodle")
-    # WRatio alone drops the noodle item from 90 → 86 just because the user
-    # reordered tokens, which is a real-world bug we hit.
+    # Combined scorer: AVERAGE of WRatio and token_set_ratio.
+    #
+    # Why average instead of max? WRatio plateaus at ~86 for short multi-word
+    # queries, so MAX(W, ts) made every plausible candidate look equally
+    # good. token_set_ratio actually differentiates them — but only if it can
+    # contribute to the final score. Averaging lets the right item rise:
+    #
+    #   query "tom yum for bangladesh"
+    #     • TOM YUM:        W=86  ts=70  →  max=86  avg=78  ← right answer
+    #     • SPICY TOMATO:   W=86  ts=37  →  max=86  avg=61
+    #     • ANIMAL FEEDS:   W=86  ts=38  →  max=86  avg=62
+    #
+    # With max(), the right answer ties with the noise. With avg(), it wins
+    # by 15+ points. We still keep both scorers because:
+    #  - WRatio handles typos and continuous-substring matches
+    #  - token_set_ratio is order-insensitive and rewards real token overlap
     def _combined(q: str, c: str, **kwargs) -> float:
         a = fuzz.WRatio(q, c, **kwargs)
         b = fuzz.token_set_ratio(q, c, **kwargs)
-        return max(a, b)
+        return (a + b) / 2
 
     results = process.extract(
         cleaned_query,

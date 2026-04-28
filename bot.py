@@ -1016,14 +1016,18 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if state.consume_expired_flag(user_id):
             await send(
                 update,
-                f"⏰ <b>Draft input expired</b> (no reply for {config.DRAFT_TIMEOUT_MINUTES} min), "
-                "please kindly redo — send /start to begin a new request.",
+                f"⏰ <b>Your draft expired</b> after {config.DRAFT_TIMEOUT_MINUTES} min of no input.\n\n"
+                "Tap below to start fresh:",
+                kb([[("➕ New request", "menu:new"), ("🏠 Main menu", "menu:home")]]),
             )
         else:
             await send(
                 update,
-                "No draft in progress.",
-                kb([[("🏠 Main menu", "menu:home")]]),
+                "🤔 <b>I don't have an active draft for you.</b>\n\n"
+                "<i>This sometimes happens after a bot update — your in-progress "
+                "draft gets reset when the bot redeploys.</i>\n\n"
+                "Tap below to start a new one:",
+                kb([[("➕ New request", "menu:new"), ("🏠 Main menu", "menu:home")]]),
             )
         return
     d.stage = "review"
@@ -1454,14 +1458,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if state.consume_expired_flag(user.id):
             await send(
                 update,
-                f"⏰ <b>Draft input expired</b> (no reply for {config.DRAFT_TIMEOUT_MINUTES} min), "
-                "please kindly redo — send /start to begin a new request.",
+                f"⏰ <b>Your draft expired</b> after {config.DRAFT_TIMEOUT_MINUTES} min of no input.\n\n"
+                "Tap below to start fresh:",
+                kb([[("➕ New request", "menu:new"), ("🏠 Main menu", "menu:home")]]),
             )
         else:
             await send(
                 update,
-                "No draft in progress.",
-                kb([[("🏠 Main menu", "menu:home")]]),
+                "🤔 <b>I don't have an active draft for you.</b>\n\n"
+                "<i>This sometimes happens after a bot update — your in-progress "
+                "draft gets reset when the bot redeploys.</i>\n\n"
+                "Tap below to start a new one:",
+                kb([[("➕ New request", "menu:new"), ("🏠 Main menu", "menu:home")]]),
             )
         return
     d.touch()
@@ -1794,15 +1802,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # buttons. We must NOT edit the original message (would clobber A's
         # view) — send a fresh nudge instead so A's draft stays visible.
         chat = update.effective_chat
+        # NOTE: q.answer() was already called at the top, so we can't show a
+        # popup. A new message is the cleanest fallback.
         if state.consume_expired_flag(user_id):
             await chat.send_message(
-                f"⏰ Your draft expired (no reply for {config.DRAFT_TIMEOUT_MINUTES} min). "
-                "Type /start to begin a new one.",
+                f"⏰ Your draft expired after {config.DRAFT_TIMEOUT_MINUTES} min of no input. "
+                "Type /start to begin a new one.\n\n<i>{footer}</i>".format(
+                    footer=h(config.BOT_VERSION)
+                ),
                 parse_mode=ParseMode.HTML,
             )
         else:
             await chat.send_message(
-                "🚫 That's not your draft. Type /start to begin your own.",
+                "🤔 No active draft — your buttons may belong to someone else, "
+                "or the bot just redeployed. Type /start to begin a new one.\n\n"
+                f"<i>{h(config.BOT_VERSION)}</i>",
                 parse_mode=ParseMode.HTML,
             )
         return

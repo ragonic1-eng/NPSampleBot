@@ -1578,12 +1578,11 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         await chat.send_action("typing")
     except Exception:  # noqa: BLE001
         pass
-    # Visible loader so the user knows we're working — fuzzy + history boost
-    # + Claude rerank can take 2-5 seconds end-to-end.
+    # Visible loader so the user knows we're working.
     placeholder = None
     try:
         placeholder = await chat.send_message(
-            "🔍 Searching the catalog & past requests… one sec!",
+            "🔍 Searching the catalog…",
             parse_mode=ParseMode.HTML,
         )
     except Exception:  # noqa: BLE001
@@ -1646,20 +1645,18 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         log.warning("load_past_submissions failed: %s", e)
         past = []
 
+    # Pure local search — no AI tokens consumed. The matcher does the work:
+    #   • token_set_ratio + WRatio scorer (order-insensitive, typo-tolerant)
+    #   • generic-term stripping ("seasoning"/"powder"/"flavour" don't dominate)
+    #   • category fold (catalog tab name is part of the choice string)
+    #   • past-submissions boost (codes used for similar past queries lift)
+    #   • code dedupe (same code in two tabs collapses to one row)
+    # On the test set this ranks the right items at score 100 without help
+    # from Claude. We keep ai.rerank_seasonings around in case we ever want
+    # to re-enable it for harder queries.
     pool_candidates = matcher.top_seasonings(
         combined_query, seasonings, limit=10, pool=40, past_submissions=past
     )
-
-    # Claude rerank for semantic intent ("korea spicy noodle" → noodle items).
-    # Falls back to the fuzzy order if the API fails or is offline.
-    if pool_candidates:
-        try:
-            reranked, tin, tout = await ai.rerank_seasonings(combined_query, pool_candidates)
-            d.tokens_in += tin
-            d.tokens_out += tout
-            pool_candidates = reranked
-        except Exception as e:  # noqa: BLE001
-            log.warning("rerank_seasonings failed, using fuzzy order: %s", e)
 
     top = pool_candidates[:5]
 

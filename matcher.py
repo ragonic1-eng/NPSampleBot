@@ -142,26 +142,52 @@ def top_seasonings(
         for i, s in enumerate(candidates)
     }
 
-    # Combined scorer: AVERAGE of WRatio and token_set_ratio.
+    # Build a catalog vocabulary so we can tell "real" query tokens (words
+    # that appear somewhere in the catalog) from "filter" tokens (markets /
+    # countries / hints like "bangladesh", "for", "vietnam"). Filter tokens
+    # don't count toward coverage, so "cheese for bangladesh" doesn't get
+    # penalised when no item literally contains "bangladesh".
+    #
+    # CRITICAL: build vocab from the FULL seasoning list, not from the
+    # already-price-filtered `candidates`. Otherwise a query like "masala
+    # noodle below 4usd" loses "masala" from vocab when no masala item fits
+    # the budget — and the scorer stops penalising non-masala results.
+    _catalog_vocab: set[str] = set()
+    for s in seasonings:
+        name_cat = _strip_generic(f"{s.get('name', '')} {s.get('category', '')}")
+        for tok in re.findall(r"[a-z0-9]+", name_cat.lower()):
+            if len(tok) >= 4:
+                _catalog_vocab.add(tok)
+
+    # Combined scorer: AVERAGE of WRatio and token_set_ratio + token-coverage
+    # penalty for queries where significant catalog tokens are missing.
     #
     # Why average instead of max? WRatio plateaus at ~86 for short multi-word
     # queries, so MAX(W, ts) made every plausible candidate look equally
-    # good. token_set_ratio actually differentiates them — but only if it can
-    # contribute to the final score. Averaging lets the right item rise:
-    #
-    #   query "tom yum for bangladesh"
-    #     • TOM YUM:        W=86  ts=70  →  max=86  avg=78  ← right answer
-    #     • SPICY TOMATO:   W=86  ts=37  →  max=86  avg=61
-    #     • ANIMAL FEEDS:   W=86  ts=38  →  max=86  avg=62
-    #
-    # With max(), the right answer ties with the noise. With avg(), it wins
-    # by 15+ points. We still keep both scorers because:
-    #  - WRatio handles typos and continuous-substring matches
-    #  - token_set_ratio is order-insensitive and rewards real token overlap
+    # good. token_set_ratio differentiates them — averaging lets it
+    # contribute. Combined with token-coverage, MASALA NOODLE no longer
+    # matches CHICKEN NOODLE just because the noodle-tab fold picks it up.
     def _combined(q: str, c: str, **kwargs) -> float:
         a = fuzz.WRatio(q, c, **kwargs)
         b = fuzz.token_set_ratio(q, c, **kwargs)
-        return (a + b) / 2
+        avg = (a + b) / 2
+
+        # Coverage penalty for multi-token queries.
+        # Only count tokens that BOTH look meaningful (≥4 chars) AND appear
+        # somewhere in the catalog vocab — that excludes filler words and
+        # market hints that wouldn't be in any product name.
+        q_real = [
+            w for w in re.findall(r"[a-z0-9]+", q.lower())
+            if len(w) >= 4 and w in _catalog_vocab
+        ]
+        if len(q_real) >= 2:
+            c_lower = c.lower()
+            missing = sum(1 for w in q_real if w not in c_lower)
+            if missing > 0:
+                # Each missing real token costs 30% off, floored at 40%.
+                # 1 missing → 0.7×, 2 missing → 0.49×, ≥3 → 0.4×
+                avg *= max(0.4, 0.7 ** missing)
+        return avg
 
     results = process.extract(
         cleaned_query,
@@ -172,7 +198,12 @@ def top_seasonings(
     )
     pooled: dict[int, dict[str, Any]] = {}
     for _name, score, idx in results:
-        if score < 50:  # combined scorer; AI rerank does the final ordering
+        # Threshold 60 (not 50): with the token-coverage penalty,
+        # items missing a key query token (e.g. CHICKEN NOODLE for "masala
+        # noodle") land around 52. Bumping to 60 drops them so the soft-
+        # fallback path triggers and the user gets a clear "no masala items
+        # under $4" message + above-budget masala suggestions.
+        if score < 60:
             continue
         s = candidates[idx]
         pooled[idx] = {

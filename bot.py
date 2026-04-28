@@ -1677,7 +1677,12 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
     ctx.user_data["seasoning_query"] = text  # latest only — used by "Use my text"
 
     # Surface the price filter status so the user always knows what's been applied.
-    if soft_price:
+    if soft_price and not top:
+        # Even the soft fallback found nothing — query has no matches at any price.
+        cap_note = (
+            f"\n⚠️ <i>No matches in the catalog for that query — even at any price.</i>"
+        )
+    elif soft_price:
         cap_note = (
             f"\n⚠️ <i>No matches under <b>${max_price:g} USD</b> — "
             "showing the closest above-budget options instead.</i>"

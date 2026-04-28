@@ -13,6 +13,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -36,6 +37,7 @@ from telegram.ext import (
 import ai
 import config
 import matcher
+import mms_product
 import sheets
 import state
 from state import FIELDS, FIELD_LABELS
@@ -61,6 +63,7 @@ CUSTOMER_BASES = [
     "Charnachur",
     "Popchips",
     "Instant noodles",
+    "Wheat flour biscuit",
 ]
 
 # Seasoning-weight presets for 3/15 main quantity.
@@ -68,7 +71,7 @@ SEASONING_WEIGHTS = ["30g", "50g", "100g", "200g", "300g", "500g", "1kg"]
 # Bottle count presets when the selected product is an oil.
 OIL_BOTTLES = ["1", "2", "3", "5"]
 # Application base-product presets (different list from customer base @ 10/15).
-APP_BASES = ["Potato chips", "Corn puff", "Corn curl (Twisties)", "Wheat flour base pellets"]
+APP_BASES = ["Potato chips", "Corn puff", "Corn curl (Twisties)", "Wheat flour base pellets", "Wheat flour biscuit"]
 # Set-count presets for seasoning qty + application sample.
 SET_COUNTS = ["1", "2", "3", "5"]
 
@@ -412,6 +415,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/cancel — discard the current draft",
         "",
         "<b>Utilities</b>",
+        "/pp <code> — pull product price from MMS (Code · Name · R&D Price · Raw Material Cost)",
         "/reload — refresh seasoning & customer lists from Google Sheets",
         "/whoami — show your Telegram ID & username",
         "/diag — diagnostic (shows what the bot can read from the Users tab)",
@@ -621,6 +625,64 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update,
         f"Username: <code>@{h(u.username or '(none)')}</code>\nID: <code>{u.id}</code>",
     )
+
+
+_PP_CODE_RE = re.compile(r"\bS-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,4})?\b", re.IGNORECASE)
+
+
+async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/pp <code>` — fetch product price summary from MMS.
+
+    Returns: Code, Name, R&D Price (USD), Raw Material Cost (USD).
+    Pricing-only — does NOT fetch the full ingredient table.
+    Goes straight to MMS each call (no caching) so the price stays fresh.
+    """
+    if not await _authorized(update):
+        return
+    msg = update.effective_message
+    raw = " ".join(ctx.args) if ctx.args else (msg.text or "").partition(" ")[2]
+    codes = _PP_CODE_RE.findall(raw)
+    if not codes:
+        await send(
+            update,
+            "💲 <b>/pp</b> — product price from MMS\n\n"
+            "Send a product code, e.g. <code>/pp S-62RG3-19</code>.",
+        )
+        return
+
+    # Dedupe + uppercase, cap at 5 to avoid spamming MMS / the chat.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for c in codes:
+        u = c.upper()
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    if len(unique) > 5:
+        await send(update, f"🙏 Max 5 codes per /pp — running first 5: {', '.join(unique[:5])}")
+        unique = unique[:5]
+
+    client = mms_product.get_client()
+    for code in unique:
+        try:
+            await update.effective_chat.send_action("typing")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            product = await asyncio.to_thread(client.fetch_product, code)
+        except mms_product.ProductNotFound:
+            await send(update, f"😕 No product found for <code>{h(code)}</code>.")
+            continue
+        except mms_product.MMSError as e:
+            log.warning("MMS error for %s: %s", code, e)
+            await send(update, f"😬 MMS error for <code>{h(code)}</code>: {h(str(e))}")
+            continue
+        except Exception as e:  # noqa: BLE001
+            log.exception("Unexpected /pi error for %s", code)
+            await send(update, f"😵 Couldn't fetch <code>{h(code)}</code>: {h(str(e))}")
+            continue
+        body = mms_product.format_pp(product)
+        await send(update, f"<pre>{h(body)}</pre>")
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -900,11 +962,11 @@ async def q_quantity(update, ctx, d):
 
     if d.sub == "app_base":
         buttons = [[(b, f"qb:{i}")] for i, b in enumerate(APP_BASES)]
-        buttons.append([("⌨️ Manual key in", "qb:manual")])
+        buttons.append([("⌨️ Enter manually", "qb:manual")])
         buttons.append(nav_row())
         await send(
             update,
-            "🍟 <b>On what base product?</b>\n\nPick one, or tap Manual.",
+            "🍟 <b>On what base product?</b>\n\nPick one, or tap Enter manually.",
             kb(buttons),
         )
         return
@@ -1005,7 +1067,14 @@ async def q_taste_check(update, ctx, d):
 async def q_customer_base(update, ctx, d):
     existing = d.data.get("customer_base", "")
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
-    # Two-column grid of preset bases + a free-text option.
+    if d.sub == "manual":
+        await send(
+            update,
+            "⌨️ Type the customer base (e.g. <i>crab-shape pellet</i>).",
+            kb([nav_row()]),
+        )
+        return
+    # Two-column grid of preset bases + an explicit Manual button.
     buttons = []
     row: list[tuple[str, str]] = []
     for i, b in enumerate(CUSTOMER_BASES):
@@ -1015,11 +1084,12 @@ async def q_customer_base(update, ctx, d):
             row = []
     if row:
         buttons.append(row)
+    buttons.append([("⌨️ Enter manually", "cb:manual")])
     buttons.append(nav_row())
     await send(
         update,
         "🍿 <b>11/16 · Customer Base</b>\n\n"
-        "Pick one, or just type your own (e.g. <i>crab-shape pellet</i>)." + hint,
+        "Pick one, or tap Enter manually to type your own." + hint,
         kb(buttons),
     )
 
@@ -1216,6 +1286,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send(update, "Please pick an option from the buttons above.")
         return
 
+    # Customer base manual entry — sub-state set by tapping "Enter manually".
+    if stage == "customer_base" and d.sub == "manual":
+        d.data["customer_base"] = text
+        d.sub = ""
+        await _advance(update, ctx, d)
+        return
+
     # Plain free-text fields
     d.data[stage] = text
     await _advance(update, ctx, d)
@@ -1262,9 +1339,31 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         await send(update, msg, kb(buttons))
         return
 
-    # Fuzzy-match a pool of 30, then return the 5 cheapest. matcher also
-    # parses price filters like "below 4.5 usd" / "under $3" out of the query.
-    top = matcher.top_seasonings(text, seasonings, limit=5, pool=30)
+    # Smart match: fuzzy-pool (name + category) + past-submissions boost,
+    # then Claude rerank on the top 10. matcher also parses price filters
+    # like "below 4.5 usd" / "under $3" out of the query.
+    try:
+        past = await asyncio.to_thread(sheets.load_past_submissions)
+    except Exception as e:  # noqa: BLE001
+        log.warning("load_past_submissions failed: %s", e)
+        past = []
+
+    pool_candidates = matcher.top_seasonings(
+        text, seasonings, limit=10, pool=40, past_submissions=past
+    )
+
+    # Claude rerank for semantic intent ("korea spicy noodle" → noodle items).
+    # Falls back to the fuzzy order if the API fails or is offline.
+    if pool_candidates:
+        try:
+            reranked, tin, tout = await ai.rerank_seasonings(text, pool_candidates)
+            d.tokens_in += tin
+            d.tokens_out += tout
+            pool_candidates = reranked
+        except Exception as e:  # noqa: BLE001
+            log.warning("rerank_seasonings failed, using fuzzy order: %s", e)
+
+    top = pool_candidates[:5]
 
     ctx.user_data["seasoning_candidates"] = top
     ctx.user_data["seasoning_query"] = text
@@ -1535,12 +1634,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("cb:"):
+        payload = data.split(":", 1)[1]
+        if payload == "manual":
+            d.sub = "manual"
+            await ask(update, ctx, d)
+            return
         try:
-            idx = int(data.split(":", 1)[1])
+            idx = int(payload)
         except ValueError:
             return
         if 0 <= idx < len(CUSTOMER_BASES):
             d.data["customer_base"] = CUSTOMER_BASES[idx]
+            d.sub = ""
             await _advance(update, ctx, d)
         return
 
@@ -1631,6 +1736,10 @@ async def _handle_nav(update, ctx, d: state.Draft, action: str):
     if action == "back":
         if d.stage == "price_budget" and d.sub == "amount":
             d.sub = "currency"
+            await ask(update, ctx, d)
+            return
+        if d.stage == "customer_base" and d.sub == "manual":
+            d.sub = ""
             await ask(update, ctx, d)
             return
         if d.stage == "quantity" and d.sub in _QTY_SUBS:
@@ -2200,13 +2309,26 @@ async def _ask_bulk_base(update, ctx):
             row = []
     if row:
         buttons.append(row)
+    buttons.append([("⌨️ Enter manually", "bsh:base:manual")])
     buttons.append([("✖ Cancel", "bulk:cancel")])
     await send(
         update,
         "🍿 <b>Customer Base (shared)</b>\n\n"
         f"{_bulk_shared_summary(shared)}\n\n"
-        "Pick one to apply to every item:",
+        "Pick one to apply to every item, or tap Enter manually:",
         kb(buttons),
+    )
+
+
+async def _ask_bulk_base_manual(update, ctx):
+    ctx.user_data["bulk_stage"] = "ask_base_manual"
+    shared = ctx.user_data.get("bulk_shared", {})
+    await send(
+        update,
+        "⌨️ <b>Customer Base (shared) — Enter manually</b>\n\n"
+        f"{_bulk_shared_summary(shared)}\n\n"
+        "Type the customer base to apply to every item:",
+        kb([[("✖ Cancel", "bulk:cancel")]]),
     )
 
 
@@ -2645,8 +2767,12 @@ async def _handle_bulk_shared_callback(update, ctx, action: str):
         await _ask_bulk_base(update, ctx)
         return
     if action.startswith("base:"):
+        payload = action.split(":", 1)[1]
+        if payload == "manual":
+            await _ask_bulk_base_manual(update, ctx)
+            return
         try:
-            i = int(action.split(":", 1)[1])
+            i = int(payload)
         except ValueError:
             return
         if 0 <= i < len(CUSTOMER_BASES):
@@ -2708,6 +2834,11 @@ async def _handle_bulk_text(update, ctx, text: str) -> bool:
             return True
         ctx.user_data["bulk_raw"] = text
         await _ask_bulk_taste(update, ctx)
+        return True
+    if stage == "ask_base_manual":
+        shared = ctx.user_data.setdefault("bulk_shared", {})
+        shared["customer_base"] = text
+        await _ask_bulk_courier(update, ctx)
         return True
     if stage == "ask_budget_amt":
         shared = ctx.user_data.setdefault("bulk_shared", {})
@@ -2787,6 +2918,7 @@ def main():
     app.add_handler(CommandHandler("bulk", cmd_bulk))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("updatesamplelist", cmd_update_sample_list))
 
     # Register Telegram's native blue slash-command menu so users see every
@@ -2802,6 +2934,7 @@ def main():
             BotCommand("cancel", "Discard the current draft"),
             BotCommand("reload", "Refresh seasoning / customer lists"),
             BotCommand("whoami", "Show your Telegram ID & username"),
+            BotCommand("pp", "💲 Product price — e.g. /pp S-62RG3-19"),
             BotCommand("diag", "Diagnostics"),
             BotCommand("help", "Show all commands"),
         ]

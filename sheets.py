@@ -32,6 +32,8 @@ _customers_cache: tuple[float, list[dict[str, str]]] | None = None
 _CUSTOMERS_TTL = 5 * 60  # 5 min — invalidated immediately on upsert
 _samples_cache: tuple[float, list[dict[str, Any]]] | None = None
 _SAMPLES_TTL = 2 * 60  # 2 min — invalidated immediately on append
+_past_submissions_cache: tuple[float, list[dict[str, str]]] | None = None
+_PAST_SUBMISSIONS_TTL = 30 * 60  # 30 min — refresh sometimes, not too often
 
 
 def _get_client() -> gspread.Client:
@@ -151,6 +153,66 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
         ", ".join(f"{t}:{c}" for t, c in per_tab),
     )
     return cleaned
+
+
+# ---------- Past sample submissions (for smart seasoning suggestions) ----------
+
+def load_past_submissions(force: bool = False) -> list[dict[str, str]]:
+    """Past entries from the Sample Log, used to boost seasoning suggestions.
+
+    Each row becomes ``{"query_text": <free-text the salesperson wrote>,
+    "matched_code": <the seasoning code that ended up on the request>}``.
+
+    The query_text concatenates the user-typed seasoning request plus
+    surrounding context (comment / requirement / market / customer base) so
+    fuzzy-matching catches phrases like "korea spicy noodle" even when those
+    words don't appear in the seasoning name itself.
+    """
+    global _past_submissions_cache
+    now = time.time()
+    if (
+        not force
+        and _past_submissions_cache
+        and now - _past_submissions_cache[0] < _PAST_SUBMISSIONS_TTL
+    ):
+        return _past_submissions_cache[1]
+
+    try:
+        ws = _open_ops().worksheet(config.TAB_SALES_LOG)
+    except Exception as e:  # noqa: BLE001
+        log.warning("load_past_submissions: %s tab missing (%s)", config.TAB_SALES_LOG, e)
+        _past_submissions_cache = (now, [])
+        return []
+
+    try:
+        rows = ws.get_all_records()
+    except Exception as e:  # noqa: BLE001
+        log.warning("load_past_submissions: failed to read rows: %s", e)
+        _past_submissions_cache = (now, [])
+        return []
+
+    parts_keys = (
+        "Seasoning Requested",
+        "Comment",
+        "Requirement",
+        "Market",
+        "Customer Base",
+    )
+    out: list[dict[str, str]] = []
+    for r in rows:
+        norm = {str(k).strip(): str(v).strip() for k, v in r.items()}
+        code = norm.get("Matched Code", "").strip()
+        if not code:
+            continue  # rows without a confirmed seasoning code aren't useful
+        bits = [norm.get(k, "") for k in parts_keys]
+        query_text = " | ".join(b for b in bits if b)
+        if not query_text:
+            continue
+        out.append({"query_text": query_text, "matched_code": code})
+
+    _past_submissions_cache = (now, out)
+    log.info("Loaded %d past submission entries for smart matching", len(out))
+    return out
 
 
 # ---------- Customer master (external sheet: code + name only) ----------

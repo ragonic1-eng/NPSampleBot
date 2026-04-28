@@ -62,6 +62,7 @@ def top_seasonings(
     seasonings: list[dict[str, Any]],
     limit: int = 5,
     pool: int = 30,
+    past_submissions: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Fuzzy-match the query, then return the `limit` cheapest from the top `pool`.
 
@@ -69,6 +70,10 @@ def top_seasonings(
     "under $3", "<=2.50"). Market / style / flavor hints (e.g. "for bangladesh",
     "chinese style") are handled implicitly: fuzzy WRatio scores names that
     contain those keywords higher.
+
+    If ``past_submissions`` is supplied, items whose code shows up against a
+    similar past query get a +score boost — surfaces "korea spicy noodle"
+    style requests by remembering what was picked for past similar queries.
     """
     if not query.strip() or not seasonings:
         return []
@@ -97,7 +102,12 @@ def top_seasonings(
             out.append({**s, "score": 0, "_price_num": _parse_price(s.get("price"))})
         return out
 
-    choices = {i: s["name"] for i, s in enumerate(candidates)}
+    # Score against seasoning name + category — fold category into the choice
+    # so "korean noodle" rewards items in the Noodle category tab.
+    choices = {
+        i: f"{s['name']} {s.get('category', '')}".strip()
+        for i, s in enumerate(candidates)
+    }
     results = process.extract(
         cleaned_query,
         choices,
@@ -105,16 +115,68 @@ def top_seasonings(
         processor=utils.default_process,
         limit=pool,
     )
-    pooled: list[dict[str, Any]] = []
+    pooled: dict[int, dict[str, Any]] = {}
     for _name, score, idx in results:
-        if score < 60:
+        if score < 55:  # slightly looser, AI rerank/category boost will tighten
             continue
         s = candidates[idx]
-        pooled.append(
-            {**s, "score": score, "_price_num": _parse_price(s.get("price"))}
+        pooled[idx] = {
+            **s, "score": float(score), "_price_num": _parse_price(s.get("price")),
+            "_past_hits": 0,
+        }
+
+    # Past-submissions boost: fuzzy-match the user's query against historical
+    # request text. For each strong hit, find that submission's matched_code
+    # in the catalog and bump its score / add it to the pool.
+    if past_submissions:
+        past_choices = {i: p.get("query_text", "") for i, p in enumerate(past_submissions)}
+        past_results = process.extract(
+            cleaned_query,
+            past_choices,
+            scorer=fuzz.WRatio,
+            processor=utils.default_process,
+            limit=20,
         )
-    pooled.sort(key=lambda s: (s["_price_num"], -s["score"]))
-    return pooled[:limit]
+        # code -> [list of past-match scores] so we can boost proportionally.
+        past_code_scores: dict[str, list[float]] = {}
+        for _txt, pscore, pidx in past_results:
+            if pscore < 65:
+                continue
+            code = past_submissions[pidx].get("matched_code", "").strip().upper()
+            if not code:
+                continue
+            past_code_scores.setdefault(code, []).append(float(pscore))
+
+        if past_code_scores:
+            # Index catalog by code for quick lookup.
+            by_code = {
+                str(s.get("code", "")).strip().upper(): (i, s)
+                for i, s in enumerate(candidates)
+                if s.get("code")
+            }
+            for code, pscores in past_code_scores.items():
+                if code not in by_code:
+                    continue
+                idx, s = by_code[code]
+                avg_pscore = sum(pscores) / len(pscores)
+                # Boost: scale 0..15 based on the avg past-score (65→0, 100→15)
+                boost = max(0.0, (avg_pscore - 65.0) * (15.0 / 35.0))
+                if idx in pooled:
+                    pooled[idx]["score"] = pooled[idx]["score"] + boost
+                    pooled[idx]["_past_hits"] = len(pscores)
+                else:
+                    # Surface from the past even if the catalog fuzzy missed it.
+                    pooled[idx] = {
+                        **s,
+                        "score": 60.0 + boost,
+                        "_price_num": _parse_price(s.get("price")),
+                        "_past_hits": len(pscores),
+                    }
+
+    ranked = list(pooled.values())
+    # Best-first by score, then cheapest within ties.
+    ranked.sort(key=lambda s: (-s["score"], s["_price_num"]))
+    return ranked[:limit]
 
 
 def find_by_code(code: str, seasonings: list[dict[str, Any]]) -> dict[str, Any] | None:

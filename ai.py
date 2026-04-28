@@ -30,13 +30,37 @@ def _claude():
 
 
 def _prompt_for_seasoning_rerank(query: str, candidates: list[dict[str, Any]]) -> str:
-    lines = [f"{i+1}. {c['name']} (code {c.get('code','')})" for i, c in enumerate(candidates)]
+    lines = []
+    for i, c in enumerate(candidates):
+        cat = c.get("category", "") or ""
+        price = c.get("price", "") or ""
+        past = int(c.get("_past_hits", 0) or 0)
+        bits = []
+        if cat:
+            bits.append(f"category: {cat}")
+        if price:
+            bits.append(f"price: {price}")
+        if past:
+            bits.append(f"past-usage: {past} similar request(s)")
+        suffix = f" — {' · '.join(bits)}" if bits else ""
+        lines.append(f"{i+1}. {c['name']} (code {c.get('code','')}){suffix}")
     return (
-        "You are helping a salesperson find a seasoning in our catalog.\n"
-        f"User typed: {query!r}\n"
-        "Candidates:\n" + "\n".join(lines) + "\n\n"
-        "Return JSON only: {\"order\": [<1-based indexes best-first>]}. "
-        "Base order on likely intent (flavor, application, keywords)."
+        "You are helping a salesperson find the right seasoning in a snack-foods "
+        "catalog. The user types free-form text describing what they want — it may "
+        "include the application (noodle, chips, biscuit, popcorn), the flavour "
+        "profile (spicy, BBQ, cheese), the regional style (korean, japanese, "
+        "indian), and sometimes a price hint.\n\n"
+        f"User typed: {query!r}\n\n"
+        "Candidates (with category tab and history hints):\n"
+        + "\n".join(lines)
+        + "\n\nRank ALL candidates best-first based on how well they fit the user's "
+        "intent. Pay close attention to:\n"
+        "  • the application/category match (e.g. \"noodle\" → Noodle category)\n"
+        "  • flavour & regional cues in the name\n"
+        "  • past-usage hints — items used before for similar requests are likely good\n"
+        "Drop irrelevant items to the bottom; do NOT remove any.\n"
+        "Return JSON ONLY in this exact shape: "
+        "{\"order\": [<1-based indexes, best-first, every index appears once>]}"
     )
 
 

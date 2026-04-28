@@ -420,7 +420,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Don't start a draft yet — wait for the user to pick "new request".
     state.clear(user.id)
     menu = [
-        [("➕ Raise a sample request", "menu:new")],
+        [("🌶 Find a seasoning & raise request", "menu:new")],
         [("📄 Paste a multi-seasoning email", "menu:bulk")],
         [("📷 Scan a product photo", "menu:scan")],
         [("📋 My sample requests", "menu:samples")],

@@ -247,16 +247,21 @@ def nav_row(include_back: bool = True, include_skip: bool = False) -> list[tuple
 
 
 def _footer(update: Update) -> str:
-    """Small footer appended to every bot reply: version + tokens so far."""
+    """Tidy footer on every bot reply.
+
+    Format:
+      <i>V1.4.x</i>                          ← no tokens consumed yet
+      <i>V1.4.x · 🧠 1,234 tokens</i>        ← tokens consumed in this draft
+
+    One line, italic, comma-separated thousands. No in/out breakdown — sales
+    reps don't need that level of detail; one total is enough.
+    """
     parts = [config.BOT_VERSION]
     user = update.effective_user
     if user:
         d = state.get(user.id)
-        if d and (d.tokens_in or d.tokens_out):
-            parts.append(
-                f"🧠 {d.tokens_total} tokens "
-                f"(in {d.tokens_in} · out {d.tokens_out})"
-            )
+        if d and d.tokens_total:
+            parts.append(f"🧠 {d.tokens_total:,} tokens")
     return "<i>" + " · ".join(parts) + "</i>"
 
 
@@ -297,13 +302,13 @@ async def send(
     text: str,
     markup: InlineKeyboardMarkup | None = None,
     *,
-    with_footer: bool = False,
+    with_footer: bool = True,
 ):
     """Send/edit a message to the user.
 
-    The version + token-usage footer is OFF by default — sales reps don't need
-    to read internal metadata on every reply. Pass `with_footer=True` only on
-    debug/admin surfaces (/diag, /help, /whoami).
+    The version + token footer is ON by default. Pass `with_footer=False` only
+    when stacking multiple bot replies for one logical action and you don't
+    want the footer to repeat on each fragment.
 
     If the message has inline buttons, the originating user is recorded so
     on_callback can refuse cross-user clicks in group chats.
@@ -482,7 +487,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/updatesamplelist — sync Sample Master List from MMS (24h cooldown; "
             "append <code>force</code> to override)",
         ]
-    await send(update, "\n".join(lines), with_footer=True)
+    await send(update, "\n".join(lines))
 
 
 SAMPLE_SYNC_COOLDOWN_HOURS = 24
@@ -942,7 +947,7 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         users = await asyncio.to_thread(sheets.load_users, True)
     except Exception as e:  # noqa: BLE001
         lines.append(f"\n❌ <b>load_users() failed:</b> <code>{h(str(e)[:300])}</code>")
-        await send(update, "\n".join(lines), with_footer=True)
+        await send(update, "\n".join(lines))
         return
 
     lines.append(f"\n✅ Loaded <b>{len(users)}</b> row(s) from Authorized Users tab.")
@@ -978,7 +983,7 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  • Active: <code>Y</code>"
         )
 
-    await send(update, "\n".join(lines), with_footer=True)
+    await send(update, "\n".join(lines))
 
 
 async def cmd_reload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

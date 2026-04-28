@@ -1657,17 +1657,35 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
     pool_candidates = matcher.top_seasonings(
         combined_query, seasonings, limit=10, pool=40, past_submissions=past
     )
+    _cleaned, max_price = matcher.parse_seasoning_query(combined_query)
+
+    # If a price cap was set but it killed the pool entirely, fall back to
+    # the same search WITHOUT the cap so the user still gets the closest
+    # matches (just above their budget). We surface the trade-off in the
+    # message so the user can decide whether to refine.
+    soft_price = False
+    if not pool_candidates and max_price is not None:
+        pool_candidates = matcher.top_seasonings(
+            combined_query, seasonings, limit=10, pool=40,
+            past_submissions=past, strict_price=False,
+        )
+        soft_price = True
 
     top = pool_candidates[:5]
 
     ctx.user_data["seasoning_candidates"] = top
     ctx.user_data["seasoning_query"] = text  # latest only — used by "Use my text"
 
-    # Surface any parsed price cap so the user knows the filter was understood.
-    _cleaned, max_price = matcher.parse_seasoning_query(combined_query)
-    cap_note = (
-        f"\n<i>Filtered to ≤ ${max_price:g} USD.</i>" if max_price is not None else ""
-    )
+    # Surface the price filter status so the user always knows what's been applied.
+    if soft_price:
+        cap_note = (
+            f"\n⚠️ <i>No matches under <b>${max_price:g} USD</b> — "
+            "showing the closest above-budget options instead.</i>"
+        )
+    elif max_price is not None:
+        cap_note = f"\n<i>Filtered to ≤ ${max_price:g} USD.</i>"
+    else:
+        cap_note = ""
 
     # Header reflects the running search context. Multi-turn → show history.
     if len(history) > 1:

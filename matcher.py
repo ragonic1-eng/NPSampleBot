@@ -90,6 +90,7 @@ def top_seasonings(
     limit: int = 5,
     pool: int = 30,
     past_submissions: list[dict[str, str]] | None = None,
+    strict_price: bool = True,
 ) -> list[dict[str, Any]]:
     """Fuzzy-match the query, then return the `limit` cheapest from the top `pool`.
 
@@ -107,9 +108,12 @@ def top_seasonings(
 
     cleaned_query, max_price = parse_seasoning_query(query)
 
-    # Apply the price cap first so we never suggest things out of budget.
+    # Apply the price cap first so we never suggest things out of budget —
+    # unless `strict_price=False`, in which case the cap is dropped (used by
+    # the caller as a fallback when the strict pool comes back empty, so
+    # the user gets the closest above-budget items rather than nothing).
     candidates = seasonings
-    if max_price is not None:
+    if max_price is not None and strict_price:
         candidates = [
             s for s in candidates
             if _parse_price(s.get("price")) <= max_price

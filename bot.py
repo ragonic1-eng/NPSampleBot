@@ -14,6 +14,7 @@ import html
 import logging
 import os
 import re
+from decimal import ROUND_CEILING, Decimal
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -766,10 +767,17 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             )
             _audit(query=code, result="Error", error=str(e))
             continue
-        # Apply the standing markup (config.RMC_MARKUP_USD) before showing
-        # OR logging the cost — every customer-facing surface (/pp, /scan,
-        # "✏️ Enter a code") and the Query-tab audit log stay consistent.
-        adj_rmc = product.raw_material_cost_usd + config.RMC_MARKUP_USD
+        # Customer-facing Raw Material Cost rule:
+        #   1) round UP to the next 0.10  (3.47622 → 3.50)
+        #   2) add the standing markup    (+ config.RMC_MARKUP_USD = 0.30)
+        # Result: a stable, .2f USD figure we quote to sales. Same value goes
+        # to the user-visible reply AND the Query-tab audit row, so display
+        # and audit log can never disagree.
+        # Decimal (not math.ceil on a float) avoids cases where 3.40 stored as
+        # 3.40000000001 would round up to 3.50 by mistake.
+        raw_dec = Decimal(str(product.raw_material_cost_usd))
+        rounded_up = float(raw_dec.quantize(Decimal("0.1"), rounding=ROUND_CEILING))
+        adj_rmc = rounded_up + config.RMC_MARKUP_USD
         rd = (
             f"USD {product.rd_price_usd:.2f}"
             if product.rd_price_usd is not None else "—"
@@ -778,7 +786,7 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             f"<b>Code:</b> <code>{h(product.code)}</code>\n"
             f"<b>Name:</b> {h(product.name)}\n"
             f"<b>R&amp;D Price:</b> {h(rd)}\n"
-            f"<b>Raw Material Cost:</b> USD {adj_rmc:.4f}"
+            f"<b>Raw Material Cost:</b> USD {adj_rmc:.2f}"
         )
         await _replace(body)
         _audit(

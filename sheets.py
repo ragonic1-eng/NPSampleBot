@@ -155,6 +155,72 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
     return cleaned
 
 
+# ---------- /pp query log (audit trail of product price lookups) ----------
+
+PP_QUERY_TAB = "Query"
+PP_QUERY_HEADER = [
+    "Timestamp",
+    "Telegram Username",
+    "Telegram User ID",
+    "Query",
+    "Result",
+    "Matched Code",
+    "Name",
+    "R&D Price (USD)",
+    "Raw Material Cost (USD)",
+    "Error",
+]
+
+
+def log_pp_query(
+    *,
+    username: str,
+    user_id: int | str,
+    query: str,
+    result: str,
+    matched_code: str = "",
+    name: str = "",
+    rd_price_usd: float | None = None,
+    raw_material_cost_usd: float | None = None,
+    error: str = "",
+) -> None:
+    """Append one row to the 'Query' tab inside the seasoning master sheet.
+
+    Logs every /pp lookup so the user can see what's been searched. Best-effort:
+    any failure is logged and swallowed so the bot's reply to the user isn't blocked.
+    """
+    try:
+        sh = _get_client().open_by_key(config.SEASONING_SHEET_ID)
+        try:
+            ws = sh.worksheet(PP_QUERY_TAB)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=PP_QUERY_TAB, rows=1000, cols=len(PP_QUERY_HEADER))
+
+        # Make sure the header is in place — first time the bot writes here it'll be empty.
+        first = ws.row_values(1)
+        if not first:
+            ws.update("A1", [PP_QUERY_HEADER])
+        elif first != PP_QUERY_HEADER and all(not c.strip() for c in first):
+            ws.update("A1", [PP_QUERY_HEADER])
+
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        row = [
+            ts,
+            f"@{username}" if username else "",
+            str(user_id),
+            query,
+            result,
+            matched_code,
+            name,
+            "" if rd_price_usd is None else f"{rd_price_usd:.4f}",
+            "" if raw_material_cost_usd is None else f"{raw_material_cost_usd:.4f}",
+            error,
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:  # noqa: BLE001
+        log.warning("log_pp_query failed: %s", e)
+
+
 # ---------- Past sample submissions (for smart seasoning suggestions) ----------
 
 def load_past_submissions(force: bool = False) -> list[dict[str, str]]:

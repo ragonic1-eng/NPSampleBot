@@ -664,6 +664,22 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     client = mms_product.get_client()
     chat = update.effective_chat
+    user = update.effective_user
+    uname = (user.username or user.full_name or "") if user else ""
+    uid = user.id if user else ""
+
+    def _audit(**kw):
+        # Fire-and-forget audit row to the Query tab. Done in a thread so the
+        # bot's reply doesn't wait for the sheet round-trip.
+        asyncio.create_task(
+            asyncio.to_thread(
+                sheets.log_pp_query,
+                username=uname,
+                user_id=uid,
+                **kw,
+            )
+        )
+
     for code in unique:
         # Loading placeholder — edited in place once the fetch finishes so the
         # user sees a clear "in progress → done" transition (MMS calls take 2-5s).
@@ -688,21 +704,32 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _replace(
                 f"😕 No product found for <code>{h(code)}</code>.\n\n{_footer(update)}"
             )
+            _audit(query=code, result="Not Found")
             continue
         except mms_product.MMSError as e:
             log.warning("MMS error for %s: %s", code, e)
             await _replace(
                 f"😬 MMS error for <code>{h(code)}</code>: {h(str(e))}\n\n{_footer(update)}"
             )
+            _audit(query=code, result="MMS Error", error=str(e))
             continue
         except Exception as e:  # noqa: BLE001
             log.exception("Unexpected /pp error for %s", code)
             await _replace(
                 f"😵 Couldn't fetch <code>{h(code)}</code>: {h(str(e))}\n\n{_footer(update)}"
             )
+            _audit(query=code, result="Error", error=str(e))
             continue
         body = mms_product.format_pp(product)
         await _replace(f"<pre>{h(body)}</pre>\n\n{_footer(update)}")
+        _audit(
+            query=code,
+            result="Found",
+            matched_code=product.code,
+            name=product.name,
+            rd_price_usd=product.rd_price_usd,
+            raw_material_cost_usd=product.raw_material_cost_usd,
+        )
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

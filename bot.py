@@ -833,17 +833,30 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle a photo upload — OCR for product codes, then auto-/pp each one.
 
-    GATED: only fires if the user explicitly opted into a scan via /scan or the
-    main-menu Scan button. Without this gate, every photo any user posts in a
-    group chat would trigger OCR (token spam, scan-result spam).
+    GATED: only fires if the user explicitly opted into a scan, via either:
+      a) ctx.user_data["awaiting_scan_photo"] flag (set by /scan or the
+         main-menu Scan button on THIS process), or
+      b) the photo is a reply to one of our "📷 Scan a product photo"
+         prompts (works across processes — useful when Railway runs more
+         than one replica and the click + photo land on different workers).
+
+    Without this gate, every photo any user posts in a group chat would
+    trigger OCR (token spam, scan-result spam).
     """
     if not await _authorized(update):
         return
     msg = update.effective_message
     if not msg or not msg.photo:
         return
-    # Opt-in gate — pop is single-use, so each /scan accepts ONE photo.
-    if not ctx.user_data.pop("awaiting_scan_photo", None):
+    has_flag = bool(ctx.user_data.pop("awaiting_scan_photo", None))
+    replied = msg.reply_to_message
+    is_scan_reply = bool(
+        replied
+        and getattr(replied, "from_user", None)
+        and getattr(replied.from_user, "is_bot", False)
+        and "Scan a product photo" in (replied.text or "")
+    )
+    if not (has_flag or is_scan_reply):
         return
 
     chat = update.effective_chat
@@ -1459,10 +1472,21 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await _handle_bulk_text(update, ctx, text):
         return
 
-    # Manual code-entry flow ("✏️ Enter a code" on the main menu): user
-    # opted into a one-shot price lookup. Single-use — pop the flag so
-    # subsequent texts go through the normal flow.
-    if ctx.user_data.pop("awaiting_code_text", None):
+    # Manual code-entry flow ("✏️ Enter a code" on the main menu): accept
+    # text either when the per-process flag is set OR when the message is
+    # a reply to one of our "Enter a product code" prompts. Reply-detection
+    # makes the flow robust to multi-replica deployments where the click
+    # and the typed reply may land on different workers.
+    has_code_flag = bool(ctx.user_data.pop("awaiting_code_text", None))
+    msg = update.effective_message
+    replied = getattr(msg, "reply_to_message", None) if msg else None
+    is_code_reply = bool(
+        replied
+        and getattr(replied, "from_user", None)
+        and getattr(replied.from_user, "is_bot", False)
+        and "Enter a product code" in (replied.text or "")
+    )
+    if has_code_flag or is_code_reply:
         codes = _PP_CODE_RE.findall(text)
         if not codes:
             await send(

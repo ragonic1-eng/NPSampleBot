@@ -766,17 +766,19 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             )
             _audit(query=code, result="Error", error=str(e))
             continue
-        # Render with <b> labels (not <pre>) — wraps naturally on mobile.
+        # Apply the standing markup (config.RMC_MARKUP_USD) before showing
+        # OR logging the cost — every customer-facing surface (/pp, /scan,
+        # "✏️ Enter a code") and the Query-tab audit log stay consistent.
+        adj_rmc = product.raw_material_cost_usd + config.RMC_MARKUP_USD
         rd = (
             f"USD {product.rd_price_usd:.2f}"
             if product.rd_price_usd is not None else "—"
         )
-        rmc = f"USD {product.raw_material_cost_usd:.4f}"
         body = (
             f"<b>Code:</b> <code>{h(product.code)}</code>\n"
             f"<b>Name:</b> {h(product.name)}\n"
             f"<b>R&amp;D Price:</b> {h(rd)}\n"
-            f"<b>Raw Material Cost:</b> {h(rmc)}"
+            f"<b>Raw Material Cost:</b> USD {adj_rmc:.4f}"
         )
         await _replace(body)
         _audit(
@@ -785,7 +787,7 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             matched_code=product.code,
             name=product.name,
             rd_price_usd=product.rd_price_usd,
-            raw_material_cost_usd=product.raw_material_cost_usd,
+            raw_material_cost_usd=adj_rmc,
         )
 
 

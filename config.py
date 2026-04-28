@@ -4,7 +4,13 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.6.0"
+BOT_VERSION = "V1.6.1"
+
+# Margin added to MMS raw_material_cost before showing it to the user (and
+# before logging to the Query audit tab). Covers handling / overhead so
+# /pp and /scan output the customer-facing cost, not the bare MMS figure.
+# Adjust by editing this constant; price discipline lives in one place.
+RMC_MARKUP_USD = 0.30
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 

@@ -270,8 +270,20 @@ def _mark_stuck_reminder(user_id: int) -> None:
     _stuck_reminder_users.add(user_id)
 
 
-async def send(update: Update, text: str, markup: InlineKeyboardMarkup | None = None):
-    full = f"{text}\n\n{_footer(update)}"
+async def send(
+    update: Update,
+    text: str,
+    markup: InlineKeyboardMarkup | None = None,
+    *,
+    with_footer: bool = False,
+):
+    """Send/edit a message to the user.
+
+    The version + token-usage footer is OFF by default — sales reps don't need
+    to read internal metadata on every reply. Pass `with_footer=True` only on
+    debug/admin surfaces (/diag, /help, /whoami).
+    """
+    full = f"{text}\n\n{_footer(update)}" if with_footer else text
     user = update.effective_user
     stuck = bool(user and user.id in _stuck_reminder_users)
     if update.callback_query and not stuck:
@@ -345,10 +357,10 @@ async def _authorized(update: Update) -> bool:
         log.warning("auth denied: uid=%s uname=%s", user.id, user.username)
         await send(
             update,
-            "🔒 You are not authorized to use this bot.\n\n"
-            f"Please ask your admin to add you.\n"
-            f"Your Telegram username: <code>@{h(user.username or '(none)')}</code>\n"
-            f"Your Telegram ID: <code>{user.id}</code>",
+            "🔒 <b>You're not authorized to use this bot.</b>\n\n"
+            "Please ask the admin to add you, and share these details:\n"
+            f"• Username: <code>@{h(user.username or '(none)')}</code>\n"
+            f"• Telegram ID: <code>{user.id}</code>",
         )
     return ok
 
@@ -368,19 +380,16 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Don't start a draft yet — wait for the user to pick "new request".
     state.clear(user.id)
     menu = [
-        [("➕ Raise a new sample request", "menu:new")],
-        [("📄 Paste bulk request (multi-seasoning)", "menu:bulk")],
-        [("📷 Scan code (photo → /pp)", "menu:scan")],
-        [("📋 Check samples I raised", "menu:samples")],
+        [("➕ Raise a sample request", "menu:new")],
+        [("📄 Paste a multi-seasoning email", "menu:bulk")],
+        [("📷 Scan a product photo", "menu:scan")],
+        [("📋 My sample requests", "menu:samples")],
     ]
     if _is_update_sample_owner(user):
-        menu.append([("🔄 Update Sample Master List (MMS)", "menu:updsample")])
+        menu.append([("🔄 Sync MMS Sample Master List", "menu:updsample")])
     await send(
         update,
-        "👋 <b>Welcome to NPSampleBot</b>\n\n"
-        f"⏱ Idle timeout: {config.DRAFT_TIMEOUT_MINUTES} min · "
-        "◀ Back / ✖ Cancel anytime · /edit to jump to review\n\n"
-        "What would you like to do?",
+        "👋 <b>Hi there — what can I help with?</b>",
         kb(menu),
     )
 
@@ -399,39 +408,46 @@ async def cmd_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state.clear(update.effective_user.id)
-    await send(update, "Draft cancelled. Send /start to begin a new one.")
+    await send(
+        update,
+        "✖ Draft cancelled.",
+        kb([[("🏠 Main menu", "menu:home")]]),
+    )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    is_admin = _is_update_sample_owner(user)
     lines = [
-        "<b>NPSampleBot — commands</b>",
+        "<b>📚 NPSampleBot — commands</b>",
         "",
-        "<b>Main flow</b>",
-        "/start — main menu (new request · bulk paste · check samples)",
-        "/bulk — paste a multi-seasoning email, I split it into items",
-        "/samples — list samples you've raised (today / this month)",
+        "<b>Sample requests</b>",
+        "/start — main menu",
+        "/bulk — paste a multi-seasoning email, I split it for you",
+        "/samples — review the requests you've raised",
         "",
-        "<b>Drafting</b>",
-        "/edit — jump to the draft review to change any field",
+        "<b>While drafting</b>",
+        "/edit — jump back to the review to change any field",
         "/cancel — discard the current draft",
         "",
-        "<b>Utilities</b>",
-        "/pp <code> — pull product price from MMS (Code · Name · R&D Price · Raw Material Cost)",
-        "/scan — send a photo, I OCR product codes and auto-run /pp",
-        "/reload — refresh seasoning & customer lists from Google Sheets",
-        "/whoami — show your Telegram ID & username",
-        "/diag — diagnostic (shows what the bot can read from the Users tab)",
+        "<b>Product lookup</b>",
+        "/pp <code> — fetch price (Code · Name · R&amp;D Price · Raw Material Cost)",
+        "/scan — send a photo, I OCR codes and run /pp on each",
+        "",
+        "<b>Account</b>",
+        "/whoami — your Telegram ID and username",
         "/help — this message",
     ]
-    if _is_update_sample_owner(user):
+    if is_admin:
         lines += [
             "",
-            "<b>Admin</b>",
-            "/updatesamplelist — sync Sample Master List 2024-Present from MMS "
-            "(24h cooldown; append <code>force</code> to override)",
+            "<b>🔧 Admin</b>",
+            "/reload — refresh seasoning &amp; customer lists from Sheets",
+            "/diag — diagnostics (auth / sheet visibility)",
+            "/updatesamplelist — sync Sample Master List from MMS (24h cooldown; "
+            "append <code>force</code> to override)",
         ]
-    await send(update, "\n".join(lines))
+    await send(update, "\n".join(lines), with_footer=True)
 
 
 SAMPLE_SYNC_COOLDOWN_HOURS = 24
@@ -627,6 +643,7 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send(
         update,
         f"Username: <code>@{h(u.username or '(none)')}</code>\nID: <code>{u.id}</code>",
+        with_footer=True,
     )
 
 
@@ -689,27 +706,36 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         try:
             product = await asyncio.to_thread(client.fetch_product, code)
         except mms_product.ProductNotFound:
-            await _replace(
-                f"😕 No product found for <code>{h(code)}</code>.\n\n{_footer(update)}"
-            )
+            await _replace(f"😕 No product found for <code>{h(code)}</code>.")
             _audit(query=code, result="Not Found")
             continue
         except mms_product.MMSError as e:
             log.warning("MMS error for %s: %s", code, e)
             await _replace(
-                f"😬 MMS error for <code>{h(code)}</code>: {h(str(e))}\n\n{_footer(update)}"
+                f"😬 MMS error for <code>{h(code)}</code>: {h(str(e))}"
             )
             _audit(query=code, result="MMS Error", error=str(e))
             continue
         except Exception as e:  # noqa: BLE001
             log.exception("Unexpected /pp error for %s", code)
             await _replace(
-                f"😵 Couldn't fetch <code>{h(code)}</code>: {h(str(e))}\n\n{_footer(update)}"
+                f"😵 Couldn't fetch <code>{h(code)}</code>: {h(str(e))}"
             )
             _audit(query=code, result="Error", error=str(e))
             continue
-        body = mms_product.format_pp(product)
-        await _replace(f"<pre>{h(body)}</pre>\n\n{_footer(update)}")
+        # Render with <b> labels (not <pre>) — wraps naturally on mobile.
+        rd = (
+            f"USD {product.rd_price_usd:.2f}"
+            if product.rd_price_usd is not None else "—"
+        )
+        rmc = f"USD {product.raw_material_cost_usd:.4f}"
+        body = (
+            f"<b>Code:</b> <code>{h(product.code)}</code>\n"
+            f"<b>Name:</b> {h(product.name)}\n"
+            f"<b>R&amp;D Price:</b> {h(rd)}\n"
+            f"<b>Raw Material Cost:</b> {h(rmc)}"
+        )
+        await _replace(body)
         _audit(
             query=code,
             result="Found",
@@ -735,7 +761,7 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not codes:
         await send(
             update,
-            "💲 <b>/pp</b> — product price from MMS\n\n"
+            "💲 <b>Product price lookup</b>\n\n"
             "Send a product code, e.g. <code>/pp S-62RG3-19</code>.",
         )
         return
@@ -752,10 +778,9 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["awaiting_scan_photo"] = True
     await send(
         update,
-        "📷 <b>Scan code from photo</b>\n\n"
-        "Send me a photo of one or more product codes (the labels with "
-        "<code>S-XXXXX-XX</code> shapes). I'll OCR them, double-check against "
-        "the catalog, and run <code>/pp</code> on every code I find.",
+        "📷 <b>Scan a product photo</b>\n\n"
+        "Send a photo of one or more product code labels "
+        "(<code>S-XXXXX-XX</code>). I'll read them and pull the price for each.",
     )
 
 
@@ -832,10 +857,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # Build a summary so the user sees what we detected (and any auto-corrections).
-    src_label = {"tesseract": "🆓 free OCR", "haiku": "🤖 Haiku vision"}.get(
-        result.source, "OCR"
-    )
-    lines = [f"🎯 Detected <b>{len(result.codes)}</b> code(s) ({src_label}):"]
+    lines = [f"🎯 Detected <b>{len(result.codes)}</b> code(s):"]
     for raw, final in zip(result.raw_codes, result.codes):
         if raw != final:
             lines.append(f"  • <code>{h(raw)}</code> → <code>{h(final)}</code> 🩹 auto-corrected")
@@ -876,7 +898,7 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         users = await asyncio.to_thread(sheets.load_users, True)
     except Exception as e:  # noqa: BLE001
         lines.append(f"\n❌ <b>load_users() failed:</b> <code>{h(str(e)[:300])}</code>")
-        await send(update, "\n".join(lines))
+        await send(update, "\n".join(lines), with_footer=True)
         return
 
     lines.append(f"\n✅ Loaded <b>{len(users)}</b> row(s) from Authorized Users tab.")
@@ -912,7 +934,7 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "  • Active: <code>Y</code>"
         )
 
-    await send(update, "\n".join(lines))
+    await send(update, "\n".join(lines), with_footer=True)
 
 
 async def cmd_reload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -949,7 +971,11 @@ async def cmd_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "please kindly redo — send /start to begin a new request.",
             )
         else:
-            await send(update, "No draft in progress. Send /start to begin.")
+            await send(
+                update,
+                "No draft in progress.",
+                kb([[("🏠 Main menu", "menu:home")]]),
+            )
         return
     d.stage = "review"
     await ask(update, ctx, d)
@@ -971,13 +997,11 @@ async def q_seasoning(update, ctx, d: state.Draft):
     hint = f"\n\nCurrent: <i>{h(current)}</i>" if current else ""
     await send(
         update,
-        "🌶 <b>1/16 · Seasoning Requested</b>\n\n"
-        "Type what you're looking for — I'll suggest the 5 closest matches.\n\n"
-        "💡 <b>You can include filters in plain English:</b>\n"
-        "• <i>cheese seasoning for bangladesh</i>\n"
-        "• <i>cheese seasoning below 4.5 usd</i>\n"
-        "• <i>cheese for chinese style</i>\n"
-        "• <i>bbq under $3</i>" + hint,
+        "🌶 <b>Seasoning Requested</b>\n\n"
+        "Type what you're looking for — I'll suggest the closest matches.\n\n"
+        "💡 You can add filters: "
+        "<i>cheese for bangladesh</i> · <i>bbq under $3</i> · "
+        "<i>spicy chinese style</i>" + hint,
         kb([nav_row(include_back=False)]),
     )
     d.sub = "ask"
@@ -988,10 +1012,11 @@ async def q_comment(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "💬 <b>2/16 · Comment to R&D</b>\n\n"
-        "Tell R&D whether this uses an existing code or needs new development.\n"
-        "Example: <i>\"Use code S-WCFG2-10 as a snack seasoning\"</i> or "
-        "<i>\"New code needed — peppery and less spicy\"</i>." + hint,
+        "💬 <b>Comment to R&amp;D</b>\n\n"
+        "What should R&amp;D do — use an existing code, or develop a new one?\n"
+        "<i>Examples:</i>\n"
+        "• Use code S-WCFG2-10 as a snack seasoning\n"
+        "• New code needed — peppery, less spicy" + hint,
         kb([nav_row()]),
     )
 
@@ -1014,7 +1039,7 @@ async def q_quantity(update, ctx, d):
     if d.sub == "main":
         if is_oil:
             prompt = (
-                "🛢 <b>3/16 · Quantity — bottles</b>\n\n"
+                "🛢 <b>Quantity</b>\n\n"
                 "This is an <b>oil</b>. How many small bottles are needed?"
             )
             buttons: list[list[tuple[str, str]]] = []
@@ -1028,7 +1053,7 @@ async def q_quantity(update, ctx, d):
                 buttons.append(row)
         else:
             prompt = (
-                "⚖️ <b>3/16 · Quantity — seasoning</b>\n\n"
+                "⚖️ <b>Quantity</b>\n\n"
                 "How much seasoning is required?"
             )
             buttons = []
@@ -1040,7 +1065,7 @@ async def q_quantity(update, ctx, d):
                     row = []
             if row:
                 buttons.append(row)
-        buttons.append([("⌨️ Manual key in", "qm:manual")])
+        buttons.append([("⌨️ Type it manually", "qm:manual")])
         buttons.append(nav_row())
         await send(update, prompt + hint, kb(buttons))
         return
@@ -1065,7 +1090,7 @@ async def q_quantity(update, ctx, d):
                 row = []
         if row:
             buttons.append(row)
-        buttons.append([("⌨️ Manual key in", "qs:manual")])
+        buttons.append([("⌨️ Type it manually", "qs:manual")])
         buttons.append(nav_row())
         await send(
             update,
@@ -1112,7 +1137,7 @@ async def q_quantity(update, ctx, d):
                 row = []
         if row:
             buttons.append(row)
-        buttons.append([("⌨️ Manual key in", "qas:manual")])
+        buttons.append([("⌨️ Type it manually", "qas:manual")])
         buttons.append(nav_row())
         await send(
             update,
@@ -1131,11 +1156,11 @@ async def q_quantity(update, ctx, d):
 
     if d.sub == "app_base":
         buttons = [[(b, f"qb:{i}")] for i, b in enumerate(APP_BASES)]
-        buttons.append([("⌨️ Enter manually", "qb:manual")])
+        buttons.append([("⌨️ Type it manually", "qb:manual")])
         buttons.append(nav_row())
         await send(
             update,
-            "🍟 <b>On what base product?</b>\n\nPick one, or tap Enter manually.",
+            "🎯 <b>Application Base Product</b>\n\nWhat base will the sample be applied on?",
             kb(buttons),
         )
         return
@@ -1153,15 +1178,16 @@ async def q_price_budget(update, ctx, d):
     if d.sub == "currency":
         await send(
             update,
-            "💰 <b>4/16 · Selling Price Budget — Currency</b>\n\n"
+            "💰 <b>Selling Price Budget</b>\n\n"
             "Pick a currency:" + hint,
             kb([[("USD", "cur:USD"), ("SGD", "cur:SGD")], nav_row()]),
         )
     else:
+        cur = d.data.get('_currency', 'USD')
         await send(
             update,
-            f"💰 <b>4/16 · Selling Price Budget — Amount ({d.data.get('_currency','USD')})</b>\n\n"
-            "Type the max budget. Example: <i>3.00</i>" + hint,
+            f"💰 <b>Selling Price Budget</b>\n\n"
+            f"Type the max budget in {cur} (e.g. <i>3.00</i>)." + hint,
             kb([nav_row()]),
         )
 
@@ -1173,7 +1199,7 @@ async def q_app_method(update, ctx, d):
     buttons.append(nav_row())
     await send(
         update,
-        "🧪 <b>5/16 · Application Method</b>\n\nPick one:" + hint,
+        "🧪 <b>Application Method</b>\n\nPick one:" + hint,
         kb(buttons),
     )
 
@@ -1183,7 +1209,7 @@ async def q_dosage(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "📏 <b>6/16 · Dosage</b>\n\n"
+        "📏 <b>Dosage</b>\n\n"
         "Customer-suggested dosage (e.g. <i>7%</i>). Tap Skip if not sure." + hint,
         kb([nav_row(include_skip=True)]),
     )
@@ -1194,7 +1220,7 @@ async def q_requirement(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "✅ <b>7/16 · Requirement</b>\n\n"
+        "📜 <b>Requirement</b>\n\n"
         "Any specific regulations? Example: <i>NO MSG / GMO FREE / HALAL</i>. "
         "Skip if none." + hint,
         kb([nav_row(include_skip=True)]),
@@ -1206,7 +1232,7 @@ async def q_market(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "🌏 <b>8/16 · Market</b>\n\nFor which market? Example: <i>Vietnam</i>" + hint,
+        "🌏 <b>Market</b>\n\nFor which market? (e.g. <i>Vietnam</i>)" + hint,
         kb([nav_row()]),
     )
 
@@ -1216,7 +1242,7 @@ async def q_deadline(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "⏰ <b>9/16 · Deadline</b>\n\n"
+        "⏰ <b>Deadline</b>\n\n"
         "When does the customer need the sample by? "
         "Example: <i>30 April 2026</i> · <i>next Friday</i> · <i>2 weeks</i>." + hint,
         kb([nav_row()]),
@@ -1228,7 +1254,7 @@ async def q_taste_check(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "👅 <b>10/16 · Need to Check Taste?</b>" + hint,
+        "👅 <b>Need to Check Taste?</b>" + hint,
         kb([[("✅ Yes", "yn:Y"), ("❌ No", "yn:N")], nav_row()]),
     )
 
@@ -1253,12 +1279,12 @@ async def q_customer_base(update, ctx, d):
             row = []
     if row:
         buttons.append(row)
-    buttons.append([("⌨️ Enter manually", "cb:manual")])
+    buttons.append([("⌨️ Type it manually", "cb:manual")])
     buttons.append(nav_row())
     await send(
         update,
-        "🍿 <b>11/16 · Customer Base</b>\n\n"
-        "Pick one, or tap Enter manually to type your own." + hint,
+        "🍿 <b>Customer Base</b>\n\n"
+        "Pick one, or tap <i>Type it manually</i> to enter your own." + hint,
         kb(buttons),
     )
 
@@ -1270,7 +1296,7 @@ async def q_courier(update, ctx, d):
     buttons.append(nav_row())
     await send(
         update,
-        "🚚 <b>12/16 · Preferred Courier</b>\n\nPick one:" + hint,
+        "🚚 <b>Preferred Courier</b>\n\nPick one:" + hint,
         kb(buttons),
     )
 
@@ -1280,7 +1306,7 @@ async def q_company_name(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "🏢 <b>13/16 · Customer Company Name</b>\n\n"
+        "🏢 <b>Customer Company Name</b>\n\n"
         "Type the company name. If we already have them, I'll auto-fill the rest." + hint,
         kb([nav_row()]),
     )
@@ -1292,7 +1318,8 @@ async def q_receiver_number(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "📞 <b>14/16 · Receiver Number</b>\n\nExample: <i>+86 282 628 181</i>" + hint,
+        "📞 <b>Receiver Number</b>\n\n"
+        "Phone number for the courier (e.g. <i>+65 9123 4567</i>)." + hint,
         kb([nav_row()]),
     )
 
@@ -1302,7 +1329,8 @@ async def q_address(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "📍 <b>15/16 · Address</b>\n\nExample: <i>82 Pham Asset Road PO 881791</i>" + hint,
+        "📍 <b>Address</b>\n\n"
+        "Where the sample should be shipped." + hint,
         kb([nav_row()]),
     )
 
@@ -1312,28 +1340,26 @@ async def q_receiving_person(update, ctx, d):
     hint = f"\n\nCurrent: <i>{h(existing)}</i>" if existing else ""
     await send(
         update,
-        "🙋 <b>16/16 · Receiving Person</b>\n\nExample: <i>Ms Jenny</i>" + hint,
+        "🙋 <b>Receiving Person</b>\n\nWho should the courier ask for? (e.g. <i>Ms Jenny</i>)" + hint,
         kb([nav_row()]),
     )
 
 
 async def q_review(update, ctx, d: state.Draft):
-    lines = ["<b>📝 Draft summary</b>\n"]
+    lines = ["<b>📝 Review your request</b>\n"]
     for key, label in FIELDS:
         if key == "comment":
             val = _effective_comment(d)
         else:
             val = d.data.get(key, "")
-        if not val:
-            val_str = "<i>(empty)</i>"
-        else:
-            val_str = h(val)
+        val_str = h(val) if val else "<i>(empty)</i>"
         lines.append(f"<b>{h(label)}:</b> {val_str}")
-    lines.append("\nAll good? Confirm to save, or edit a field.")
+    lines.append("\nAll good?")
+    # Cancel separated from the primary actions to avoid one-tap mishaps.
     buttons = [
-        [("✅ Confirm & submit", "rev:confirm")],
+        [("✅ Submit", "rev:confirm")],
         [("✏️ Edit a field", "rev:edit")],
-        [("✖ Cancel draft", "nav:cancel")],
+        [("✖ Discard draft", "nav:cancel")],
     ]
     await send(update, "\n".join(lines), kb(buttons))
 
@@ -1383,7 +1409,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "please kindly redo — send /start to begin a new request.",
             )
         else:
-            await send(update, "No draft in progress. Send /start to begin.")
+            await send(
+                update,
+                "No draft in progress.",
+                kb([[("🏠 Main menu", "menu:home")]]),
+            )
         return
     d.touch()
 
@@ -1433,7 +1463,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _advance(update, ctx, d)
             return
         _mark_stuck_reminder(user.id)
-        await send(update, "Please use the buttons above (or tap Manual to type).")
+        await send(update, "👆 Tap a button above, or use <i>Type it manually</i>.")
         return
 
     if stage == "price_budget" and d.sub == "amount":
@@ -1446,13 +1476,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if stage == "price_budget" and d.sub == "currency":
         _mark_stuck_reminder(user.id)
-        await send(update, "Please tap USD or SGD above.")
+        await send(update, "👆 Tap USD or SGD above.")
         return
 
     # Fields that accept a button answer — remind user.
     if stage in {"app_method", "taste_check", "courier"}:
         _mark_stuck_reminder(user.id)
-        await send(update, "Please pick an option from the buttons above.")
+        await send(update, "👆 Tap one of the buttons above.")
         return
 
     # Customer base manual entry — sub-state set by tapping "Enter manually".
@@ -1600,13 +1630,13 @@ async def _handle_company_text(update, ctx, d: state.Draft, text: str):
     if d.sub == "new_name":
         d.data["company_name"] = text
         d.sub = ""
-        await send(update, f"Got it — <b>{h(text)}</b>. Let's grab the contact details.")
+        await send(update, f"Saved as new customer: <b>{h(text)}</b>.")
         await _advance(update, ctx, d)
         return
 
     if d.sub == "confirm_address":
         _mark_stuck_reminder(d.user_id)
-        await send(update, "Please tap ✅ Yes or ❌ No above.")
+        await send(update, "👆 Tap ✅ Yes or ❌ No above.")
         return
 
     try:
@@ -1704,7 +1734,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "please kindly redo — send /start to begin a new request.",
             )
         else:
-            await send(update, "No draft in progress. Send /start to begin.")
+            await send(
+                update,
+                "No draft in progress.",
+                kb([[("🏠 Main menu", "menu:home")]]),
+            )
         return
     d.touch()
 
@@ -1854,8 +1888,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _handle_menu_callback(update, ctx, action: str):
-    """Top-level /start menu (V0.3.0): new request vs. check samples."""
+    """Top-level /start menu — pick what the user wants to do."""
     user = update.effective_user
+    if action == "home":
+        await cmd_start(update, ctx)
+        return
     if action == "new":
         state.clear(user.id)
         d = state.start(user.id, user.username or user.first_name or "")
@@ -1872,11 +1909,10 @@ async def _handle_menu_callback(update, ctx, action: str):
         ctx.user_data["awaiting_scan_photo"] = True
         await send(
             update,
-            "📷 <b>Scan code from photo</b>\n\n"
-            "Send me a photo of one or more product codes (the labels with "
-            "<code>S-XXXXX-XX</code> shapes). I'll OCR them, double-check against "
-            "the catalog, and run <code>/pp</code> on every code I find.\n\n"
-            "Tip: tap 📎 → Camera, snap a clear shot, send.",
+            "📷 <b>Scan a product photo</b>\n\n"
+            "Send a photo of one or more product code labels "
+            "(<code>S-XXXXX-XX</code>). I'll read them and pull the price for each.\n\n"
+            "<i>Tip:</i> tap 📎 → Camera for the sharpest shot.",
         )
         return
     if action == "updsample":
@@ -1928,8 +1964,28 @@ async def _handle_again(update, ctx, action: str):
 
 async def _handle_nav(update, ctx, d: state.Draft, action: str):
     if action == "cancel":
+        # Confirm before discarding — single tap kills 16 fields of work otherwise.
+        await send(
+            update,
+            "⚠️ <b>Cancel this draft?</b>\n\n"
+            "All entered fields will be discarded. This cannot be undone.",
+            kb([
+                [("🗑 Yes, discard", "nav:cancel_yes")],
+                [("◀ Keep editing", "nav:cancel_no")],
+            ]),
+        )
+        return
+    if action == "cancel_yes":
         state.clear(d.user_id)
-        await send(update, "Draft cancelled. Send /start to begin a new one.")
+        await send(
+            update,
+            "✖ Draft discarded.",
+            kb([[("🏠 Main menu", "menu:home")]]),
+        )
+        return
+    if action == "cancel_no":
+        # Bounce back to whatever question we were on.
+        await ask(update, ctx, d)
         return
     if action == "skip":
         d.data[d.stage] = ""
@@ -2072,7 +2128,7 @@ async def _handle_review(update, ctx, d: state.Draft, action: str):
         buttons = []
         for key, label in FIELDS:
             buttons.append([(f"✏️ {label}", f"edit:{key}")])
-        buttons.append([("↩ Back to draft", "rev:back")])
+        buttons.append([("◀ Back to draft", "rev:back")])
         await send(update, "<b>Which field do you want to edit?</b>", kb(buttons))
         return
     if action == "back":
@@ -2189,13 +2245,6 @@ async def _submit(update, ctx, d: state.Draft):
     except Exception as e:  # noqa: BLE001
         log.warning("upsert_customer failed: %s", e)
 
-    tokens_msg = (
-        f"\n\n🧠 AI tokens used for this request: <b>{d.tokens_total}</b> "
-        f"(in {d.tokens_in} · out {d.tokens_out})"
-        if d.tokens_total
-        else "\n\n🧠 AI tokens used for this request: <b>0</b>"
-    )
-
     # Bulk-session submit: mark the item done and return to the bulk list
     # instead of the normal post-submit screen.
     bulk_idx_raw = d.data.get("_bulk_idx", "")
@@ -2220,10 +2269,7 @@ async def _submit(update, ctx, d: state.Draft):
                 "_contact_linked": d.data.get("_contact_linked", ""),
             }
         state.clear(user.id)
-        await send(
-            update,
-            f"✅ <b>Item {bi + 1} saved to the sales log.</b>" + tokens_msg,
-        )
+        await send(update, f"✅ Item {bi + 1} saved.")
         await _show_bulk_list(update, ctx)
         return
 
@@ -2232,18 +2278,15 @@ async def _submit(update, ctx, d: state.Draft):
     ctx.user_data["last_submission"] = dict(d.data)
     state.clear(user.id)
     company = d.data.get("company_name", "")
-    again_hint = f" for <b>{h(company)}</b>" if company else ""
+    company_line = f"\nCustomer: <b>{h(company)}</b>" if company else ""
     buttons = [
-        [("➕ Add another seasoning (same customer)", "again:same")],
-        [("📋 Check samples I raised", "again:samples")],
-        [("🆕 Start fresh", "again:fresh")],
+        [("➕ Same customer — add another seasoning", "again:same")],
+        [("🆕 Start a fresh request", "again:fresh")],
+        [("📋 My sample requests", "again:samples")],
     ]
     await send(
         update,
-        "✅ <b>Saved!</b> Your sample request has been added to the sales log."
-        + tokens_msg
-        + f"\n\nNeed to add another seasoning{again_hint}? Tap below — "
-        "I'll carry everything over so you only set the new seasoning.",
+        f"✅ <b>Saved.</b>{company_line}\n\nWhat next?",
         kb(buttons),
     )
 
@@ -2253,7 +2296,7 @@ async def _submit(update, ctx, d: state.Draft):
 async def show_samples_menu(update, ctx):
     await send(
         update,
-        "📋 <b>Check samples I raised</b>\n\nPick a period:",
+        "📋 <b>My sample requests</b>\n\nPick a period:",
         kb([
             [("🗓 Today", "samp:today")],
             [("📆 This month", "samp:month")],
@@ -2381,11 +2424,13 @@ async def _handle_samples_callback(update, ctx, action: str):
         return
     if action == "close":
         q = update.callback_query
-        footer = _footer(update)
         try:
             await q.edit_message_text(
-                f"Closed. Send /start or /samples anytime.\n\n{footer}",
+                "Closed.",
                 parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🏠 Main menu", callback_data="menu:home")]]
+                ),
             )
         except Exception:  # noqa: BLE001
             pass
@@ -2511,7 +2556,7 @@ async def _ask_bulk_base(update, ctx):
             row = []
     if row:
         buttons.append(row)
-    buttons.append([("⌨️ Enter manually", "bsh:base:manual")])
+    buttons.append([("⌨️ Type it manually", "bsh:base:manual")])
     buttons.append([("✖ Cancel", "bulk:cancel")])
     await send(
         update,
@@ -2527,7 +2572,7 @@ async def _ask_bulk_base_manual(update, ctx):
     shared = ctx.user_data.get("bulk_shared", {})
     await send(
         update,
-        "⌨️ <b>Customer Base (shared) — Enter manually</b>\n\n"
+        "⌨️ <b>Customer Base (shared)</b>\n\n"
         f"{_bulk_shared_summary(shared)}\n\n"
         "Type the customer base to apply to every item:",
         kb([[("✖ Cancel", "bulk:cancel")]]),
@@ -2605,7 +2650,7 @@ async def _run_bulk_parse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
     await send(
         update,
-        "🧠 <b>Parsing your paste with Claude Sonnet 4.6…</b>\n\n"
+        "🧠 <b>Reading your paste…</b>\n\n"
         "This usually takes a few seconds. Please wait.",
     )
 
@@ -3000,7 +3045,11 @@ async def _handle_bulk_callback(update, ctx, action: str):
                   "bulk_customer_carry"):
             ctx.user_data.pop(k, None)
         state.clear(user.id)
-        await send(update, "Bulk session cancelled. Send /start to begin again.")
+        await send(
+            update,
+            "✖ Bulk session cancelled.",
+            kb([[("🏠 Main menu", "menu:home")]]),
+        )
         return
     if action == "retry":
         await _run_bulk_parse(update, ctx)
@@ -3012,8 +3061,11 @@ async def _handle_bulk_callback(update, ctx, action: str):
             ctx.user_data.pop(k, None)
         await send(
             update,
-            "🎉 <b>All bulk items submitted.</b>\n\nSend /start for more, or "
-            "/samples to review what you logged.",
+            "🎉 <b>All bulk items submitted.</b>",
+            kb([
+                [("📋 My sample requests", "again:samples")],
+                [("🏠 Main menu", "menu:home")],
+            ]),
         )
         return
     if action == "list":

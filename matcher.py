@@ -7,6 +7,32 @@ from rapidfuzz import fuzz, process, utils
 
 import re
 
+# Generic words that appear in nearly every seasoning name AND most user
+# queries — they massively inflate fuzzy scores without adding signal. We
+# strip them from BOTH the query and the catalog choice strings before
+# scoring so the remaining tokens (cuisine, flavour, application) actually
+# drive ranking. Without this, "spicy korean noodle seasoning" is
+# essentially scored as just "seasoning" against the catalog and pulls
+# unrelated cheese / onion / pickled items to the top.
+_GENERIC_TERMS = {
+    "seasoning", "seasonings",
+    "powder", "powders",
+    "flavor", "flavors", "flavour", "flavours",
+    "flavored", "flavoured",
+    "blend", "blends",
+    "mix", "mixes",
+}
+_GENERIC_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _GENERIC_TERMS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_generic(s: str) -> str:
+    """Remove generic seasoning-domain words so they don't dominate scoring."""
+    return re.sub(r"\s+", " ", _GENERIC_RE.sub(" ", s)).strip()
+
+
 _PRICE_NUM = re.compile(r"[-+]?\d*\.?\d+")
 
 # "below 4.5", "under $3", "less than 5 usd", "cheaper than 2.50", "<=4.5", "<4".
@@ -53,6 +79,7 @@ def parse_seasoning_query(query: str) -> tuple[str, float | None]:
             max_price = None
     cleaned = _PRICE_STRIP_RE.sub(" ", q)
     cleaned = _LONELY_CURRENCY_RE.sub(" ", cleaned)
+    cleaned = _strip_generic(cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned, max_price
 
@@ -103,21 +130,35 @@ def top_seasonings(
         return out
 
     # Score against seasoning name + category — fold category into the choice
-    # so "korean noodle" rewards items in the Noodle category tab.
+    # so "korean noodle" rewards items in the Noodle category tab. Also strip
+    # generic terms from the choice string so "seasoning" / "powder" /
+    # "flavour" don't dominate the score.
     choices = {
-        i: f"{s['name']} {s.get('category', '')}".strip()
+        i: _strip_generic(f"{s['name']} {s.get('category', '')}").strip()
         for i, s in enumerate(candidates)
     }
+
+    # Combined scorer: max(WRatio, token_set_ratio).
+    #  - WRatio handles typos and continuous-substring matches well
+    #  - token_set_ratio is order-insensitive ("spicy korean noodle" should
+    #    score the same as "korean spicy noodle")
+    # WRatio alone drops the noodle item from 90 → 86 just because the user
+    # reordered tokens, which is a real-world bug we hit.
+    def _combined(q: str, c: str, **kwargs) -> float:
+        a = fuzz.WRatio(q, c, **kwargs)
+        b = fuzz.token_set_ratio(q, c, **kwargs)
+        return max(a, b)
+
     results = process.extract(
         cleaned_query,
         choices,
-        scorer=fuzz.WRatio,
+        scorer=_combined,
         processor=utils.default_process,
         limit=pool,
     )
     pooled: dict[int, dict[str, Any]] = {}
     for _name, score, idx in results:
-        if score < 55:  # slightly looser, AI rerank/category boost will tighten
+        if score < 50:  # combined scorer; AI rerank does the final ordering
             continue
         s = candidates[idx]
         pooled[idx] = {
@@ -173,7 +214,22 @@ def top_seasonings(
                         "_past_hits": len(pscores),
                     }
 
-    ranked = list(pooled.values())
+    # Dedupe by code: the same product code lives in both its proper category
+    # tab and the historical "Sample Master List 2024-Present" tab — without
+    # this dedupe the top-5 is half-duplicates. Keep the highest-scoring
+    # entry per code.
+    by_code: dict[str, dict[str, Any]] = {}
+    no_code_entries: list[dict[str, Any]] = []
+    for s in pooled.values():
+        code = str(s.get("code", "")).strip().upper()
+        if not code:
+            no_code_entries.append(s)
+            continue
+        existing = by_code.get(code)
+        if existing is None or s["score"] > existing["score"]:
+            by_code[code] = s
+
+    ranked = list(by_code.values()) + no_code_entries
     # Best-first by score, then cheapest within ties.
     ranked.sort(key=lambda s: (-s["score"], s["_price_num"]))
     return ranked[:limit]

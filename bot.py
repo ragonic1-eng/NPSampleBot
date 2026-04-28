@@ -448,6 +448,8 @@ async def cmd_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state.clear(update.effective_user.id)
+    for k in ("seasoning_queries", "seasoning_candidates", "seasoning_query"):
+        ctx.user_data.pop(k, None)
     await send(
         update,
         "✖ Draft cancelled.",
@@ -1556,6 +1558,22 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
     chat = update.effective_chat
+
+    # Conversational refinement: keep a short query history within the same
+    # seasoning-stage session. Each new line the user types ADDS to their
+    # search intent rather than replacing it. So:
+    #   "instant soup seasoning"  → search "instant soup seasoning"
+    #   then "i want more spicy"  → search "instant soup seasoning · spicy"
+    # Cleared when the user picks a candidate, taps "🔄 Start over", or
+    # cancels the draft.
+    history: list[str] = list(ctx.user_data.get("seasoning_queries", []))
+    history.append(text)
+    # Cap history so it doesn't grow forever — only the last 4 turns count.
+    if len(history) > 4:
+        history = history[-4:]
+    ctx.user_data["seasoning_queries"] = history
+    combined_query = " · ".join(history)
+
     try:
         await chat.send_action("typing")
     except Exception:  # noqa: BLE001
@@ -1587,12 +1605,14 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         d.data["seasoning"] = text
         d.matched_code = ""
         d.matched_price = ""
+        ctx.user_data.pop("seasoning_queries", None)
         await _advance(update, ctx, d)
         return
 
     # Code-first match: if the user pasted a product code (exact or suffix-trim
     # variant), skip fuzzy name search and ask them to confirm the single hit.
     # Much clearer UX than burying the code match inside a fuzzy-name list.
+    # Code lookup uses the LATEST text only — combining history would never help.
     code_hit = matcher.find_by_code(text, seasonings)
     if code_hit:
         ctx.user_data["seasoning_candidates"] = [code_hit]
@@ -1618,7 +1638,8 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
 
     # Smart match: fuzzy-pool (name + category) + past-submissions boost,
     # then Claude rerank on the top 10. matcher also parses price filters
-    # like "below 4.5 usd" / "under $3" out of the query.
+    # like "below 4.5 usd" / "under $3" out of the query. We feed it the
+    # COMBINED query so multi-turn refinement keeps prior context.
     try:
         past = await asyncio.to_thread(sheets.load_past_submissions)
     except Exception as e:  # noqa: BLE001
@@ -1626,14 +1647,14 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         past = []
 
     pool_candidates = matcher.top_seasonings(
-        text, seasonings, limit=10, pool=40, past_submissions=past
+        combined_query, seasonings, limit=10, pool=40, past_submissions=past
     )
 
     # Claude rerank for semantic intent ("korea spicy noodle" → noodle items).
     # Falls back to the fuzzy order if the API fails or is offline.
     if pool_candidates:
         try:
-            reranked, tin, tout = await ai.rerank_seasonings(text, pool_candidates)
+            reranked, tin, tout = await ai.rerank_seasonings(combined_query, pool_candidates)
             d.tokens_in += tin
             d.tokens_out += tout
             pool_candidates = reranked
@@ -1643,22 +1664,36 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
     top = pool_candidates[:5]
 
     ctx.user_data["seasoning_candidates"] = top
-    ctx.user_data["seasoning_query"] = text
+    ctx.user_data["seasoning_query"] = text  # latest only — used by "Use my text"
 
     # Surface any parsed price cap so the user knows the filter was understood.
-    _cleaned, max_price = matcher.parse_seasoning_query(text)
+    _cleaned, max_price = matcher.parse_seasoning_query(combined_query)
     cap_note = (
         f"\n<i>Filtered to ≤ ${max_price:g} USD.</i>" if max_price is not None else ""
     )
 
+    # Header reflects the running search context. Multi-turn → show history.
+    if len(history) > 1:
+        header = (
+            f"🔍 <b>Searching:</b> "
+            + " <b>+</b> ".join(f"<i>{h(q)}</i>" for q in history)
+            + cap_note
+        )
+    else:
+        header = f"You typed: <b>{h(text)}</b>{cap_note}"
+
     if not top:
         msg = (
-            f"No close matches in the catalog for <b>{h(text)}</b>.{cap_note}\n\n"
-            "You can keep your text as-is, or type something different."
+            f"{header}\n\nNo close matches in the catalog. "
+            "You can keep your text as-is, refine it, or start over."
         )
-        buttons = [[("Use my text", "ssn:raw")], nav_row(include_back=False)]
+        buttons = [
+            [("📝 Use my latest text as-is", "ssn:raw")],
+            [("🔄 Start search over", "ssn:reset")],
+            nav_row(include_back=False),
+        ]
     else:
-        lines = [f"You typed: <b>{h(text)}</b>{cap_note}\n\nClosest matches:"]
+        lines = [header, "\nClosest matches:"]
         buttons = []
         for i, s in enumerate(top):
             cat = s.get("category") or ""
@@ -1669,12 +1704,16 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
                 f"<b>{i+1}. {h(s['name'])}</b>{cat_str}\n"
                 f"    code {h(code)} · {h(price)}"
             )
-            # Keep button label short (Telegram shows ~30 chars nicely).
             label = f"{i+1}. {s['name']}"
             if len(label) > 40:
                 label = label[:38] + "…"
             buttons.append([(label, f"ssn:{i}")])
-        buttons.append([("Use my text instead", "ssn:raw")])
+        if len(history) > 1:
+            lines.append("\n<i>💡 Type more to refine further, or tap Start over to reset.</i>")
+        else:
+            lines.append("\n<i>💡 Type more to refine, or pick a match above.</i>")
+        buttons.append([("📝 Use my latest text as-is", "ssn:raw")])
+        buttons.append([("🔄 Start search over", "ssn:reset")])
         buttons.append(nav_row(include_back=False))
         msg = "\n".join(lines)
     await _drop_loader()
@@ -1975,6 +2014,9 @@ async def _handle_menu_callback(update, ctx, action: str):
         return
     if action == "new":
         state.clear(user.id)
+        # Clean up any leftover per-user search context from a previous draft.
+        for k in ("seasoning_queries", "seasoning_candidates", "seasoning_query"):
+            ctx.user_data.pop(k, None)
         d = state.start(user.id, user.username or user.first_name or "")
         await send(update, "Let's begin! 🌶")
         await ask(update, ctx, d)
@@ -2117,10 +2159,22 @@ async def _handle_seasoning_pick(update, ctx, d: state.Draft, payload: str):
     if payload == "retry":
         # User rejected the code match — prompt them to type a name instead.
         ctx.user_data.pop("seasoning_candidates", None)
+        ctx.user_data.pop("seasoning_queries", None)
         await send(
             update,
             "OK — type the <b>product name</b> (or a hint like "
             "<i>cheese below 4.5 usd</i>) and I'll search the catalog.",
+            kb([nav_row(include_back=False)]),
+        )
+        return
+    if payload == "reset":
+        # Clear the running query history and re-prompt the seasoning question.
+        ctx.user_data.pop("seasoning_candidates", None)
+        ctx.user_data.pop("seasoning_queries", None)
+        ctx.user_data.pop("seasoning_query", None)
+        await send(
+            update,
+            "🔄 Search reset. Type what you're looking for and I'll start over.",
             kb([nav_row(include_back=False)]),
         )
         return
@@ -2142,11 +2196,14 @@ async def _handle_seasoning_pick(update, ctx, d: state.Draft, payload: str):
             d.matched_price = c.get("price", "")
             d.matched_category = c.get("category", "")
             # Prefill the comment with the picked product + code so R&D sees
-            # exactly what sales chose. User can still edit in 2/15.
+            # exactly what sales chose. User can still edit later.
             if c.get("code"):
                 d.data["comment"] = f"Use code {c['code']} — {c['name']}"
             else:
                 d.data["comment"] = f"Use {c['name']}"
+    # Search resolved — drop the running query history so the next draft
+    # (or next edit pass) starts clean.
+    ctx.user_data.pop("seasoning_queries", None)
     await _advance(update, ctx, d)
 
 

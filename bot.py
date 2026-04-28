@@ -663,26 +663,46 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         unique = unique[:5]
 
     client = mms_product.get_client()
+    chat = update.effective_chat
     for code in unique:
+        # Loading placeholder — edited in place once the fetch finishes so the
+        # user sees a clear "in progress → done" transition (MMS calls take 2-5s).
+        placeholder = await chat.send_message(
+            f"⏳ Fetching <code>{h(code)}</code> from MMS…",
+            parse_mode=ParseMode.HTML,
+        )
         try:
-            await update.effective_chat.send_action("typing")
+            await chat.send_action("typing")
         except Exception:  # noqa: BLE001
             pass
+
+        async def _replace(text: str) -> None:
+            try:
+                await placeholder.edit_text(text, parse_mode=ParseMode.HTML)
+            except Exception:  # noqa: BLE001 — edit can fail if message too old
+                await chat.send_message(text, parse_mode=ParseMode.HTML)
+
         try:
             product = await asyncio.to_thread(client.fetch_product, code)
         except mms_product.ProductNotFound:
-            await send(update, f"😕 No product found for <code>{h(code)}</code>.")
+            await _replace(
+                f"😕 No product found for <code>{h(code)}</code>.\n\n{_footer(update)}"
+            )
             continue
         except mms_product.MMSError as e:
             log.warning("MMS error for %s: %s", code, e)
-            await send(update, f"😬 MMS error for <code>{h(code)}</code>: {h(str(e))}")
+            await _replace(
+                f"😬 MMS error for <code>{h(code)}</code>: {h(str(e))}\n\n{_footer(update)}"
+            )
             continue
         except Exception as e:  # noqa: BLE001
-            log.exception("Unexpected /pi error for %s", code)
-            await send(update, f"😵 Couldn't fetch <code>{h(code)}</code>: {h(str(e))}")
+            log.exception("Unexpected /pp error for %s", code)
+            await _replace(
+                f"😵 Couldn't fetch <code>{h(code)}</code>: {h(str(e))}\n\n{_footer(update)}"
+            )
             continue
         body = mms_product.format_pp(product)
-        await send(update, f"<pre>{h(body)}</pre>")
+        await _replace(f"<pre>{h(body)}</pre>\n\n{_footer(update)}")
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1299,14 +1319,34 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
+    chat = update.effective_chat
     try:
-        await update.effective_chat.send_action("typing")
+        await chat.send_action("typing")
     except Exception:  # noqa: BLE001
         pass
+    # Visible loader so the user knows we're working — fuzzy + history boost
+    # + Claude rerank can take 2-5 seconds end-to-end.
+    placeholder = None
+    try:
+        placeholder = await chat.send_message(
+            "🔍 Searching the catalog & past requests… one sec!",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:  # noqa: BLE001
+        placeholder = None
+
+    async def _drop_loader() -> None:
+        if placeholder is not None:
+            try:
+                await placeholder.delete()
+            except Exception:  # noqa: BLE001 — message may have been edited/deleted
+                pass
+
     try:
         seasonings = await asyncio.to_thread(sheets.load_seasonings)
     except Exception as e:  # noqa: BLE001
         log.exception("load_seasonings failed: %s", e)
+        await _drop_loader()
         await send(update, "⚠️ Couldn't read the seasoning master sheet. Continuing with your text.")
         d.data["seasoning"] = text
         d.matched_code = ""
@@ -1336,6 +1376,7 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
             [("🔍 No, search by name", "ssn:retry")],
             nav_row(include_back=False),
         ]
+        await _drop_loader()
         await send(update, msg, kb(buttons))
         return
 
@@ -1400,6 +1441,7 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         buttons.append([("Use my text instead", "ssn:raw")])
         buttons.append(nav_row(include_back=False))
         msg = "\n".join(lines)
+    await _drop_loader()
     await send(update, msg, kb(buttons))
 
 

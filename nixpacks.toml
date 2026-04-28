@@ -1,0 +1,5 @@
+# Install tesseract OCR binary on the Railway build image so pytesseract
+# can shell out to it at runtime. Without this, /scan falls back to the
+# (paid) Claude Haiku vision path. Same setup as NPProductBot.
+[phases.setup]
+aptPkgs = ["tesseract-ocr"]

@@ -40,6 +40,7 @@ import matcher
 import mms_product
 import sheets
 import state
+import vision_scan
 from state import FIELDS, FIELD_LABELS
 
 logging.basicConfig(
@@ -369,6 +370,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     menu = [
         [("➕ Raise a new sample request", "menu:new")],
         [("📄 Paste bulk request (multi-seasoning)", "menu:bulk")],
+        [("📷 Scan code (photo → /pp)", "menu:scan")],
         [("📋 Check samples I raised", "menu:samples")],
     ]
     if _is_update_sample_owner(user):
@@ -416,6 +418,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "",
         "<b>Utilities</b>",
         "/pp <code> — pull product price from MMS (Code · Name · R&D Price · Raw Material Cost)",
+        "/scan — send a photo, I OCR product codes and auto-run /pp",
         "/reload — refresh seasoning & customer lists from Google Sheets",
         "/whoami — show your Telegram ID & username",
         "/diag — diagnostic (shows what the bot can read from the Users tab)",
@@ -630,38 +633,27 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _PP_CODE_RE = re.compile(r"\bS-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,4})?\b", re.IGNORECASE)
 
 
-async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """`/pp <code>` — fetch product price summary from MMS.
-
-    Returns: Code, Name, R&D Price (USD), Raw Material Cost (USD).
-    Pricing-only — does NOT fetch the full ingredient table.
-    Goes straight to MMS each call (no caching) so the price stays fresh.
-    """
-    if not await _authorized(update):
-        return
-    msg = update.effective_message
-    raw = " ".join(ctx.args) if ctx.args else (msg.text or "").partition(" ")[2]
-    codes = _PP_CODE_RE.findall(raw)
-    if not codes:
-        await send(
-            update,
-            "💲 <b>/pp</b> — product price from MMS\n\n"
-            "Send a product code, e.g. <code>/pp S-62RG3-19</code>.",
-        )
-        return
-
-    # Dedupe + uppercase, cap at 5 to avoid spamming MMS / the chat.
+def _dedupe_codes(codes: list[str], cap: int = 5) -> list[str]:
     seen: set[str] = set()
-    unique: list[str] = []
+    out: list[str] = []
     for c in codes:
         u = c.upper()
         if u not in seen:
             seen.add(u)
-            unique.append(u)
-    if len(unique) > 5:
-        await send(update, f"🙏 Max 5 codes per /pp — running first 5: {', '.join(unique[:5])}")
-        unique = unique[:5]
+            out.append(u)
+        if len(out) >= cap:
+            break
+    return out
 
+
+async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
+    """Fetch /pp for each code, edit-in-place loader, audit-log every result.
+
+    Used by both `/pp <code>` and the photo-scan flow. Caller passes already
+    deduplicated, capped, uppercase codes.
+    """
+    if not codes:
+        return
     client = mms_product.get_client()
     chat = update.effective_chat
     user = update.effective_user
@@ -669,8 +661,6 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = user.id if user else ""
 
     def _audit(**kw):
-        # Fire-and-forget audit row to the Query tab. Done in a thread so the
-        # bot's reply doesn't wait for the sheet round-trip.
         asyncio.create_task(
             asyncio.to_thread(
                 sheets.log_pp_query,
@@ -680,9 +670,7 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         )
 
-    for code in unique:
-        # Loading placeholder — edited in place once the fetch finishes so the
-        # user sees a clear "in progress → done" transition (MMS calls take 2-5s).
+    for code in codes:
         placeholder = await chat.send_message(
             f"⏳ Fetching <code>{h(code)}</code> from MMS…",
             parse_mode=ParseMode.HTML,
@@ -695,7 +683,7 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async def _replace(text: str) -> None:
             try:
                 await placeholder.edit_text(text, parse_mode=ParseMode.HTML)
-            except Exception:  # noqa: BLE001 — edit can fail if message too old
+            except Exception:  # noqa: BLE001 — message may be too old to edit
                 await chat.send_message(text, parse_mode=ParseMode.HTML)
 
         try:
@@ -730,6 +718,140 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rd_price_usd=product.rd_price_usd,
             raw_material_cost_usd=product.raw_material_cost_usd,
         )
+
+
+async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/pp <code>` — fetch product price summary from MMS.
+
+    Returns: Code, Name, R&D Price (USD), Raw Material Cost (USD).
+    Pricing-only — does NOT fetch the full ingredient table.
+    Goes straight to MMS each call (no caching) so the price stays fresh.
+    """
+    if not await _authorized(update):
+        return
+    msg = update.effective_message
+    raw = " ".join(ctx.args) if ctx.args else (msg.text or "").partition(" ")[2]
+    codes = _PP_CODE_RE.findall(raw)
+    if not codes:
+        await send(
+            update,
+            "💲 <b>/pp</b> — product price from MMS\n\n"
+            "Send a product code, e.g. <code>/pp S-62RG3-19</code>.",
+        )
+        return
+    unique = _dedupe_codes(codes, cap=5)
+    if len(codes) > 5:
+        await send(update, f"🙏 Max 5 codes per /pp — running first 5: {', '.join(unique)}")
+    await _run_pp_for_codes(update, unique)
+
+
+async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/scan` — prompt the user to send a photo of product code(s)."""
+    if not await _authorized(update):
+        return
+    ctx.user_data["awaiting_scan_photo"] = True
+    await send(
+        update,
+        "📷 <b>Scan code from photo</b>\n\n"
+        "Send me a photo of one or more product codes (the labels with "
+        "<code>S-XXXXX-XX</code> shapes). I'll OCR them, double-check against "
+        "the catalog, and run <code>/pp</code> on every code I find.",
+    )
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle a photo upload — OCR for product codes, then auto-/pp each one."""
+    if not await _authorized(update):
+        return
+    msg = update.effective_message
+    if not msg or not msg.photo:
+        return
+    # Clear the menu/scan flag — we accept any photo as a scan request, but
+    # this lets `awaiting_scan_photo` reset cleanly for the next interaction.
+    ctx.user_data.pop("awaiting_scan_photo", None)
+
+    chat = update.effective_chat
+    notice = await chat.send_message(
+        "🔍 Reading product code(s) from your photo… one sec!",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await chat.send_action("typing")
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        photo = msg.photo[-1]  # largest size for best OCR
+        tg_file = await ctx.bot.get_file(photo.file_id)
+        buf = await tg_file.download_as_bytearray()
+    except Exception as e:  # noqa: BLE001
+        log.exception("Photo download failed")
+        try:
+            await notice.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await send(update, f"😕 Couldn't read that photo: {h(str(e))}")
+        return
+
+    # Build the catalog set (uppercase) once, used by the self-healer.
+    try:
+        seasonings = await asyncio.to_thread(sheets.load_seasonings)
+        catalog_codes = {
+            str(s.get("code", "")).strip().upper()
+            for s in seasonings
+            if s.get("code")
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning("Catalog load failed for scan: %s", e)
+        catalog_codes = set()
+
+    try:
+        result = await vision_scan.scan_image(bytes(buf), catalog_codes)
+    except Exception as e:  # noqa: BLE001
+        log.exception("OCR failed")
+        try:
+            await notice.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await send(update, f"😵 OCR failed: {h(str(e))}")
+        return
+
+    # Drop the loading notice; we're about to send the result + per-code /pp.
+    try:
+        await notice.delete()
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not result.codes:
+        await send(
+            update,
+            "🙈 Couldn't spot a product code in that photo.\n"
+            "Try again with better lighting or a closer crop — codes look like "
+            "<code>S-XXXXX-XX</code> or <code>S-XXXXXX</code>.",
+        )
+        return
+
+    # Build a summary so the user sees what we detected (and any auto-corrections).
+    src_label = {"tesseract": "🆓 free OCR", "haiku": "🤖 Haiku vision"}.get(
+        result.source, "OCR"
+    )
+    lines = [f"🎯 Detected <b>{len(result.codes)}</b> code(s) ({src_label}):"]
+    for raw, final in zip(result.raw_codes, result.codes):
+        if raw != final:
+            lines.append(f"  • <code>{h(raw)}</code> → <code>{h(final)}</code> 🩹 auto-corrected")
+        else:
+            lines.append(f"  • <code>{h(final)}</code>")
+    if result.unmatched:
+        lines.append(
+            f"\n⚠️ Not in catalog (will still try MMS): "
+            + ", ".join(f"<code>{h(c)}</code>" for c in result.unmatched)
+        )
+    lines.append("\nFetching prices now…")
+    await send(update, "\n".join(lines))
+
+    # Cap at 5 to match the /pp ceiling and avoid spamming MMS.
+    unique = _dedupe_codes(result.codes, cap=5)
+    await _run_pp_for_codes(update, unique)
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1745,6 +1867,17 @@ async def _handle_menu_callback(update, ctx, action: str):
         return
     if action == "bulk":
         await _start_bulk(update, ctx)
+        return
+    if action == "scan":
+        ctx.user_data["awaiting_scan_photo"] = True
+        await send(
+            update,
+            "📷 <b>Scan code from photo</b>\n\n"
+            "Send me a photo of one or more product codes (the labels with "
+            "<code>S-XXXXX-XX</code> shapes). I'll OCR them, double-check against "
+            "the catalog, and run <code>/pp</code> on every code I find.\n\n"
+            "Tip: tap 📎 → Camera, snap a clear shot, send.",
+        )
         return
     if action == "updsample":
         # Ragonic-only guard — defense in depth; button is already hidden
@@ -2988,6 +3121,7 @@ def main():
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
+    app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("updatesamplelist", cmd_update_sample_list))
 
     # Register Telegram's native blue slash-command menu so users see every
@@ -3004,6 +3138,7 @@ def main():
             BotCommand("reload", "Refresh seasoning / customer lists"),
             BotCommand("whoami", "Show your Telegram ID & username"),
             BotCommand("pp", "💲 Product price — e.g. /pp S-62RG3-19"),
+            BotCommand("scan", "📷 Scan a photo for product code(s)"),
             BotCommand("diag", "Diagnostics"),
             BotCommand("help", "Show all commands"),
         ]
@@ -3017,6 +3152,7 @@ def main():
     app.post_init = _install_commands
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_error_handler(on_error)
 
     # Warm the caches so the first user of the day doesn't wait on cold

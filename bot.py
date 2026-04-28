@@ -423,6 +423,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [("🌶 Find a seasoning & raise request", "menu:new")],
         [("📄 Paste a multi-seasoning email", "menu:bulk")],
         [("📷 Scan a product photo", "menu:scan")],
+        [("✏️ Enter a code (price lookup)", "menu:code")],
         [("📋 My sample requests", "menu:samples")],
     ]
     if _is_update_sample_owner(user):
@@ -1455,6 +1456,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await _handle_bulk_text(update, ctx, text):
         return
 
+    # Manual code-entry flow ("✏️ Enter a code" on the main menu): user
+    # opted into a one-shot price lookup. Single-use — pop the flag so
+    # subsequent texts go through the normal flow.
+    if ctx.user_data.pop("awaiting_code_text", None):
+        codes = _PP_CODE_RE.findall(text)
+        if not codes:
+            await send(
+                update,
+                "🤔 That doesn't look like a product code (expected something "
+                "like <code>S-668U1</code> or <code>S-62RG3-19</code>). Tap "
+                "<i>Enter a code</i> on the main menu to try again.",
+                kb([[("🏠 Main menu", "menu:home")]]),
+            )
+            return
+        unique = _dedupe_codes(codes, cap=5)
+        await _run_pp_for_codes(update, unique)
+        return
+
     d = state.get(user.id)
     if not d:
         if state.consume_expired_flag(user.id):
@@ -1608,29 +1627,56 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         await _advance(update, ctx, d)
         return
 
-    # Code-first match: if the user pasted a product code (exact or suffix-trim
-    # variant), skip fuzzy name search and ask them to confirm the single hit.
-    # Much clearer UX than burying the code match inside a fuzzy-name list.
-    # Code lookup uses the LATEST text only — combining history would never help.
-    code_hit = matcher.find_by_code(text, seasonings)
-    if code_hit:
-        ctx.user_data["seasoning_candidates"] = [code_hit]
+    # Code-first match: if the user pasted a product code (exact, prefix or
+    # suffix-trim variant), skip fuzzy name search and ask them to confirm.
+    # `find_codes_matching` returns multiple if the user typed a base (e.g.
+    # "S-668U1") that has several catalog variants ("S-668U1-02",
+    # "S-668U1-03"), so the user can pick the right SKU.
+    code_matches = matcher.find_codes_matching(text, seasonings)
+    if code_matches:
+        ctx.user_data["seasoning_candidates"] = code_matches[:5]
         ctx.user_data["seasoning_query"] = text
-        cat = code_hit.get("category") or ""
-        cat_str = f" · <i>{h(cat)}</i>" if cat else ""
-        price = code_hit.get("price") or "—"
-        code = code_hit.get("code") or "—"
-        msg = (
-            f"🎯 <b>Code match</b> for <code>{h(text)}</code>:\n\n"
-            f"<b>{h(code_hit['name'])}</b>{cat_str}\n"
-            f"    code <code>{h(code)}</code> · {h(price)}\n\n"
-            "Use this product?"
-        )
-        buttons = [
-            [("✅ Yes, use it", "ssn:0")],
-            [("🔍 No, search by name", "ssn:retry")],
-            nav_row(include_back=False),
-        ]
+        if len(code_matches) == 1:
+            c = code_matches[0]
+            cat = c.get("category") or ""
+            cat_str = f" · <i>{h(cat)}</i>" if cat else ""
+            price = c.get("price") or "—"
+            code = c.get("code") or "—"
+            msg = (
+                f"🎯 <b>Code match</b> for <code>{h(text)}</code>:\n\n"
+                f"<b>{h(c['name'])}</b>{cat_str}\n"
+                f"    code <code>{h(code)}</code> · {h(price)}\n\n"
+                "Use this product?"
+            )
+            buttons = [
+                [("✅ Yes, use it", "ssn:0")],
+                [("🔍 No, search by name", "ssn:retry")],
+                nav_row(include_back=False),
+            ]
+        else:
+            lines = [
+                f"🎯 <b>Found {len(code_matches)} matches</b> for <code>{h(text)}</code>:",
+                "",
+            ]
+            buttons = []
+            shown = code_matches[:5]
+            for i, c in enumerate(shown):
+                cat = c.get("category") or ""
+                cat_str = f" · <i>{h(cat)}</i>" if cat else ""
+                price = c.get("price") or "—"
+                code = c.get("code") or "—"
+                lines.append(
+                    f"<b>{i+1}. {h(c['name'])}</b>{cat_str}\n"
+                    f"    code <code>{h(code)}</code> · {h(price)}"
+                )
+                label = f"{i+1}. {c.get('code', '')} · {c['name']}"
+                if len(label) > 40:
+                    label = label[:38] + "…"
+                buttons.append([(label, f"ssn:{i}")])
+            lines.append("\nPick the one you want, or refine your code.")
+            buttons.append([("🔍 Search by name instead", "ssn:retry")])
+            buttons.append(nav_row(include_back=False))
+            msg = "\n".join(lines)
         await _drop_loader()
         await send(update, msg, kb(buttons))
         return
@@ -2055,6 +2101,16 @@ async def _handle_menu_callback(update, ctx, action: str):
             "Send a photo of one or more product code labels "
             "(<code>S-XXXXX-XX</code>). I'll read them and pull the price for each.\n\n"
             "<i>Tip:</i> tap 📎 → Camera for the sharpest shot.",
+        )
+        return
+    if action == "code":
+        ctx.user_data["awaiting_code_text"] = True
+        await send(
+            update,
+            "✏️ <b>Enter a product code</b>\n\n"
+            "Type one or more product codes and I'll pull the price for each. "
+            "You can paste a base code like <code>S-668U1</code> and I'll list "
+            "all its variants — or paste up to 5 full codes separated by spaces.",
         )
         return
     if action == "updsample":

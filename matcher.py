@@ -281,24 +281,56 @@ def top_seasonings(
 
 
 def find_by_code(code: str, seasonings: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Look up a seasoning by its exact product code (case-insensitive).
+    """Backwards-compatible single-result code lookup. Returns the first match
+    from `find_codes_matching` or None.
+    """
+    matches = find_codes_matching(code, seasonings)
+    return matches[0] if matches else None
 
-    Tries suffix-trim fallback for coded variants — e.g. if the user pastes
-    ``S-6AUH2-12-Y1`` but the master only stores ``S-6AUH2-12`` or
-    ``S-6AUH2``, we still resolve it. Same rule the V0.4.0 bulk parser uses.
 
-    Returns ``None`` when nothing matches — callers should then fall back
-    to fuzzy name matching.
+def find_codes_matching(
+    code: str, seasonings: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Look up catalog entries whose code matches the user's input.
+
+    Resolution order (each later step skips codes already collected):
+      1. Exact case-insensitive match
+      2. Prefix expansion: catalog codes starting with `<input>-` so a user
+         typing ``S-668U1`` finds ``S-668U1-02``, ``S-668U1-03``, etc.
+      3. Suffix-trim of the user's input: ``S-6AUH2-12-Y1`` → ``S-6AUH2-12``
+         → ``S-6AUH2`` (handy when sales paste an over-specific code from a
+         downstream system).
+
+    Returns a list (possibly empty) deduped by code, in the order above so
+    callers can show the most-confident match first.
     """
     q = (code or "").strip().upper()
     if not q:
-        return None
-    # Exact match first.
+        return []
+
+    matches: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+
+    def _add(s: dict[str, Any]) -> None:
+        c = str(s.get("code", "")).strip().upper()
+        if c and c not in seen_codes:
+            seen_codes.add(c)
+            matches.append(s)
+
+    # 1) Exact
     for s in seasonings:
         c = str(s.get("code", "")).strip().upper()
-        if c and c == q:
-            return s
-    # Suffix-trim fallback: S-6AUH2-12-Y1 → S-6AUH2-12 → S-6AUH2.
+        if c == q:
+            _add(s)
+
+    # 2) Prefix: user typed a base, catalog has variants like base-XX.
+    prefix = q + "-"
+    for s in seasonings:
+        c = str(s.get("code", "")).strip().upper()
+        if c.startswith(prefix):
+            _add(s)
+
+    # 3) Suffix-trim of user's input (over-specific code → progressively shorter).
     trimmed = q
     while "-" in trimmed:
         trimmed = trimmed.rsplit("-", 1)[0]
@@ -306,9 +338,10 @@ def find_by_code(code: str, seasonings: list[dict[str, Any]]) -> dict[str, Any] 
             break
         for s in seasonings:
             c = str(s.get("code", "")).strip().upper()
-            if c and c == trimmed:
-                return s
-    return None
+            if c == trimmed:
+                _add(s)
+
+    return matches
 
 
 def top_companies(query: str, customers: list[dict[str, str]], limit: int = 3) -> list[dict[str, str]]:

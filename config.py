@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.7.4"
+BOT_VERSION = "V1.8.0"
 
 # Margin added to MMS raw_material_cost before showing it to the user (and
 # before logging to the Query audit tab). Covers handling / overhead so
@@ -89,4 +89,4 @@ SALES_LOG_COLS = [
     "Receiving Person",
 ]
 
-USER_COLS = ["Telegram Username", "Telegram User ID", "Name", "Active"]
+USER_COLS = ["Telegram Username", "Telegram User ID", "Name", "Active", "MMS Name"]

@@ -652,6 +652,59 @@ def invalidate_caches() -> None:
     _samples_cache = None
 
 
+def get_user_mms_name(tg_user_id: int, username: str | None) -> str:
+    """Return the MMS Name configured for this Telegram user, or "" if none.
+
+    Used by /lastsample to filter Full Sample Listing rows down to ones the
+    caller actually owns. The Authorized Users tab gained an "MMS Name"
+    column in V1.7.5 — the field is blank for users who haven't been mapped
+    yet, which the caller treats as "ask admin to fill this in."
+    """
+    uname = (username or "").lstrip("@").lower()
+    for row in load_users():
+        if str(row.get("Active", "")).strip().lower() not in {"y", "yes", "true", "1"}:
+            continue
+        row_id = str(row.get("Telegram User ID", "")).strip()
+        row_uname = str(row.get("Telegram Username", "")).lstrip("@").lower()
+        if (row_id and row_id == str(tg_user_id)) or (row_uname and row_uname == uname):
+            return str(row.get("MMS Name", "")).strip()
+    return ""
+
+
+def load_fsl_rows_for_sales(sales_name: str) -> list[dict[str, str]]:
+    """Return every Full Sample Listing row whose Sales col matches sales_name
+    (case-insensitive, whitespace-collapsed). Each row is a dict with the
+    FSL_HEADER columns as keys + a parsed `_date` (datetime.date | None) for
+    sorting. Returns [] if the sales name is empty or the tab is missing.
+    """
+    if not (sales_name or "").strip():
+        return []
+    target = " ".join(sales_name.lower().split())
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(FSL_TAB)
+    except gspread.WorksheetNotFound:
+        return []
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    header, data = values[0], values[1:]
+
+    out: list[dict[str, str]] = []
+    for r in data:
+        if len(r) <= FSL_COL_SALES:
+            continue
+        sales = " ".join((r[FSL_COL_SALES] or "").lower().split())
+        if sales != target:
+            continue
+        # Pad to header width for safe column access.
+        padded = r + [""] * (len(FSL_HEADER) - len(r))
+        row = {h: padded[i] for i, h in enumerate(FSL_HEADER)}
+        row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
+        out.append(row)
+    return out
+
+
 def is_user_authorized(tg_user_id: int, username: str | None) -> bool:
     uname = (username or "").lstrip("@").lower()
     for row in load_users():

@@ -477,6 +477,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Product lookup</b>",
         "/pp <code> — fetch price (Code · Name · R&amp;D Price · Raw Material Cost)",
         "/scan — send a photo, I OCR codes and run /pp on each",
+        "/lastsample — find the most recent sample you sent matching a keyword",
         "",
         "<b>Account</b>",
         "/whoami — your Telegram ID and username",
@@ -768,6 +769,158 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Cap at 5 to match the /pp ceiling and avoid spamming MMS.
     unique = _dedupe_codes(result.codes, cap=5)
     await _run_pp_for_codes(update, unique)
+
+
+# ---------- /lastsample ----------------------------------------------------
+#
+# Sales rep workflow: "what was the last sample I sent matching X?"
+#
+# The Authorized Users tab carries an "MMS Name" column that maps the user's
+# Telegram identity → the name MMS records against the sample (e.g. "Alex",
+# "Joycelyn"). We use that to filter Full Sample Listing to just THIS rep's
+# rows, then fuzzy-match the user's keywords against Product Name + Code +
+# Taste describe, and return the row with the latest Sample Date Out.
+#
+# Same one-shot prompt → reply pattern as /scan and the manual code-entry
+# button: set a flag in ctx.user_data, the user's next text message is
+# treated as the search query.
+
+
+async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """`/lastsample` — find the most recent sample this rep sent matching a keyword."""
+    if not await _authorized(update):
+        return
+    user = update.effective_user
+    mms_name = await asyncio.to_thread(sheets.get_user_mms_name, user.id, user.username)
+    if not mms_name:
+        await send(
+            update,
+            "🛑 <b>Your MMS name isn't set yet.</b>\n\n"
+            "Ask the admin to fill in the <b>MMS Name</b> column for your row "
+            "in the <i>Authorized Users</i> tab — that's the name MMS records "
+            "against your samples (e.g. <code>Alex</code>, <code>Joycelyn</code>). "
+            "Once it's set, /lastsample can find your past samples.",
+        )
+        return
+
+    ctx.user_data["awaiting_lastsample_query"] = True
+    ctx.user_data["lastsample_mms_name"] = mms_name
+    await send(
+        update,
+        "🔎 <b>Find your last sample</b>\n\n"
+        f"You're set up as <b>{h(mms_name)}</b> in MMS.\n\n"
+        "<b>📎 Reply to this message</b> with a product name or keyword "
+        "(e.g. <i>BBQ</i>, <i>tom yum</i>, <i>S-668</i>). I'll search your "
+        "samples in <i>Full Sample Listing</i> and show the most recent match.",
+    )
+
+
+async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> None:
+    """Search FSL rows owned by `mms_name` for `query`, reply with the latest match."""
+    query = (query or "").strip()
+    if len(query) < 2:
+        await send(
+            update,
+            "🤏 That's too short. Try at least 2 characters — a product name, "
+            "code prefix, or flavour keyword.",
+        )
+        return
+
+    try:
+        rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
+    except Exception as e:  # noqa: BLE001
+        log.exception("lastsample: FSL read failed")
+        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}")
+        return
+
+    if not rows:
+        await send(
+            update,
+            f"📭 I don't see any samples logged under <b>{h(mms_name)}</b> "
+            "in Full Sample Listing yet.",
+        )
+        return
+
+    # Score each row against the query. Search field combines Product Name,
+    # Product Code, and Taste describe so a query like "spicy chicken" can
+    # match either the name or the keyword cloud.
+    from rapidfuzz import fuzz
+    q = query.lower().strip()
+
+    def _score(row: dict) -> float:
+        name = (row.get("Product Name") or "").lower()
+        code = (row.get("Product Code") or "").lower()
+        taste = (row.get("Taste describe") or "").lower()
+        # Cheap exact-substring boost: typing part of a code or word should
+        # win decisively over a fuzzy near-match elsewhere.
+        if q in code:
+            return 100.0
+        if q in name:
+            return 95.0
+        if q in taste:
+            return 85.0
+        haystack = f"{name} {code} {taste}"
+        return float(fuzz.WRatio(q, haystack))
+
+    scored = [(r, _score(r)) for r in rows]
+    # Threshold: 60 mirrors matcher.py. Lower = more false positives.
+    candidates = [(r, s) for r, s in scored if s >= 60]
+    if not candidates:
+        await send(
+            update,
+            f"🙈 No samples match <b>{h(query)}</b> under your name "
+            f"(<b>{h(mms_name)}</b>).\n\n"
+            "Try a shorter keyword, a code prefix like <code>S-668</code>, "
+            "or a flavour word like <i>spicy</i>.",
+        )
+        return
+
+    # Sort by date desc, but also keep score as a tiebreaker so a high-score
+    # exact match isn't beaten by a marginal-score row that happens to be
+    # newer.
+    from datetime import date as _date
+    SENTINEL = _date(1900, 1, 1)
+    candidates.sort(key=lambda rs: (rs[0].get("_date") or SENTINEL, rs[1]), reverse=True)
+    best, best_score = candidates[0]
+
+    # Format date nicely; fall back to the raw string if parsing failed.
+    raw_date = best.get("Sample Date Out", "") or ""
+    parsed = best.get("_date")
+    pretty_date = parsed.strftime("%d %b %Y") if parsed else raw_date
+
+    # R&D price may be blank or numeric — render trimmed, and add USD suffix
+    # only when the value looks numeric.
+    rd_raw = (best.get("R&D Price") or "").strip()
+    if rd_raw:
+        try:
+            float(rd_raw)
+            rd_display = f"{rd_raw} USD"
+        except ValueError:
+            rd_display = rd_raw
+    else:
+        rd_display = "—"
+
+    lines = [
+        "🎯 <b>Based on my search:</b>",
+        "",
+        f"<b>Product Name:</b> {h(best.get('Product Name') or '—')}",
+        f"<b>Product Code:</b> <code>{h(best.get('Product Code') or '—')}</code>",
+        f"<b>Last sent out:</b> {h(pretty_date or '—')}",
+        f"<b>Customer Name:</b> {h(best.get('Customer Name') or '—')}",
+        f"<b>R&amp;D Price:</b> {h(rd_display)}",
+    ]
+    # If there are several plausible matches, hint at it so the user can
+    # refine — keeps the answer clear but not misleading.
+    if len(candidates) > 1:
+        others = sum(1 for _, s in candidates[1:] if s >= 70)
+        if others:
+            lines.append("")
+            lines.append(
+                f"<i>({others} other match{'es' if others > 1 else ''} found — "
+                "send a more specific keyword to narrow further.)</i>"
+            )
+
+    await send(update, "\n".join(lines))
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1298,14 +1451,42 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await _handle_bulk_text(update, ctx, text):
         return
 
+    # /lastsample reply flow: same per-process flag + reply-detection pattern
+    # as the manual code entry below. Whichever signal fires first wins, and
+    # we read+clear the cached MMS name so a stale flag from a prior session
+    # doesn't leak into the next text the user sends.
+    msg = update.effective_message
+    replied = getattr(msg, "reply_to_message", None) if msg else None
+    has_lastsample_flag = bool(ctx.user_data.pop("awaiting_lastsample_query", None))
+    is_lastsample_reply = bool(
+        replied
+        and getattr(replied, "from_user", None)
+        and getattr(replied.from_user, "is_bot", False)
+        and "Find your last sample" in (replied.text or "")
+    )
+    if has_lastsample_flag or is_lastsample_reply:
+        mms_name = ctx.user_data.pop("lastsample_mms_name", "")
+        if not mms_name:
+            # Stateless fallback (multi-replica deploys): re-resolve from sheet.
+            mms_name = await asyncio.to_thread(
+                sheets.get_user_mms_name, user.id, user.username
+            )
+        if not mms_name:
+            await send(
+                update,
+                "🛑 I can't see your <b>MMS Name</b> — ask the admin to set "
+                "it on the <i>Authorized Users</i> tab, then re-run /lastsample.",
+            )
+            return
+        await _run_lastsample_search(update, mms_name, text)
+        return
+
     # Manual code-entry flow ("✏️ Enter a code" on the main menu): accept
     # text either when the per-process flag is set OR when the message is
     # a reply to one of our "Enter a product code" prompts. Reply-detection
     # makes the flow robust to multi-replica deployments where the click
     # and the typed reply may land on different workers.
     has_code_flag = bool(ctx.user_data.pop("awaiting_code_text", None))
-    msg = update.effective_message
-    replied = getattr(msg, "reply_to_message", None) if msg else None
     is_code_reply = bool(
         replied
         and getattr(replied, "from_user", None)
@@ -3302,6 +3483,7 @@ def main():
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("lastsample", cmd_lastsample))
     # /updatesamplelist command retired in V1.7.1. The MMS → FSL sync is
     # now scheduled by the JobQueue setup at the bottom of main().
 
@@ -3320,6 +3502,7 @@ def main():
             BotCommand("whoami", "Show your Telegram ID & username"),
             BotCommand("pp", "💲 Product price — e.g. /pp S-62RG3-19"),
             BotCommand("scan", "📷 Scan a photo for product code(s)"),
+            BotCommand("lastsample", "🔎 Find your last sample by keyword"),
             BotCommand("diag", "Diagnostics"),
             BotCommand("help", "Show all commands"),
         ]

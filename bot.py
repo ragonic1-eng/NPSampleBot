@@ -425,6 +425,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [("📄 Paste a multi-seasoning email", "menu:bulk")],
         [("📷 Scan a product photo", "menu:scan")],
         [("✏️ Enter a code (price lookup)", "menu:code")],
+        [("🤔 What I send ah?", "menu:lastsample")],
         [("📋 My sample requests", "menu:samples")],
     ]
     # MMS → Full Sample Listing sync is now automated weekly via the
@@ -2159,6 +2160,11 @@ async def _handle_menu_callback(update, ctx, action: str):
             "like <code>S-668U1</code> and I'll list all its variants — or "
             "paste up to 5 full codes separated by spaces.",
         )
+        return
+    if action == "lastsample":
+        # Same flow as the /lastsample command — reuse it so the prompt and
+        # MMS-name lookup logic stay in one place.
+        await cmd_lastsample(update, ctx)
         return
     # menu:updsample retired in V1.7.1 — sync is now automated weekly. If
     # a stale menu message gets tapped, route to the home menu so the user

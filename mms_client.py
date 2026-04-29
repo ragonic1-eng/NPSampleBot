@@ -75,6 +75,7 @@ class SampleRow:
     rd_price: str
     sample_date_out: str
     feedback: str
+    quantity_g: str = ""
 
     def sample_date_out_as_date(self) -> dt.date | None:
         s = (self.sample_date_out or "").strip()
@@ -324,6 +325,7 @@ def _dto_to_sample_row(d: dict) -> SampleRow:
         rd_price=rd_price,
         sample_date_out=str(d.get("shipdateString") or ""),
         feedback=str(d.get("feedback") or ""),
+        quantity_g=str(d.get("quantity") or ""),
     )
 
 

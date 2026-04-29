@@ -428,7 +428,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [("📋 My sample requests", "menu:samples")],
     ]
     if _is_update_sample_owner(user):
-        menu.append([("🔄 Sync MMS Sample Master List", "menu:updsample")])
+        menu.append([("🔄 Sync MMS → Full Sample Listing", "menu:updsample")])
     await send(
         update,
         "👋 <b>Hi there — what can I help with?</b>",
@@ -488,8 +488,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "<b>🔧 Admin</b>",
             "/reload — refresh seasoning &amp; customer lists from Sheets",
             "/diag — diagnostics (auth / sheet visibility)",
-            "/updatesamplelist — sync Sample Master List from MMS (24h cooldown; "
-            "append <code>force</code> to override)",
+            "/updatesamplelist — pull fresh MMS samples into Full Sample Listing "
+            "(24h cooldown; append <code>force</code> to override)",
         ]
     await send(update, "\n".join(lines))
 
@@ -498,14 +498,23 @@ SAMPLE_SYNC_COOLDOWN_HOURS = 24
 
 
 async def cmd_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Sync 'Sample Master List 2024-Present' from MMS (ragonic-only).
+    """`/updatesamplelist` — pull fresh sample submissions from MMS into the
+    Full Sample Listing tab.
 
-    Fetches Sample Date Out from SAMPLE_UPDATE_START (default 2026-03-01)
-    through today, upserts by Product Code, and fills Flavour Profile +
-    Taste describe via Claude for genuinely new products only.
+    Behaviour:
+      - Logs into MMS with credentials from .env (MMS_USER / MMS_PASSWORD).
+      - Fetches every sample row whose Sample Date Out ∈ [SAMPLE_UPDATE_START,
+        today]. Same fetch logic the old SML sync used.
+      - Dedupes against existing FSL rows on (Sample Date Out, Product Code,
+        Customer Name) so re-runs only add genuinely new submissions.
+      - Enriches each new row with Country (from existing FSL customer-map
+        and heuristics first, Haiku as last resort), Taste describe (~20
+        keywords from cache or Haiku), Category (from the 6 category tabs
+        first, Haiku as fallback), and R&D Price (currency + price from MMS).
+      - Appends the enriched rows to the bottom of FSL.
 
-    Rate-limited: refuses to re-sync within 24h of the last successful run
-    unless invoked as ``/updatesamplelist force``.
+    Rate-limited: 24h cooldown unless invoked as `/updatesamplelist force`.
+    Restricted to UPDATE_SAMPLE_OWNER (from .env, default "ragonic").
     """
     if not await _authorized(update):
         return
@@ -523,6 +532,7 @@ async def _run_update_sample_list(
 ):
     import datetime as _dt
 
+    import enrich
     import mms_client
     import requests
 
@@ -545,12 +555,11 @@ async def _run_update_sample_list(
                 mins = int((remaining.total_seconds() % 3600) // 60)
                 await send(
                     update,
-                    "ℹ️ <b>Sample Master List is already up to date.</b>\n\n"
+                    "ℹ️ <b>Full Sample Listing is already up to date.</b>\n\n"
                     f"Last synced: <b>{last.strftime('%d %b %Y %H:%M UTC')}</b>\n"
                     f"Next auto-sync allowed in: <b>{hrs}h {mins}m</b>\n\n"
-                    "<i>MMS rarely changes within 24h, so we skip to save your "
-                    "API quota. If you truly need a fresh pull (e.g. you just "
-                    "edited MMS), run:</i>\n"
+                    "<i>MMS rarely changes within 24h, so we skip to save API "
+                    "quota. To force a fresh pull, run:</i>\n"
                     "<code>/updatesamplelist force</code>",
                 )
                 return
@@ -573,6 +582,7 @@ async def _run_update_sample_list(
         except Exception:  # noqa: BLE001
             pass
 
+    # ---------- Step 1: MMS login + fetch ----------
     session = requests.Session()
     try:
         ok = await asyncio.to_thread(
@@ -589,7 +599,7 @@ async def _run_update_sample_list(
     await _set("✅ Logged into MMS.\n⏳ Fetching sample submissions…")
     t0 = datetime.now(timezone.utc)
     try:
-        rows = await asyncio.to_thread(
+        mms_rows = await asyncio.to_thread(
             mms_client.fetch_all_samples, session, start_date, end_date
         )
     except Exception as e:  # noqa: BLE001
@@ -599,58 +609,106 @@ async def _run_update_sample_list(
 
     fetch_secs = (datetime.now(timezone.utc) - t0).total_seconds()
     await _set(
-        f"✅ Pulled <b>{len(rows)}</b> MMS rows in {fetch_secs:.0f}s.\n"
-        "⏳ Dedup + upsert into Google Sheets…"
+        f"✅ Pulled <b>{len(mms_rows)}</b> MMS rows in {fetch_secs:.0f}s.\n"
+        "⏳ Reading existing Full Sample Listing for dedupe…"
     )
 
-    # Dedupe by Product Code — latest Sample Date Out wins (same rule as backfill).
-    best: dict[str, mms_client.SampleRow] = {}
-    for r in rows:
-        code = (r.product_code or "").strip()
-        if not code:
-            continue
-        d = r.sample_date_out_as_date() or _dt.date(1900, 1, 1)
-        prev = best.get(code)
-        if prev is None or (prev.sample_date_out_as_date() or _dt.date(1900, 1, 1)) < d:
-            best[code] = r
-
-    def _iso(r: mms_client.SampleRow) -> str:
-        d = r.sample_date_out_as_date()
-        return d.isoformat() if d else (r.sample_date_out or "").strip()
-
-    incoming = [
-        {
-            "Seasoning Name": r.product_name,
-            "Code": r.product_code,
-            "Country": r.country,
-            "Sales": r.sales,
-            "R&D Price (USD)": r.rd_price,
-            "Sample Date Out": _iso(r),
-        }
-        for r in best.values()
-    ]
-
-    t1 = datetime.now(timezone.utc)
-    ai.reset_blurb_usage()  # so the totals below only reflect THIS run
+    # ---------- Step 2: Dedupe against existing FSL ----------
     try:
-        added, updated = await asyncio.to_thread(
-            sheets.upsert_sample_master, incoming, ai.taste_blurb_sync
-        )
+        existing_keys = await asyncio.to_thread(sheets.load_fsl_dedupe_keys)
+        customer_map = await asyncio.to_thread(sheets.load_fsl_customer_country_map)
+        tab_map = await asyncio.to_thread(sheets.load_fsl_category_tab_map)
     except Exception as e:  # noqa: BLE001
-        log.exception("Sheet upsert failed: %s", e)
-        await _set(f"❌ Sheet upsert failed: <code>{h(str(e)[:200])}</code>")
+        log.exception("FSL read failed: %s", e)
+        await _set(f"❌ Couldn't read Full Sample Listing: <code>{h(str(e)[:200])}</code>")
         return
 
-    upsert_secs = (datetime.now(timezone.utc) - t1).total_seconds()
-    total_secs = (datetime.now(timezone.utc) - t0).total_seconds()
+    new_rows: list[mms_client.SampleRow] = []
+    for r in mms_rows:
+        code = (r.product_code or "").strip().upper()
+        date = (r.sample_date_out or "").strip()
+        cust = (r.customer_name or "").strip()
+        if not (code and date and cust):
+            continue
+        key = (date, code, " ".join(cust.lower().split()))
+        if key in existing_keys:
+            continue
+        new_rows.append(r)
 
-    # Claude Haiku token accounting (only blurb calls — we don't hit Claude
-    # anywhere else in this flow). Haiku 4.5 rates are USD 1 / 1M input,
-    # USD 5 / 1M output. Show an estimated cost so the user sees the spend.
-    usage = ai.get_blurb_usage()
-    t_in = usage["input_tokens"]
-    t_out = usage["output_tokens"]
-    cost_usd = (t_in / 1_000_000) * 1.0 + (t_out / 1_000_000) * 5.0
+    if not new_rows:
+        sync_time = datetime.now(timezone.utc)
+        try:
+            await asyncio.to_thread(sheets.set_last_sample_sync, sync_time)
+        except Exception:  # noqa: BLE001
+            pass
+        await _set(
+            f"✅ <b>Full Sample Listing already up to date.</b>\n\n"
+            f"MMS rows pulled: {len(mms_rows)}\n"
+            f"Already present in FSL: {len(mms_rows)}\n"
+            f"➕ New rows added: 0"
+        )
+        return
+
+    # ---------- Step 3: Enrich each new row ----------
+    await _set(
+        f"⏳ Enriching <b>{len(new_rows)}</b> new rows "
+        "(Country / Taste / Category / Price)…"
+    )
+
+    country_cache, taste_cache, category_cache = enrich.load_all_caches()
+    haiku = enrich.haiku_client()
+
+    # Sort chronologically by Sample Date Out so they append in the right order.
+    def _date_key(r: mms_client.SampleRow):
+        d = r.sample_date_out_as_date()
+        return d or _dt.date(1900, 1, 1)
+    new_rows.sort(key=_date_key)
+
+    enriched: list[list[str]] = []
+    for r in new_rows:
+        country = enrich.resolve_country(
+            raw_country=r.country,
+            customer_name=r.customer_name,
+            customer_map=customer_map,
+            country_cache=country_cache,
+            haiku_client=haiku,
+        )
+        taste = enrich.resolve_taste(
+            code=r.product_code,
+            name=r.product_name,
+            taste_cache=taste_cache,
+            haiku_client=haiku,
+        )
+        category = enrich.resolve_category(
+            code=r.product_code,
+            name=r.product_name,
+            tab_map=tab_map,
+            category_cache=category_cache,
+            haiku_client=haiku,
+        )
+        enriched.append([
+            r.sales,
+            r.customer_name,
+            country,
+            r.product_code,
+            r.product_name,
+            r.quantity_g,
+            r.sample_date_out,
+            taste,
+            category,
+            r.rd_price,
+        ])
+
+    # ---------- Step 4: Append to FSL ----------
+    t1 = datetime.now(timezone.utc)
+    try:
+        appended = await asyncio.to_thread(sheets.append_fsl_rows, enriched)
+    except Exception as e:  # noqa: BLE001
+        log.exception("FSL append failed: %s", e)
+        await _set(f"❌ FSL append failed: <code>{h(str(e)[:200])}</code>")
+        return
+    write_secs = (datetime.now(timezone.utc) - t1).total_seconds()
+    total_secs = (datetime.now(timezone.utc) - t0).total_seconds()
 
     # Record the successful run so the 24h cooldown starts ticking.
     sync_time = datetime.now(timezone.utc)
@@ -660,20 +718,13 @@ async def _run_update_sample_list(
         log.warning("Could not record last-sync timestamp: %s", e)
 
     lines = [
-        "✅ <b>Sample Master List updated.</b>",
+        "✅ <b>Full Sample Listing updated.</b>",
         "",
         f"Window: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}",
-        f"MMS rows pulled: <b>{len(rows)}</b>",
-        f"Unique products: <b>{len(incoming)}</b>",
-        f"➕ Added: <b>{added}</b>",
-        f"🔁 Refreshed: <b>{updated}</b>",
-        f"⏱ Fetch {fetch_secs:.0f}s · Upsert {upsert_secs:.0f}s · Total {total_secs:.0f}s",
-        "",
-        "<b>Anthropic API usage (Haiku 4.5)</b>",
-        f"🤖 Claude calls: <b>{usage['calls']}</b>",
-        f"↳ Input tokens: <b>{t_in:,}</b>",
-        f"↳ Output tokens: <b>{t_out:,}</b>",
-        f"💵 Est. cost: <b>US$ {cost_usd:.4f}</b>",
+        f"MMS rows pulled: <b>{len(mms_rows)}</b>",
+        f"Already in FSL: <b>{len(mms_rows) - len(new_rows)}</b>",
+        f"➕ New rows added: <b>{appended}</b>",
+        f"⏱ Fetch {fetch_secs:.0f}s · Append {write_secs:.0f}s · Total {total_secs:.0f}s",
         "",
         f"<i>Next auto-sync allowed after "
         f"{(sync_time + _dt.timedelta(hours=SAMPLE_SYNC_COOLDOWN_HOURS)).strftime('%d %b %Y %H:%M UTC')} "
@@ -2147,8 +2198,9 @@ async def _handle_menu_callback(update, ctx, action: str):
         )
         return
     if action == "updsample":
-        # Ragonic-only guard — defense in depth; button is already hidden
-        # for everyone else at cmd_start.
+        # Admin-only — defence in depth (the button itself is hidden for
+        # non-admins in cmd_start). Routes to the same flow as the
+        # /updatesamplelist command.
         if not _is_update_sample_owner(user):
             await send(update, "🔒 This command is restricted.")
             return

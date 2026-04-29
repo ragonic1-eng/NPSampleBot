@@ -155,6 +155,144 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
     return cleaned
 
 
+# ---------- Full Sample Listing (transactional sample-out log) ----------
+
+FSL_TAB = "Full Sample Listing"
+FSL_HEADER = [
+    "Sales", "Customer Name", "Country", "Product Code", "Product Name",
+    "Quantity (g)", "Sample Date Out", "Taste describe", "Category",
+    "R&D Price",
+]
+# Index positions for the 10-col layout (0-indexed in the values matrix).
+FSL_COL_SALES = 0
+FSL_COL_CUSTOMER = 1
+FSL_COL_COUNTRY = 2
+FSL_COL_CODE = 3
+FSL_COL_NAME = 4
+FSL_COL_QTY = 5
+FSL_COL_DATE = 6
+FSL_COL_TASTE = 7
+FSL_COL_CATEGORY = 8
+FSL_COL_RD_PRICE = 9
+
+
+def _open_seasoning_master():
+    """Open the workbook that holds Full Sample Listing + the 6 category tabs."""
+    return _get_client().open_by_key(config.SEASONING_SHEET_ID)
+
+
+def _norm_customer(name: str) -> str:
+    return " ".join((name or "").lower().split())
+
+
+def load_fsl_dedupe_keys() -> set[tuple[str, str, str]]:
+    """Return the set of (sample_date_out, product_code, normalized_customer)
+    tuples for every row already in Full Sample Listing.
+
+    /updatesamplelist uses this to skip rows it's already imported from MMS.
+    """
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(FSL_TAB)
+    except gspread.WorksheetNotFound:
+        return set()
+    rows = ws.get_all_values()[1:]  # skip header
+    out: set[tuple[str, str, str]] = set()
+    for r in rows:
+        date = (r[FSL_COL_DATE] if len(r) > FSL_COL_DATE else "").strip()
+        code = (r[FSL_COL_CODE] if len(r) > FSL_COL_CODE else "").strip().upper()
+        cust = (r[FSL_COL_CUSTOMER] if len(r) > FSL_COL_CUSTOMER else "").strip()
+        if date and code and cust:
+            out.add((date, code, _norm_customer(cust)))
+    return out
+
+
+def load_fsl_customer_country_map() -> dict[str, str]:
+    """Build a {normalized_customer_name: country} map from existing FSL rows.
+
+    Used by /updatesamplelist to back-fill Country when MMS returns it blank
+    (most legacy MMS rows have no country) — your own data is the source of
+    truth.
+    """
+    from collections import Counter
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(FSL_TAB)
+    except gspread.WorksheetNotFound:
+        return {}
+    rows = ws.get_all_values()[1:]
+    by_customer: dict[str, Counter] = {}
+    for r in rows:
+        name = (r[FSL_COL_CUSTOMER] if len(r) > FSL_COL_CUSTOMER else "").strip()
+        country = (r[FSL_COL_COUNTRY] if len(r) > FSL_COL_COUNTRY else "").strip()
+        if not name or not country:
+            continue
+        by_customer.setdefault(_norm_customer(name), Counter())[country] += 1
+    return {k: ctr.most_common(1)[0][0] for k, ctr in by_customer.items()}
+
+
+def load_fsl_category_tab_map() -> dict[str, str]:
+    """Build a {PRODUCT_CODE_UPPER: category} map by reading the 6 category
+    tabs (Snack, Noodle & Instant Soup, etc.). First tab to claim a code wins.
+    """
+    sh = _open_seasoning_master()
+    out: dict[str, str] = {}
+    for tab in (
+        "Snack", "Noodle & Instant Soup", "Sauces & Mixes",
+        "Marinades", "Oil", "Beverage",
+    ):
+        try:
+            ws = sh.worksheet(tab)
+        except gspread.WorksheetNotFound:
+            continue
+        for r in ws.get_all_values()[1:]:
+            for cell in r:
+                c = (cell or "").strip().upper()
+                if c.startswith("S-") and len(c) >= 5:
+                    out.setdefault(c, tab)
+                    break
+    return out
+
+
+def append_fsl_rows(rows: list[list[str]]) -> int:
+    """Append rows to the bottom of Full Sample Listing.
+
+    Each row must already be a 10-element list matching FSL_HEADER. Returns
+    the number of rows actually appended. Header is refreshed if missing.
+    """
+    if not rows:
+        return 0
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(FSL_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=FSL_TAB, rows=2000, cols=len(FSL_HEADER))
+
+    # Ensure header.
+    first = ws.row_values(1)
+    if first != FSL_HEADER:
+        if ws.col_count < len(FSL_HEADER):
+            ws.add_cols(len(FSL_HEADER) - ws.col_count)
+        ws.update(values=[FSL_HEADER], range_name="A1")
+
+    # Find the first empty row at the bottom of the existing data.
+    existing = ws.get_all_values()
+    next_row = max(2, len(existing) + 1)
+
+    # Make sure the sheet is tall enough.
+    needed = next_row + len(rows) - 1
+    if ws.row_count < needed:
+        ws.add_rows(needed - ws.row_count)
+
+    end_col_letter = "J"  # 10th column
+    ws.update(
+        range_name=f"A{next_row}:{end_col_letter}{next_row + len(rows) - 1}",
+        values=rows,
+        value_input_option="USER_ENTERED",
+    )
+    return len(rows)
+
+
 # ---------- /pp query log (audit trail of product price lookups) ----------
 
 PP_QUERY_TAB = "Query"
@@ -489,9 +627,21 @@ def load_sample_log(force: bool = False) -> list[dict[str, Any]]:
     return out
 
 
-# ---------- Sample Master List 2024-Present (populated from MMS) ----------
+# ---------- Sample Master List 2024-Present — DEPRECATED ----------
+#
+# This tab has been retired in favour of the transactional "Full Sample
+# Listing" tab, populated by the PDF consolidation pipeline:
+#     _consolidate_full_sample_listing.py
+#     _propagate_manual_countries.py
+#     _add_taste_describe.py
+#     _add_category.py
+#
+# The /updatesamplelist command that used to write here is currently
+# stubbed (see bot.cmd_update_sample_list) and will be rewired to target
+# "Full Sample Listing" with the new schema. Until then, the helpers below
+# stay in source for reference but should NOT auto-create the deleted tab.
 
-SAMPLE_MASTER_TAB = "Sample Master List 2024-Present"
+SAMPLE_MASTER_TAB = "Sample Master List 2024-Present"  # deprecated
 SAMPLE_MASTER_COLS = [
     "Seasoning Name",
     "Code",
@@ -609,15 +759,23 @@ def set_last_sample_sync(when) -> None:
 
 
 def load_sample_master() -> tuple[list[str], list[list[str]]]:
-    """Return (header, rows) for the master tab. Creates tab if missing."""
+    """Return (header, rows) for the deprecated master tab.
+
+    No longer auto-creates the tab if missing — the user deleted it and we
+    don't want to silently resurrect it. Callers that hit this path now get
+    an empty result; the legacy /updatesamplelist command is stubbed at the
+    handler level so this should never be reached in practice.
+    """
     sh = _open_master()
     try:
         ws = sh.worksheet(SAMPLE_MASTER_TAB)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(
-            title=SAMPLE_MASTER_TAB, rows=6000, cols=len(SAMPLE_MASTER_COLS)
+        log.warning(
+            "load_sample_master: %r tab not found — it's been deprecated. "
+            "Returning empty result. The PDF consolidation pipeline writes "
+            "to 'Full Sample Listing' instead.",
+            SAMPLE_MASTER_TAB,
         )
-        ws.update(range_name="A1", values=[SAMPLE_MASTER_COLS])
         return SAMPLE_MASTER_COLS[:], []
 
     vals = ws.get_all_values()
@@ -642,7 +800,16 @@ def upsert_sample_master(
     incoming: list[dict[str, str]],
     blurb_fn=None,
 ) -> tuple[int, int]:
-    """Upsert rows into 'Sample Master List 2024-Present' keyed on Code.
+    """DEPRECATED — upserts to the deleted 'Sample Master List 2024-Present'.
+
+    Kept for reference until the /updatesamplelist command is rewired to
+    target 'Full Sample Listing' with the transactional schema. If invoked
+    today, will hit `load_sample_master`'s missing-tab branch and short-
+    circuit without writing.
+
+    Original docstring follows.
+
+    Upsert rows into 'Sample Master List 2024-Present' keyed on Code.
 
     ``incoming`` items look like::
         {

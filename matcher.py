@@ -259,10 +259,11 @@ def top_seasonings(
                         "_past_hits": len(pscores),
                     }
 
-    # Dedupe by code: the same product code lives in both its proper category
-    # tab and the historical "Sample Master List 2024-Present" tab — without
-    # this dedupe the top-5 is half-duplicates. Keep the highest-scoring
-    # entry per code.
+    # Dedupe by code: a product code can appear in more than one tab when
+    # the workbook is mid-cleanup, or when a code lives in a category tab AND
+    # in the (now-retired) "Sample Master List 2024-Present" tab from older
+    # data. Without this pass the top-5 can be half-duplicates. Keep the
+    # highest-scoring entry per code.
     by_code: dict[str, dict[str, Any]] = {}
     no_code_entries: list[dict[str, Any]] = []
     for s in pooled.values():

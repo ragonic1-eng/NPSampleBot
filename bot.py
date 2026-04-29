@@ -937,8 +937,74 @@ async def _run_lastsample_search(
 
     candidates = [r for r in rows if _matches(r)]
     if not candidates:
-        # Refinement context: explain that a stacked refinement returned
-        # nothing and the chain has been reset.
+        # PRODUCT search failed → fall through to CUSTOMER search.
+        # Same MMS-Name scope (only this rep's samples). Substring rules
+        # are slightly looser than product matching: each query token must
+        # appear ANYWHERE inside the full customer name string, not just
+        # within a single name token. Customer names have heavy
+        # punctuation and abbreviations (Pte Ltd, Co., parentheses…) so
+        # token-boundary matching would be too strict.
+        def _customer_matches(cust_name: str) -> bool:
+            cn = (cust_name or "").lower()
+            if not cn:
+                return False
+            if q and q in cn:
+                return True
+            if not q_tokens:
+                return False
+            return all(qt in cn for qt in q_tokens)
+
+        from datetime import date as _date
+        SENTINEL = _date(1900, 1, 1)
+        cust_latest: dict[str, _date | None] = {}
+        for r in rows:
+            cust = (r.get("Customer Name") or "").strip()
+            if not cust or not _customer_matches(cust):
+                continue
+            d = r.get("_date")
+            prev_d = cust_latest.get(cust)
+            if cust not in cust_latest or (d and (prev_d is None or d > prev_d)):
+                cust_latest[cust] = d
+        sorted_customers = sorted(
+            cust_latest.keys(),
+            key=lambda c: cust_latest.get(c) or SENTINEL,
+            reverse=True,
+        )
+
+        if sorted_customers:
+            # Found at least one customer matching the query. Per the user's
+            # spec ('1 b'): list the customers as buttons even when there's
+            # only one — keeps the UX consistent and lets them confirm intent.
+            options = sorted_customers[:9]  # cap at 9 buttons; rest hidden
+            ctx.user_data["lastsample_customer_options"] = options
+            ctx.user_data["lastsample_mms_name"] = mms_name  # kept warm for callback
+
+            btn_rows = [[(c, f"lsc:{i}")] for i, c in enumerate(options)]
+            btn_rows.append([
+                ("🔎 Find another", "lastsample:again"),
+                ("🏠 Main menu", "menu:home"),
+            ])
+            intro = [
+                f"🤔 <b>No products matched {h(query)}.</b>",
+                "",
+                f"But I found <b>{len(sorted_customers)}</b> customer"
+                f"{'s' if len(sorted_customers) != 1 else ''} you've sent samples to "
+                f"with <b>{h(query)}</b> in the name.",
+                "",
+                "<b>Tap one to see their last 10 samples:</b>",
+            ]
+            if len(sorted_customers) > 9:
+                intro.append("")
+                intro.append(
+                    f"<i>(Showing top {len(options)} by most-recent activity. "
+                    "Refine with a longer keyword to narrow further.)</i>"
+                )
+            await send(update, "\n".join(intro), kb(btn_rows))
+            # Reset the refinement chain — the customer button is the next step.
+            _re_arm("")
+            return
+
+        # No products AND no customers matched.
         reset_note = (
             "\n\n<i>🔄 Your search has been reset — send a fresh keyword "
             "to start over, or tap 🏠 Main menu.</i>" if prev else ""
@@ -947,12 +1013,11 @@ async def _run_lastsample_search(
             update,
             f"🙈 <b>No product found in your sample request list.</b>\n\n"
             f"Nothing under your name (<b>{h(mms_name)}</b>) has "
-            f"<b>{h(query)}</b> in the Product Name. Double-check the "
-            "spelling, or try a different keyword."
+            f"<b>{h(query)}</b> in the Product Name or Customer Name. "
+            "Double-check the spelling, or try a different keyword."
             f"{reset_note}",
             _LASTSAMPLE_KB,
         )
-        # Reset the refinement chain — next text is a fresh search.
         _re_arm("")
         return
 
@@ -1010,6 +1075,80 @@ async def _run_lastsample_search(
     # Persist this query so the next text the user sends is treated as a
     # refinement on top of it.
     _re_arm(query)
+
+
+async def _show_customer_samples(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    mms_name: str,
+    customer_name: str,
+) -> None:
+    """Render the latest 10 samples this rep sent to ``customer_name``.
+
+    Used by the customer-name fallback in /lastsample: after the user picks
+    a matching customer from the inline keyboard, we pull every FSL row
+    where Sales == mms_name AND Customer Name == customer_name (case- and
+    whitespace-insensitive equality), sort by Sample Date Out desc, take
+    the top 10.
+    """
+    try:
+        rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
+    except Exception as e:  # noqa: BLE001
+        log.exception("lastsample: FSL read failed for customer view")
+        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _LASTSAMPLE_KB)
+        return
+
+    target = " ".join(customer_name.lower().split())
+    matches = [
+        r for r in rows
+        if " ".join((r.get("Customer Name") or "").lower().split()) == target
+    ]
+    if not matches:
+        await send(
+            update,
+            f"📭 I don't see any samples you sent to <b>{h(customer_name)}</b>.",
+            _LASTSAMPLE_KB,
+        )
+        return
+
+    from datetime import date as _date
+    SENTINEL = _date(1900, 1, 1)
+    matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
+    top = matches[:10]
+
+    def _fmt_price(raw: str) -> str:
+        s = (raw or "").strip()
+        if not s:
+            return "—"
+        try:
+            float(s)
+            return f"USD {s}"
+        except ValueError:
+            return s  # already has currency text baked in
+
+    lines = [
+        f"📋 <b>Last {len(top)} sample{'s' if len(top) > 1 else ''} to "
+        f"{h(customer_name)}:</b>",
+        "",
+    ]
+    for i, r in enumerate(top, 1):
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        name = r.get("Product Name") or "—"
+        code = r.get("Product Code") or "—"
+        price = _fmt_price(r.get("R&D Price") or "")
+        lines.append(
+            f" {i}. {h(date_str)} · {h(name)} · <code>{h(code)}</code> · {h(price)}"
+        )
+    if len(matches) > 10:
+        lines.append("")
+        lines.append(
+            f"<i>({len(matches) - 10} older sample"
+            f"{'s' if len(matches) - 10 > 1 else ''} hidden — refine your "
+            "search with a more specific keyword if you need them.)</i>"
+        )
+
+    await send(update, "\n".join(lines), _LASTSAMPLE_KB)
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2003,6 +2142,41 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # no-draft guard since /lastsample doesn't open a draft.
     if data == "lastsample:again":
         await cmd_lastsample(update, ctx)
+        return
+
+    # /lastsample customer pick — user tapped a customer suggestion from the
+    # 'No products matched, did you mean a customer?' keyboard. The list of
+    # options was cached in ctx.user_data["lastsample_customer_options"]
+    # right before that message went out. If the cache is gone (different
+    # process / restart / long delay) we tell the user to retry.
+    if data.startswith("lsc:"):
+        try:
+            idx = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        options = ctx.user_data.get("lastsample_customer_options") or []
+        if idx < 0 or idx >= len(options):
+            await send(
+                update,
+                "🤔 That selection has expired — please tap 🔎 Find another "
+                "and search again.",
+                _LASTSAMPLE_KB,
+            )
+            return
+        customer = options[idx]
+        mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
+            sheets.get_user_mms_name,
+            update.effective_user.id, update.effective_user.username,
+        )
+        if not mms:
+            await send(
+                update,
+                "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
+                "on the <i>Authorized Users</i> tab, then re-run /lastsample.",
+            )
+            return
+        ctx.user_data["lastsample_mms_name"] = mms
+        await _show_customer_samples(update, ctx, mms, customer)
         return
 
     # Main menu and /samples browsing work with or without a draft.

@@ -511,13 +511,16 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# Match seasoning codes. Original V1.6.x version only allowed ONE optional
-# '-XX' suffix, which truncated codes like 'S-TXF06-00-03' to 'S-TXF06-00'
-# (V1.9.7 bug report). Now allows up to 3 hyphenated suffixes — covers
-# every code shape we've seen in MMS / FSL while still anchoring on
-# 'S-' + 3+ alphanumerics so we don't grab unrelated tokens.
+# Match seasoning codes. History of one-segment-at-a-time fixes:
+#   V1.6.x: one optional '-XX' suffix → broke on S-TXF06-00-03
+#   V1.9.7: up to 3 suffixes        → would break on a 5-segment code
+#   V1.9.8: up to 6 suffixes (this) → covers anything we've seen and
+#           leaves headroom (e.g. S-T4C83-35-07-11 has 3, but the user
+#           wants margin so we don't chase regex bumps every time R&D
+#           introduces a new naming layer)
+# Anchored on 'S-' + 3+ alphanumerics so we don't grab unrelated tokens.
 _PP_CODE_RE = re.compile(
-    r"\bS-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,3}\b",
+    r"\bS-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,6}\b",
     re.IGNORECASE,
 )
 

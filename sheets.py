@@ -789,14 +789,32 @@ SAMPLE_MASTER_COLS = [
 def _parse_iso_date(s: str):
     """Best-effort parse of Sample Date Out strings. Returns ``date`` or None.
 
-    Accepts ISO (YYYY-MM-DD), ``dd-MMM-yyyy`` (MMS style like ``02-Apr-2024``),
-    ``dd/mm/yyyy`` and a couple of other common shapes. Never raises.
+    Accepts every shape we've seen in Full Sample Listing in the wild:
+      - ISO          ``2026-04-29``
+      - MMS style    ``02-Apr-2024``        (dash + abbreviated month)
+      - Slash + abbr ``01/Apr/2026``        (FSL via PDF backfill)
+      - Slash + full ``01/April/2026``
+      - Numeric      ``01/04/2026`` / ``2026/04/29`` / ``01-04-2026``
+      - Spaced       ``02 Apr 2024``
+
+    Critical for /lastsample sorting and the FSL sort job — if a row's date
+    fails to parse, it falls back to a sentinel date (1900-01-01) which can
+    cause newer rows to sort below older ones when scores tie. Bug found
+    V1.8.4: ``01/Apr/2026`` wasn't covered, leaving 2026 honey samples
+    sorting behind 2024 ones.
     """
     import datetime as _d
     s = (s or "").strip()
     if not s:
         return None
-    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d %b %Y", "%d-%m-%Y"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%d-%b-%Y", "%d-%B-%Y",
+        "%d/%b/%Y", "%d/%B/%Y",
+        "%d/%m/%Y", "%Y/%m/%d",
+        "%d %b %Y", "%d %B %Y",
+        "%d-%m-%Y",
+    ):
         try:
             return _d.datetime.strptime(s, fmt).date()
         except ValueError:

@@ -880,145 +880,86 @@ async def _run_lastsample_search(
         _re_arm("")  # nothing to refine on
         return
 
-    # Score each row against the query. Two-pass:
+    # Strict containment scoring (V1.8.8). The Product Name MUST literally
+    # contain the user's input term — we no longer fuzzy-match. Rules:
     #
-    #   (1) Exact-substring boosts: if the query string appears verbatim in
-    #       the code, name, or taste keywords, return a high decisive score.
-    #       Handles 'S-668', 'BBQ', exact-name copy/paste.
+    #   - Whole query as substring of code or name → match.
+    #   - Otherwise, every non-stopword token from the query must appear
+    #     inside SOME name token (substring either direction, so 'chip'
+    #     finds 'chips' and vice versa).
+    #   - Anything else → no match. Bot says "no product found in your
+    #     sample request list", no fuzzy 'did you mean' guesses.
     #
-    #   (2) Token-wise fuzzy: split the query into words, and for each word
-    #       find the BEST match among the row's tokens (name + code + taste).
-    #       Average those per-token bests.
-    #
-    #       This catches typos that the old single-WRatio approach missed:
-    #         'pecking duck'  → 'peking duck seasoning'   (ratio 92 + 100)
-    #         'spicy chese'   → 'spicy nacho cheese ...'  (ratio 100 + 91)
-    #         'duck peking'   → 'peking duck ...'         (order-agnostic)
-    #
-    #       Why per-token max instead of WRatio against a joined haystack:
-    #       WRatio penalises length mismatches. Once the haystack runs to
-    #       'spicy nacho cheese seasoning bangladesh ...' the score for
-    #       'spicy chese' collapses below threshold even though both words
-    #       are present.
-    from rapidfuzz import fuzz
-
+    # Why this is the right trade-off here: false positives (peri → PEPPER,
+    # honey → BBQ via taste keywords) misled users into quoting the wrong
+    # product. Strict containment is predictable: if the user's word isn't
+    # in the name, the bot honestly says so.
     _word_re = re.compile(r"[a-z0-9]+")
+    # Common connectors that pollute substring matching when present in
+    # either the query or the product name (e.g. 'fish and chip' vs 'FISH
+    # & CHIPS' — '&' becomes nothing after tokenizing, 'and' is a noise
+    # word). Keep this short — only words that are truly never meaningful.
+    _STOPWORDS = {"and", "or", "the", "of", "with", "in", "for", "to"}
 
     def _tokens(s: str) -> list[str]:
-        return [t for t in _word_re.findall((s or "").lower()) if len(t) >= 2]
+        return [
+            t for t in _word_re.findall((s or "").lower())
+            if len(t) >= 2 and t not in _STOPWORDS
+        ]
 
     q = query.lower().strip()
     q_tokens = _tokens(query)
 
-    def _score(row: dict) -> float:
+    def _matches(row: dict) -> bool:
         name = (row.get("Product Name") or "").lower()
         code = (row.get("Product Code") or "").lower()
-        # Taste describe is intentionally NOT searched. Haiku-generated
-        # taste keywords contain words like 'honey' or 'spicy' for products
-        # whose real name doesn't include them, which produced misleading
-        # 'last sample' results (V1.8.5). Search is now strictly:
-        #   - Product Code  (substring → exact code lookups)
-        #   - Product Name  (substring + token-wise fuzzy → typo tolerance)
-
-        # (1) Substring boosts — cheap and decisive.
+        # Whole-string substring shortcuts — handles 'S-668', exact-name
+        # copy/paste, and multi-word phrases that happen to appear verbatim.
         if q and q in code:
-            return 100.0
+            return True
         if q and q in name:
-            return 98.0
-        # (2) Token-wise fuzzy on Product Name only — Levenshtein ratio only.
-        # We deliberately do NOT use partial_ratio: it's too aggressive for
-        # short queries (e.g. partial_ratio('peri', 'pepper') = 85 because
-        # they share 'pe...r', causing 'peri' to falsely match products
-        # with 'PEPPER' in the name). Substring containment is already
-        # handled in (1) above, so partial_ratio adds no value here, only
-        # false positives.
+            return True
+        # Otherwise: every meaningful token from the query must appear in
+        # some token of the name. Substring either direction so 'chip'
+        # finds 'chips' and 'tomato' is still found by typing 'tom'.
         if not q_tokens:
-            return 0.0
+            return False
         name_tokens = _tokens(name)
         if not name_tokens:
-            return 0.0
-        per_token_best: list[float] = []
+            return False
         for qt in q_tokens:
-            # ratio = Levenshtein-based similarity. Catches single-char
-            # typos ('chese' vs 'cheese' = 90) but stays low when the
-            # words are genuinely different ('peri' vs 'pepper' = 60).
-            best = max(fuzz.ratio(qt, ht) for ht in name_tokens)
-            per_token_best.append(best)
-        return sum(per_token_best) / len(per_token_best)
+            if not any(qt in nt or nt in qt for nt in name_tokens):
+                return False
+        return True
 
-    scored = [(r, _score(r)) for r in rows]
-    # Two thresholds:
-    #   ≥ HIGH → confident match, return the most recent
-    #   ≥ NEAR but < HIGH → near miss, show as "did you mean?" suggestions
-    HIGH = 75.0
-    NEAR = 55.0
-    candidates = [(r, s) for r, s in scored if s >= HIGH]
+    candidates = [r for r in rows if _matches(r)]
     if not candidates:
-        # Build a deduped (by product code) suggestion list of the closest
-        # near-misses so the user can spot the right product / spelling.
-        near_sorted = sorted(
-            [(r, s) for r, s in scored if s >= NEAR],
-            key=lambda rs: rs[1], reverse=True,
-        )
-        seen_codes: set[str] = set()
-        suggestions: list[dict] = []
-        for r, _s in near_sorted:
-            c = (r.get("Product Code") or "").upper()
-            if c in seen_codes:
-                continue
-            seen_codes.add(c)
-            suggestions.append(r)
-            if len(suggestions) >= 3:
-                break
-
-        # Refinement context: if the user was narrowing an existing query,
-        # phrase the failure as "your refinement returned nothing — search
-        # has been reset" so they understand why their next message will be
-        # treated as a fresh search rather than yet another refinement.
-        was_refinement = bool(prev)
+        # Refinement context: explain that a stacked refinement returned
+        # nothing and the chain has been reset.
         reset_note = (
-            "\n\n<i>🔄 Your search has been reset — send a fresh keyword to "
-            "start over, or tap 🏠 Main menu.</i>"
-            if was_refinement else ""
+            "\n\n<i>🔄 Your search has been reset — send a fresh keyword "
+            "to start over, or tap 🏠 Main menu.</i>" if prev else ""
         )
-        if suggestions:
-            lines = [
-                f"🤔 <b>No exact match for {h(query)}</b> under your name.",
-                "",
-                "<b>Did you mean one of these?</b>",
-            ]
-            for r in suggestions:
-                lines.append(
-                    f"  • {h(r.get('Product Name') or '—')} "
-                    f"(<code>{h(r.get('Product Code') or '—')}</code>)"
-                )
-            lines.append("")
-            lines.append(
-                "<i>Send one of those names (or a fresh keyword) to try again.</i>"
-                + reset_note.replace("\n\n", "\n")
-            )
-            await send(update, "\n".join(lines), _LASTSAMPLE_KB)
-        else:
-            await send(
-                update,
-                f"🙈 <b>Not found in database.</b>\n\n"
-                f"No samples under your name (<b>{h(mms_name)}</b>) match "
-                f"<b>{h(query)}</b>. Double-check the spelling, or try a "
-                "shorter keyword like <i>spicy</i>, <i>BBQ</i>, or a code "
-                f"prefix like <code>S-668</code>.{reset_note}",
-                _LASTSAMPLE_KB,
-            )
+        await send(
+            update,
+            f"🙈 <b>No product found in your sample request list.</b>\n\n"
+            f"Nothing under your name (<b>{h(mms_name)}</b>) has "
+            f"<b>{h(query)}</b> in the Product Name. Double-check the "
+            "spelling, or try a different keyword."
+            f"{reset_note}",
+            _LASTSAMPLE_KB,
+        )
         # Reset the refinement chain — next text is a fresh search.
         _re_arm("")
         return
 
-    # Sort by date desc, but also keep score as a tiebreaker so a high-score
-    # exact match isn't beaten by a marginal-score row that happens to be
-    # newer.
+    # All matches are equally valid (binary containment). Sort by date desc
+    # so the user always sees the most recent sample. Unparseable dates
+    # sink to the bottom via the SENTINEL.
     from datetime import date as _date
     SENTINEL = _date(1900, 1, 1)
-    candidates.sort(key=lambda rs: (rs[0].get("_date") or SENTINEL, rs[1]), reverse=True)
-    best, best_score = candidates[0]
+    candidates.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
+    best = candidates[0]
 
     # Format date nicely; fall back to the raw string if parsing failed.
     raw_date = best.get("Sample Date Out", "") or ""
@@ -1052,16 +993,15 @@ async def _run_lastsample_search(
         lines.append("")
         lines.append(f"<i>🔍 Searched: {h(query)}</i>")
     # If there are several plausible matches, prompt the user to keep
-    # narrowing. Just type more words — refinement is now persistent.
-    if len(candidates) > 1:
-        others = sum(1 for _, s in candidates[1:] if s >= 70)
-        if others:
-            if not prev:
-                lines.append("")
-            lines.append(
-                f"<i>({others} other match{'es' if others > 1 else ''} found — "
-                "type more words to narrow further, or tap 🔎 Find another to start over.)</i>"
-            )
+    # narrowing. Just type more words — refinement is persistent.
+    others = len(candidates) - 1
+    if others > 0:
+        if not prev:
+            lines.append("")
+        lines.append(
+            f"<i>({others} other match{'es' if others > 1 else ''} found — "
+            "type more words to narrow further, or tap 🔎 Find another to start over.)</i>"
+        )
 
     await send(update, "\n".join(lines), _LASTSAMPLE_KB)
     # Persist this query so the next text the user sends is treated as a

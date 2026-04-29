@@ -815,6 +815,11 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# Reusable footer keyboard for every /lastsample reply — keeps the user in
+# the loop without making them retype the slash command.
+_LASTSAMPLE_KB = kb([[("🔎 Find another", "lastsample:again"), ("🏠 Main menu", "menu:home")]])
+
+
 async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> None:
     """Search FSL rows owned by `mms_name` for `query`, reply with the latest match."""
     query = (query or "").strip()
@@ -823,6 +828,7 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
             update,
             "🤏 That's too short. Try at least 2 characters — a product name, "
             "code prefix, or flavour keyword.",
+            _LASTSAMPLE_KB,
         )
         return
 
@@ -830,7 +836,7 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
         rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
     except Exception as e:  # noqa: BLE001
         log.exception("lastsample: FSL read failed")
-        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}")
+        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _LASTSAMPLE_KB)
         return
 
     if not rows:
@@ -838,6 +844,7 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
             update,
             f"📭 I don't see any samples logged under <b>{h(mms_name)}</b> "
             "in Full Sample Listing yet.",
+            _LASTSAMPLE_KB,
         )
         return
 
@@ -872,6 +879,7 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
             f"(<b>{h(mms_name)}</b>).\n\n"
             "Try a shorter keyword, a code prefix like <code>S-668</code>, "
             "or a flavour word like <i>spicy</i>.",
+            _LASTSAMPLE_KB,
         )
         return
 
@@ -920,7 +928,7 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
                 "send a more specific keyword to narrow further.)</i>"
             )
 
-    await send(update, "\n".join(lines))
+    await send(update, "\n".join(lines), _LASTSAMPLE_KB)
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1898,6 +1906,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Handle before the no-draft guard.
     if data.startswith("again:"):
         await _handle_again(update, ctx, data.split(":", 1)[1])
+        return
+
+    # /lastsample "Find another" button — re-arm the awaiting flag and reprompt
+    # without forcing the user to retype the slash command. Lives BEFORE the
+    # no-draft guard since /lastsample doesn't open a draft.
+    if data == "lastsample:again":
+        await cmd_lastsample(update, ctx)
         return
 
     # Main menu and /samples browsing work with or without a draft.

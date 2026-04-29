@@ -80,8 +80,79 @@ COUNTRY_TOKENS = [
     "India", "China", "Taiwan", "Korea", "Japan",
     "Saudi Arabia", "Bahrain", "Kuwait", "Oman", "Qatar", "Jordan", "Lebanon",
     "Egypt", "Syria", "Iraq", "Iran", "Yemen",
-    "Australia", "New Zealand",
+    "Australia", "New Zealand", "United Arab Emirates", "United States",
+    "United Kingdom",
 ]
+
+# 2-letter ISO codes → canonical full name. Used to normalize values like
+# "SG" or "SG (Singapore)" coming out of MMS.
+ISO_TO_COUNTRY = {
+    "SG": "Singapore", "MY": "Malaysia", "TH": "Thailand", "ID": "Indonesia",
+    "VN": "Vietnam", "PH": "Philippines", "IN": "India", "BD": "Bangladesh",
+    "LK": "Sri Lanka", "PK": "Pakistan", "NP": "Nepal", "KH": "Cambodia",
+    "MM": "Myanmar", "CN": "China", "TW": "Taiwan", "KR": "Korea", "JP": "Japan",
+    "SA": "Saudi Arabia", "BH": "Bahrain", "KW": "Kuwait", "OM": "Oman",
+    "QA": "Qatar", "JO": "Jordan", "LB": "Lebanon", "EG": "Egypt", "SY": "Syria",
+    "IQ": "Iraq", "IR": "Iran", "YE": "Yemen", "AU": "Australia", "NZ": "New Zealand",
+    "AE": "United Arab Emirates", "US": "United States", "USA": "United States",
+    "GB": "United Kingdom", "UK": "United Kingdom",
+}
+
+# Free-text aliases that aren't ISO codes but show up in MMS / customer notes.
+COUNTRY_ALIASES = {
+    "uae": "United Arab Emirates", "u.a.e": "United Arab Emirates",
+    "u.a.e.": "United Arab Emirates", "emirates": "United Arab Emirates",
+    "ksa": "Saudi Arabia", "kingdom of saudi arabia": "Saudi Arabia",
+    "south korea": "Korea", "republic of korea": "Korea",
+    "korea, south": "Korea", "korea (south)": "Korea",
+    "viet nam": "Vietnam",
+    "burma": "Myanmar", "myanmar (burma)": "Myanmar",
+    "p.r. china": "China", "prc": "China", "p.r.c.": "China",
+    "philippine": "Philippines", "philipines": "Philippines",
+}
+
+
+def normalize_country(s: str) -> str:
+    """Canonicalize a country string into the project's preferred format.
+
+    Examples:
+      "SG"                -> "Singapore"
+      "SG (Singapore)"    -> "Singapore"
+      "Singapore (SG)"    -> "Singapore"
+      "UAE"               -> "United Arab Emirates"
+      "south korea"       -> "Korea"
+      "Singapore"         -> "Singapore"   (passthrough)
+      ""                  -> ""
+
+    Unknown values are returned trimmed but otherwise untouched so we don't
+    accidentally blank out something legitimate the maintainer typed by hand.
+    """
+    if not s:
+        return ""
+    raw = str(s).strip()
+    if not raw:
+        return ""
+
+    # Pull "outside (inside)" apart so both halves get a chance to match.
+    import re
+    m = re.match(r"^\s*([^()]+?)\s*\(([^)]+)\)\s*$", raw)
+    candidates = [m.group(1).strip(), m.group(2).strip()] if m else [raw]
+
+    for cand in candidates:
+        if not cand:
+            continue
+        upper = cand.upper().replace(".", "").strip()
+        if upper in ISO_TO_COUNTRY:
+            return ISO_TO_COUNTRY[upper]
+        lower = cand.lower().strip()
+        if lower in COUNTRY_ALIASES:
+            return COUNTRY_ALIASES[lower]
+        for tok in COUNTRY_TOKENS:
+            if tok.lower() == lower:
+                return tok
+
+    # Fallback: hand back the cleaned outside half so manual entries survive.
+    return candidates[0].strip()
 
 
 def _norm_company(name: str) -> str:
@@ -125,24 +196,24 @@ def resolve_country(
       6. Haiku call (only if client provided AND name nonempty)
     """
     if (raw_country or "").strip():
-        return raw_country.strip()
+        return normalize_country(raw_country)
     if not customer_name:
         return ""
     inferred = customer_map.get(_norm_company(customer_name))
     if inferred:
-        return inferred
+        return normalize_country(inferred)
     tok = _country_from_tokens(customer_name)
     if tok:
-        return tok
+        return tok  # already canonical
     suf = _country_from_suffix(customer_name)
     if suf:
-        return suf
+        return suf  # already canonical
     if customer_name in country_cache:
-        return country_cache[customer_name]
+        return normalize_country(country_cache[customer_name])
     if haiku_client is None:
         return ""
-    # Last resort: ask Haiku.
-    guess = _ask_haiku_country(haiku_client, customer_name)
+    # Last resort: ask Haiku, then normalize whatever it returns.
+    guess = normalize_country(_ask_haiku_country(haiku_client, customer_name))
     country_cache[customer_name] = guess
     _save_json(COUNTRY_CACHE_PATH, country_cache)
     return guess

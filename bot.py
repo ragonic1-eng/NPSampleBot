@@ -882,24 +882,28 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
     def _score(row: dict) -> float:
         name = (row.get("Product Name") or "").lower()
         code = (row.get("Product Code") or "").lower()
-        taste = (row.get("Taste describe") or "").lower()
+        # Taste describe is intentionally NOT searched. Haiku-generated
+        # taste keywords contain words like 'honey' or 'spicy' for products
+        # whose real name doesn't include them, which produced misleading
+        # 'last sample' results (V1.8.5). Search is now strictly:
+        #   - Product Code  (substring → exact code lookups)
+        #   - Product Name  (substring + token-wise fuzzy → typo tolerance)
+
         # (1) Substring boosts — cheap and decisive.
         if q and q in code:
             return 100.0
         if q and q in name:
             return 98.0
-        if q and q in taste:
-            return 88.0
-        # (2) Token-wise fuzzy.
+        # (2) Token-wise fuzzy on Product Name only.
         if not q_tokens:
             return 0.0
-        haystack_tokens = list(set(_tokens(name) + _tokens(code) + _tokens(taste)))
-        if not haystack_tokens:
+        name_tokens = _tokens(name)
+        if not name_tokens:
             return 0.0
         per_token_best: list[float] = []
         for qt in q_tokens:
             best = 0.0
-            for ht in haystack_tokens:
+            for ht in name_tokens:
                 # ratio handles single-char typos ('chese' vs 'cheese' = 91).
                 # partial_ratio handles 'qt is a substring' cases ('thai'
                 # finding 'thailand') without dragging the score down for

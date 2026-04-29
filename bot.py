@@ -567,9 +567,42 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             except Exception:  # noqa: BLE001 — message may be too old to edit
                 await chat.send_message(text, parse_mode=ParseMode.HTML)
 
+        # Helper: render an FSL-only reply (3 lines, no RMC). Used both
+        # when MMS doesn't have the variant and when MMS returned a
+        # parent code instead of the exact variant the user asked for.
+        async def _reply_from_fsl(asked_code: str, fsl_row: dict) -> None:
+            fsl_name = (fsl_row.get("Product Name") or "—").strip() or "—"
+            fsl_price_raw = (fsl_row.get("R&D Price") or "").strip()
+            try:
+                float(fsl_price_raw)
+                fsl_price_display = f"USD {fsl_price_raw}"
+                fsl_price_for_audit = float(fsl_price_raw)
+            except ValueError:
+                fsl_price_display = fsl_price_raw or "—"
+                fsl_price_for_audit = None
+            body = (
+                f"<b>Code:</b> <code>{h(asked_code)}</code>\n"
+                f"<b>Name:</b> {h(fsl_name)}\n"
+                f"<b>R&amp;D Price:</b> {h(fsl_price_display)}"
+            )
+            await _replace(body)
+            _audit(
+                query=asked_code,
+                result="Found (FSL)",
+                matched_code=asked_code,
+                name=fsl_name,
+                rd_price_usd=fsl_price_for_audit,
+                raw_material_cost_usd=None,
+            )
+
         try:
             product = await asyncio.to_thread(client.fetch_product, code)
         except mms_product.ProductNotFound:
+            # MMS has no record at all. Try FSL by exact code before giving up.
+            fsl_row = await asyncio.to_thread(sheets.find_fsl_product_by_code, code)
+            if fsl_row:
+                await _reply_from_fsl(code, fsl_row)
+                continue
             await _replace(f"😕 No product found for <code>{h(code)}</code>.")
             _audit(query=code, result="Not Found")
             continue
@@ -587,6 +620,22 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             )
             _audit(query=code, result="Error", error=str(e))
             continue
+
+        # MMS returned a product. Did it return the EXACT code the user
+        # asked for? MMS does prefix matching, so requesting
+        # 'S-TXF06-00-03' can come back as 'S-TXF06-00' (the parent), and
+        # the parent's R&D price is wrong for the variant. When that
+        # happens, prefer FSL — it has the variant-specific price.
+        asked = code.strip().upper()
+        got = (product.code or "").strip().upper()
+        if got != asked:
+            fsl_row = await asyncio.to_thread(sheets.find_fsl_product_by_code, asked)
+            if fsl_row:
+                await _reply_from_fsl(asked, fsl_row)
+                continue
+            # else: fall through to the MMS reply; it'll show the parent
+            # code, which the user can still cross-check.
+
         # Customer-facing Raw Material Cost rule:
         #   1) round UP to the next 0.10  (3.47622 → 3.50)
         #   2) add the standing markup    (+ config.RMC_MARKUP_USD = 0.30)

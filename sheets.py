@@ -733,6 +733,49 @@ def get_user_mms_name(tg_user_id: int, username: str | None) -> str:
     return ""
 
 
+def find_fsl_product_by_code(code: str) -> dict | None:
+    """Return the most-recent Full Sample Listing row whose Product Code
+    EXACTLY matches ``code`` (case-insensitive), or ``None`` if no row
+    matches.
+
+    Used by /pp as a fallback when MMS returns a parent code (e.g. user
+    asked for ``S-TXF06-00-03`` but MMS only has ``S-TXF06-00``) — FSL
+    holds variant-specific R&D prices that the parent's MMS row doesn't.
+
+    The returned dict carries every FSL_HEADER column plus a parsed
+    ``_date`` (datetime.date or None) so the caller can render the
+    sample-out date nicely.
+    """
+    import datetime as _d
+    code_upper = (code or "").strip().upper()
+    if not code_upper:
+        return None
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(FSL_TAB)
+    except gspread.WorksheetNotFound:
+        return None
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return None
+    matches: list[dict] = []
+    for r in values[1:]:
+        if len(r) <= FSL_COL_CODE:
+            continue
+        row_code = (r[FSL_COL_CODE] or "").strip().upper()
+        if row_code != code_upper:
+            continue
+        padded = r + [""] * (len(FSL_HEADER) - len(r))
+        row = {hdr: padded[i] for i, hdr in enumerate(FSL_HEADER)}
+        row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
+        matches.append(row)
+    if not matches:
+        return None
+    SENTINEL = _d.date(1900, 1, 1)
+    matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
+    return matches[0]
+
+
 def load_fsl_rows_for_sales(sales_name: str) -> list[dict[str, str]]:
     """Return every Full Sample Listing row whose Sales col matches sales_name
     (case-insensitive, whitespace-collapsed). Each row is a dict with the

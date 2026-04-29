@@ -849,6 +849,17 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _LASTSAMPLE_KB = kb([[("🔎 Find another", "lastsample:again"), ("🏠 Main menu", "menu:home")]])
 
 
+def _cust_hash(name: str) -> str:
+    """Stable short hash for customer-name callback data.
+
+    10 hex chars = 40 bits — collision-safe well past any plausible
+    customer count for one rep. Stays under Telegram's 64-byte
+    callback_data limit even with the 'lsc:' prefix.
+    """
+    import hashlib
+    return hashlib.md5((name or "").lower().strip().encode("utf-8")).hexdigest()[:10]
+
+
 async def _run_lastsample_search(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -1000,10 +1011,16 @@ async def _run_lastsample_search(
             # spec ('1 b'): list the customers as buttons even when there's
             # only one — keeps the UX consistent and lets them confirm intent.
             options = sorted_customers[:9]  # cap at 9 buttons; rest hidden
-            ctx.user_data["lastsample_customer_options"] = options
             ctx.user_data["lastsample_mms_name"] = mms_name  # kept warm for callback
 
-            btn_rows = [[(c, f"lsc:{i}")] for i, c in enumerate(options)]
+            # Use a short hash of the customer name as callback data instead
+            # of a list index. Why: ctx.user_data is per-worker, so when
+            # Railway switches workers between sending the buttons and the
+            # user tapping one, an index lookup in user_data fails ('That
+            # selection has expired'). A hash lets us re-derive the customer
+            # name from the FSL on whichever worker handles the click —
+            # state-free, multi-replica safe.
+            btn_rows = [[(c, f"lsc:{_cust_hash(c)}")] for c in options]
             btn_rows.append([
                 ("🔎 Find another", "lastsample:again"),
                 ("🏠 Main menu", "menu:home"),
@@ -2168,26 +2185,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_lastsample(update, ctx)
         return
 
-    # /lastsample customer pick — user tapped a customer suggestion from the
-    # 'No products matched, did you mean a customer?' keyboard. The list of
-    # options was cached in ctx.user_data["lastsample_customer_options"]
-    # right before that message went out. If the cache is gone (different
-    # process / restart / long delay) we tell the user to retry.
+    # /lastsample customer pick — user tapped a customer suggestion. The
+    # callback_data is 'lsc:<hash>' where hash = first 10 hex chars of the
+    # customer name's md5. We re-derive the customer list from FSL on
+    # whichever worker handles the click and find the one whose hash
+    # matches. State-free → survives multi-replica deploys, the 5-min
+    # ctx.user_data window, and process restarts.
     if data.startswith("lsc:"):
-        try:
-            idx = int(data.split(":", 1)[1])
-        except ValueError:
+        target_hash = data.split(":", 1)[1].strip()
+        if not target_hash:
             return
-        options = ctx.user_data.get("lastsample_customer_options") or []
-        if idx < 0 or idx >= len(options):
-            await send(
-                update,
-                "🤔 That selection has expired — please tap 🔎 Find another "
-                "and search again.",
-                _LASTSAMPLE_KB,
-            )
-            return
-        customer = options[idx]
         mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
             sheets.get_user_mms_name,
             update.effective_user.id, update.effective_user.username,
@@ -2200,7 +2207,36 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         ctx.user_data["lastsample_mms_name"] = mms
-        await _show_customer_samples(update, ctx, mms, customer)
+        # Re-derive the unique customer set this rep has sent to.
+        try:
+            rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms)
+        except Exception as e:  # noqa: BLE001
+            log.exception("lastsample: FSL read failed during customer-pick callback")
+            await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _LASTSAMPLE_KB)
+            return
+        seen_customers: set[str] = set()
+        for r in rows:
+            cust = (r.get("Customer Name") or "").strip()
+            if cust:
+                seen_customers.add(cust)
+        chosen: str | None = next(
+            (c for c in seen_customers if _cust_hash(c) == target_hash),
+            None,
+        )
+        if chosen is None:
+            log.warning(
+                "lsc callback: no customer matches hash %s for mms=%r "
+                "(saw %d customers)",
+                target_hash, mms, len(seen_customers),
+            )
+            await send(
+                update,
+                "🤔 Couldn't match that customer in the latest data — please "
+                "tap 🔎 Find another and search again.",
+                _LASTSAMPLE_KB,
+            )
+            return
+        await _show_customer_samples(update, ctx, mms, chosen)
         return
 
     # Main menu and /samples browsing work with or without a draft.

@@ -925,7 +925,13 @@ async def _run_lastsample_search(
             return 100.0
         if q and q in name:
             return 98.0
-        # (2) Token-wise fuzzy on Product Name only.
+        # (2) Token-wise fuzzy on Product Name only — Levenshtein ratio only.
+        # We deliberately do NOT use partial_ratio: it's too aggressive for
+        # short queries (e.g. partial_ratio('peri', 'pepper') = 85 because
+        # they share 'pe...r', causing 'peri' to falsely match products
+        # with 'PEPPER' in the name). Substring containment is already
+        # handled in (1) above, so partial_ratio adds no value here, only
+        # false positives.
         if not q_tokens:
             return 0.0
         name_tokens = _tokens(name)
@@ -933,19 +939,10 @@ async def _run_lastsample_search(
             return 0.0
         per_token_best: list[float] = []
         for qt in q_tokens:
-            best = 0.0
-            for ht in name_tokens:
-                # ratio handles single-char typos ('chese' vs 'cheese' = 91).
-                # partial_ratio handles 'qt is a substring' cases ('thai'
-                # finding 'thailand') without dragging the score down for
-                # length mismatch.
-                r = fuzz.ratio(qt, ht)
-                if r > best:
-                    best = r
-                if len(qt) <= len(ht):
-                    p = fuzz.partial_ratio(qt, ht)
-                    if p > best:
-                        best = p
+            # ratio = Levenshtein-based similarity. Catches single-char
+            # typos ('chese' vs 'cheese' = 90) but stays low when the
+            # words are genuinely different ('peri' vs 'pepper' = 60).
+            best = max(fuzz.ratio(qt, ht) for ht in name_tokens)
             per_token_best.append(best)
         return sum(per_token_best) / len(per_token_best)
 

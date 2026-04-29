@@ -511,7 +511,15 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-_PP_CODE_RE = re.compile(r"\bS-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,4})?\b", re.IGNORECASE)
+# Match seasoning codes. Original V1.6.x version only allowed ONE optional
+# '-XX' suffix, which truncated codes like 'S-TXF06-00-03' to 'S-TXF06-00'
+# (V1.9.7 bug report). Now allows up to 3 hyphenated suffixes — covers
+# every code shape we've seen in MMS / FSL while still anchoring on
+# 'S-' + 3+ alphanumerics so we don't grab unrelated tokens.
+_PP_CODE_RE = re.compile(
+    r"\bS-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,3}\b",
+    re.IGNORECASE,
+)
 
 
 def _dedupe_codes(codes: list[str], cap: int = 5) -> list[str]:

@@ -670,6 +670,22 @@ def _norm_tg_id(v) -> str:
         return s
 
 
+def _row_get_loose(row: dict, key: str) -> str:
+    """Get a value from a row dict tolerant of header whitespace and case.
+
+    A header typed as 'MMS Name ' (trailing space) or 'mms name' would
+    otherwise cause row.get('MMS Name') to silently return None, leading
+    to mysterious 'your MMS name isn't set' errors even when the cell is
+    populated. This walks the dict's keys and matches case-/whitespace-
+    insensitively, so we tolerate copy-paste imperfections from the sheet.
+    """
+    target = key.lower().strip()
+    for k, v in row.items():
+        if str(k).lower().strip() == target:
+            return v if v is not None else ""
+    return ""
+
+
 def get_user_mms_name(tg_user_id: int, username: str | None) -> str:
     """Return the MMS Name configured for this Telegram user, or "" if none.
 
@@ -678,25 +694,43 @@ def get_user_mms_name(tg_user_id: int, username: str | None) -> str:
     The first attempt uses the 5-minute cache (fast); if no row matches OR
     the matched row has an empty MMS Name, we re-read the sheet and try
     once more.
+
+    Column lookups are header-tolerant via ``_row_get_loose`` — copy-paste
+    artefacts like ``MMS Name `` (trailing space) or ``mms name`` no longer
+    silently break the lookup.
     """
     target_id = _norm_tg_id(tg_user_id)
     target_uname = (username or "").lstrip("@").lower()
 
     def _scan(users) -> str:
         for row in users:
-            if str(row.get("Active", "")).strip().lower() not in {"y", "yes", "true", "1"}:
+            active = str(_row_get_loose(row, "Active")).strip().lower()
+            if active not in {"y", "yes", "true", "1"}:
                 continue
-            row_id = _norm_tg_id(row.get("Telegram User ID", ""))
-            row_uname = str(row.get("Telegram Username", "")).lstrip("@").lower()
+            row_id = _norm_tg_id(_row_get_loose(row, "Telegram User ID"))
+            row_uname = str(_row_get_loose(row, "Telegram Username")).lstrip("@").lower()
             if (row_id and row_id == target_id) or (row_uname and row_uname == target_uname):
-                return str(row.get("MMS Name", "")).strip()
+                return str(_row_get_loose(row, "MMS Name")).strip()
         return ""
 
-    name = _scan(load_users(force=False))
+    users = load_users(force=False)
+    name = _scan(users)
     if name:
         return name
     # Cache may be stale (user just filled in MMS Name). Re-read once.
-    return _scan(load_users(force=True))
+    users = load_users(force=True)
+    name = _scan(users)
+    if name:
+        return name
+    # Hard miss — log the headers we actually saw + the first few rows so
+    # we can diagnose 'MMS name isn't set' complaints from Railway logs.
+    sample_headers = list(users[0].keys()) if users else []
+    log.warning(
+        "get_user_mms_name MISS for tg_user_id=%s username=%s. "
+        "Saw %d users with headers %s",
+        target_id, target_uname, len(users), sample_headers,
+    )
+    return ""
 
 
 def load_fsl_rows_for_sales(sales_name: str) -> list[dict[str, str]]:

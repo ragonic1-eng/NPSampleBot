@@ -273,15 +273,26 @@ def resolve_taste(
     name: str,
     taste_cache: dict[str, str],
     haiku_client=None,
+    fsl_map: dict[str, str] | None = None,
 ) -> str:
+    """Resolve taste keywords cheapest-first.
+
+    Order:
+      1. fsl_map  — already in Full Sample Listing (free, persistent)
+      2. taste_cache — on-disk JSON (free, lost on Railway redeploy)
+      3. Haiku   — paid; only when both caches miss
+    """
     if not code:
         return ""
-    if code in taste_cache and taste_cache[code]:
-        return taste_cache[code]
+    upper = code.strip().upper()
+    if fsl_map and fsl_map.get(upper):
+        return fsl_map[upper]
+    if upper in taste_cache and taste_cache[upper]:
+        return taste_cache[upper]
     if haiku_client is None:
         return ""
     kws = _ask_haiku_taste(haiku_client, code, name)
-    taste_cache[code] = kws
+    taste_cache[upper] = kws
     _save_json(TASTE_CACHE_PATH, taste_cache)
     return kws
 
@@ -346,12 +357,23 @@ def resolve_category(
     tab_map: dict[str, str],
     category_cache: dict[str, str],
     haiku_client=None,
+    fsl_map: dict[str, str] | None = None,
 ) -> str:
+    """Resolve category cheapest-first.
+
+    Order:
+      1. tab_map        — the 6 authoritative category tabs (free)
+      2. fsl_map        — past FSL row for this code (free, persistent)
+      3. category_cache — on-disk JSON (free, lost on Railway redeploy)
+      4. Haiku          — paid; only when all caches miss
+    """
     if not code:
         return ""
     upper = code.strip().upper()
     if upper in tab_map:
         return tab_map[upper]
+    if fsl_map and fsl_map.get(upper) in CATEGORIES:
+        return fsl_map[upper]
     if upper in category_cache and category_cache[upper] in CATEGORIES:
         return category_cache[upper]
     if haiku_client is None:

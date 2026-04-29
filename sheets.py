@@ -189,46 +189,81 @@ def load_fsl_dedupe_keys() -> set[tuple[str, str, str]]:
     """Return the set of (sample_date_out, product_code, normalized_customer)
     tuples for every row already in Full Sample Listing.
 
-    /updatesamplelist uses this to skip rows it's already imported from MMS.
+    Kept as a thin wrapper so callers that only want dedupe don't have to
+    pay for the full state load. sync_engine prefers ``load_fsl_state()``.
     """
-    sh = _open_seasoning_master()
-    try:
-        ws = sh.worksheet(FSL_TAB)
-    except gspread.WorksheetNotFound:
-        return set()
-    rows = ws.get_all_values()[1:]  # skip header
-    out: set[tuple[str, str, str]] = set()
-    for r in rows:
-        date = (r[FSL_COL_DATE] if len(r) > FSL_COL_DATE else "").strip()
-        code = (r[FSL_COL_CODE] if len(r) > FSL_COL_CODE else "").strip().upper()
-        cust = (r[FSL_COL_CUSTOMER] if len(r) > FSL_COL_CUSTOMER else "").strip()
-        if date and code and cust:
-            out.add((date, code, _norm_customer(cust)))
-    return out
+    return load_fsl_state()["dedupe_keys"]
 
 
 def load_fsl_customer_country_map() -> dict[str, str]:
-    """Build a {normalized_customer_name: country} map from existing FSL rows.
+    """Back-compat wrapper. Prefer ``load_fsl_state()`` which returns this
+    plus the taste/category maps in a single sheet read."""
+    return load_fsl_state()["customer_country"]
 
-    Used by /updatesamplelist to back-fill Country when MMS returns it blank
-    (most legacy MMS rows have no country) — your own data is the source of
-    truth.
+
+def load_fsl_state() -> dict:
+    """Single FSL read returning every map sync_engine needs.
+
+    Returns:
+        {
+          "dedupe_keys":      set[(date, code_upper, customer_norm)],
+          "customer_country": {customer_norm: country},
+          "code_taste":       {CODE_UPPER: taste_describe},
+          "code_category":    {CODE_UPPER: category},
+        }
+
+    Why this exists: enriched FSL rows are the cheapest possible cache.
+    Railway wipes the on-disk JSON caches every redeploy, but FSL lives in
+    Google Sheets and persists forever. Reading it on every sync gives
+    each new MMS row a free shot at "we already know the taste/category for
+    this product code, no Haiku needed."
+
+    Conflict resolution:
+      - customer_country: most-common country across all rows for that customer
+      - code_taste / code_category: first non-empty value wins (deterministic
+        per code, so first-seen-from-FSL is fine)
     """
     from collections import Counter
     sh = _open_seasoning_master()
     try:
         ws = sh.worksheet(FSL_TAB)
     except gspread.WorksheetNotFound:
-        return {}
-    rows = ws.get_all_values()[1:]
+        return {
+            "dedupe_keys": set(),
+            "customer_country": {},
+            "code_taste": {},
+            "code_category": {},
+        }
+
+    rows = ws.get_all_values()[1:]  # skip header
+    dedupe_keys: set[tuple[str, str, str]] = set()
     by_customer: dict[str, Counter] = {}
+    code_taste: dict[str, str] = {}
+    code_category: dict[str, str] = {}
+
     for r in rows:
-        name = (r[FSL_COL_CUSTOMER] if len(r) > FSL_COL_CUSTOMER else "").strip()
+        date = (r[FSL_COL_DATE] if len(r) > FSL_COL_DATE else "").strip()
+        code = (r[FSL_COL_CODE] if len(r) > FSL_COL_CODE else "").strip().upper()
+        cust = (r[FSL_COL_CUSTOMER] if len(r) > FSL_COL_CUSTOMER else "").strip()
         country = (r[FSL_COL_COUNTRY] if len(r) > FSL_COL_COUNTRY else "").strip()
-        if not name or not country:
-            continue
-        by_customer.setdefault(_norm_customer(name), Counter())[country] += 1
-    return {k: ctr.most_common(1)[0][0] for k, ctr in by_customer.items()}
+        taste = (r[FSL_COL_TASTE] if len(r) > FSL_COL_TASTE else "").strip()
+        category = (r[FSL_COL_CATEGORY] if len(r) > FSL_COL_CATEGORY else "").strip()
+
+        if date and code and cust:
+            dedupe_keys.add((date, code, _norm_customer(cust)))
+        if cust and country:
+            by_customer.setdefault(_norm_customer(cust), Counter())[country] += 1
+        if code and taste and code not in code_taste:
+            code_taste[code] = taste
+        if code and category and code not in code_category:
+            code_category[code] = category
+
+    return {
+        "dedupe_keys": dedupe_keys,
+        "customer_country": {k: ctr.most_common(1)[0][0] for k, ctr in by_customer.items()},
+        "code_taste": code_taste,
+        "code_category": code_category,
+    }
 
 
 def load_fsl_category_tab_map() -> dict[str, str]:

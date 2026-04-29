@@ -119,9 +119,16 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
     log.info("sync_engine: pulled %d MMS rows", len(mms_rows))
 
     # Step 3: Read FSL state for dedupe + lookup maps.
+    # ONE sheet read returns dedupe set, customer→country, code→taste,
+    # code→category. Past enriched rows act as a free, persistent cache so
+    # already-seen product codes / customers never trigger another Haiku
+    # call — even after Railway wipes the on-disk JSON caches on redeploy.
     try:
-        existing_keys = sheets.load_fsl_dedupe_keys()
-        customer_map = sheets.load_fsl_customer_country_map()
+        state = sheets.load_fsl_state()
+        existing_keys = state["dedupe_keys"]
+        customer_map = state["customer_country"]
+        fsl_taste_map = state["code_taste"]
+        fsl_category_map = state["code_category"]
         tab_map = sheets.load_fsl_category_tab_map()
     except Exception as e:  # noqa: BLE001
         log.exception("sync_engine: FSL read failed")
@@ -129,6 +136,12 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
             "status": "error", "error": f"fsl_read: {e}",
             "mms_pulled": len(mms_rows), "rows_added": 0, "elapsed_secs": _elapsed(t0),
         }
+    log.info(
+        "sync_engine: FSL state — %d dedupe keys, %d known customers, "
+        "%d codes with taste, %d codes with category, %d codes in tab_map",
+        len(existing_keys), len(customer_map), len(fsl_taste_map),
+        len(fsl_category_map), len(tab_map),
+    )
 
     # Filter to genuinely new rows.
     new_rows: list[mms_client.SampleRow] = []
@@ -167,22 +180,72 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
     country_cache, taste_cache, category_cache = enrich.load_all_caches()
     haiku = enrich.haiku_client()
 
-    enriched: list[list[str]] = []
-    for r in new_rows:
-        country = enrich.resolve_country(
+    # Track which path each field came from so the result dict can report
+    # how many Haiku calls were actually needed vs avoided. The "fsl" / "free"
+    # buckets are zero-cost; "haiku" is the only paid path.
+    metrics = {
+        "country_free": 0, "country_haiku": 0,
+        "taste_free": 0, "taste_haiku": 0,
+        "category_free": 0, "category_haiku": 0,
+    }
+
+    def _resolve_country_tracked(r):
+        # Free paths short-circuit before Haiku is ever consulted. We classify
+        # by whether a free signal would have answered first.
+        if (r.country or "").strip(): return enrich.normalize_country(r.country), "free"
+        if not r.customer_name: return "", "free"
+        cust_norm = " ".join(r.customer_name.lower().split())
+        if customer_map.get(cust_norm): return enrich.normalize_country(customer_map[cust_norm]), "free"
+        if enrich._country_from_tokens(r.customer_name): return enrich._country_from_tokens(r.customer_name), "free"
+        if enrich._country_from_suffix(r.customer_name): return enrich._country_from_suffix(r.customer_name), "free"
+        # Genuine miss — would call Haiku (or hit on-disk cache).
+        out = enrich.resolve_country(
             raw_country=r.country, customer_name=r.customer_name,
             customer_map=customer_map, country_cache=country_cache,
             haiku_client=haiku,
         )
+        # On-disk cache hit also counts as free; only true paid call counts as haiku.
+        was_cached = r.customer_name in country_cache and country_cache[r.customer_name] == out
+        return out, ("free" if was_cached else "haiku")
+
+    enriched: list[list[str]] = []
+    for r in new_rows:
+        country, country_src = _resolve_country_tracked(r)
+        metrics[f"country_{country_src}"] += 1
+
+        code_upper = (r.product_code or "").strip().upper()
+        # Taste: classify before resolving so we can count cleanly.
+        taste_src = "haiku"
+        if not code_upper:
+            taste_src = "free"
+        elif fsl_taste_map.get(code_upper):
+            taste_src = "free"
+        elif code_upper in taste_cache and taste_cache[code_upper]:
+            taste_src = "free"
         taste = enrich.resolve_taste(
             code=r.product_code, name=r.product_name,
             taste_cache=taste_cache, haiku_client=haiku,
+            fsl_map=fsl_taste_map,
         )
+        metrics[f"taste_{taste_src}"] += 1
+
+        # Category: same classify-before pattern.
+        cat_src = "haiku"
+        if not code_upper:
+            cat_src = "free"
+        elif code_upper in tab_map:
+            cat_src = "free"
+        elif fsl_category_map.get(code_upper) in enrich.CATEGORIES:
+            cat_src = "free"
+        elif code_upper in category_cache and category_cache[code_upper] in enrich.CATEGORIES:
+            cat_src = "free"
         category = enrich.resolve_category(
             code=r.product_code, name=r.product_name,
             tab_map=tab_map, category_cache=category_cache,
-            haiku_client=haiku,
+            haiku_client=haiku, fsl_map=fsl_category_map,
         )
+        metrics[f"category_{cat_src}"] += 1
+
         enriched.append([
             r.sales,
             r.customer_name,
@@ -195,6 +258,18 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
             category,
             r.rd_price,
         ])
+
+    haiku_total = metrics["country_haiku"] + metrics["taste_haiku"] + metrics["category_haiku"]
+    free_total = metrics["country_free"] + metrics["taste_free"] + metrics["category_free"]
+    log.info(
+        "sync_engine: enrichment cost — %d Haiku calls, %d free lookups "
+        "(country: %d free / %d haiku · taste: %d free / %d haiku · "
+        "category: %d free / %d haiku)",
+        haiku_total, free_total,
+        metrics["country_free"], metrics["country_haiku"],
+        metrics["taste_free"], metrics["taste_haiku"],
+        metrics["category_free"], metrics["category_haiku"],
+    )
 
     # Step 5: Append to FSL.
     try:
@@ -231,6 +306,9 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
         "rows_added": appended,
         "elapsed_secs": _elapsed(t0),
         "window": (start_date.isoformat(), end_date.isoformat()),
+        "haiku_calls": haiku_total,
+        "free_lookups": free_total,
+        "enrichment_metrics": metrics,
     }
 
 

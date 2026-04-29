@@ -849,39 +849,123 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
         )
         return
 
-    # Score each row against the query. Search field combines Product Name,
-    # Product Code, and Taste describe so a query like "spicy chicken" can
-    # match either the name or the keyword cloud.
+    # Score each row against the query. Two-pass:
+    #
+    #   (1) Exact-substring boosts: if the query string appears verbatim in
+    #       the code, name, or taste keywords, return a high decisive score.
+    #       Handles 'S-668', 'BBQ', exact-name copy/paste.
+    #
+    #   (2) Token-wise fuzzy: split the query into words, and for each word
+    #       find the BEST match among the row's tokens (name + code + taste).
+    #       Average those per-token bests.
+    #
+    #       This catches typos that the old single-WRatio approach missed:
+    #         'pecking duck'  → 'peking duck seasoning'   (ratio 92 + 100)
+    #         'spicy chese'   → 'spicy nacho cheese ...'  (ratio 100 + 91)
+    #         'duck peking'   → 'peking duck ...'         (order-agnostic)
+    #
+    #       Why per-token max instead of WRatio against a joined haystack:
+    #       WRatio penalises length mismatches. Once the haystack runs to
+    #       'spicy nacho cheese seasoning bangladesh ...' the score for
+    #       'spicy chese' collapses below threshold even though both words
+    #       are present.
     from rapidfuzz import fuzz
+
+    _word_re = re.compile(r"[a-z0-9]+")
+
+    def _tokens(s: str) -> list[str]:
+        return [t for t in _word_re.findall((s or "").lower()) if len(t) >= 2]
+
     q = query.lower().strip()
+    q_tokens = _tokens(query)
 
     def _score(row: dict) -> float:
         name = (row.get("Product Name") or "").lower()
         code = (row.get("Product Code") or "").lower()
         taste = (row.get("Taste describe") or "").lower()
-        # Cheap exact-substring boost: typing part of a code or word should
-        # win decisively over a fuzzy near-match elsewhere.
-        if q in code:
+        # (1) Substring boosts — cheap and decisive.
+        if q and q in code:
             return 100.0
-        if q in name:
-            return 95.0
-        if q in taste:
-            return 85.0
-        haystack = f"{name} {code} {taste}"
-        return float(fuzz.WRatio(q, haystack))
+        if q and q in name:
+            return 98.0
+        if q and q in taste:
+            return 88.0
+        # (2) Token-wise fuzzy.
+        if not q_tokens:
+            return 0.0
+        haystack_tokens = list(set(_tokens(name) + _tokens(code) + _tokens(taste)))
+        if not haystack_tokens:
+            return 0.0
+        per_token_best: list[float] = []
+        for qt in q_tokens:
+            best = 0.0
+            for ht in haystack_tokens:
+                # ratio handles single-char typos ('chese' vs 'cheese' = 91).
+                # partial_ratio handles 'qt is a substring' cases ('thai'
+                # finding 'thailand') without dragging the score down for
+                # length mismatch.
+                r = fuzz.ratio(qt, ht)
+                if r > best:
+                    best = r
+                if len(qt) <= len(ht):
+                    p = fuzz.partial_ratio(qt, ht)
+                    if p > best:
+                        best = p
+            per_token_best.append(best)
+        return sum(per_token_best) / len(per_token_best)
 
     scored = [(r, _score(r)) for r in rows]
-    # Threshold: 60 mirrors matcher.py. Lower = more false positives.
-    candidates = [(r, s) for r, s in scored if s >= 60]
+    # Two thresholds:
+    #   ≥ HIGH → confident match, return the most recent
+    #   ≥ NEAR but < HIGH → near miss, show as "did you mean?" suggestions
+    HIGH = 75.0
+    NEAR = 55.0
+    candidates = [(r, s) for r, s in scored if s >= HIGH]
     if not candidates:
-        await send(
-            update,
-            f"🙈 No samples match <b>{h(query)}</b> under your name "
-            f"(<b>{h(mms_name)}</b>).\n\n"
-            "Try a shorter keyword, a code prefix like <code>S-668</code>, "
-            "or a flavour word like <i>spicy</i>.",
-            _LASTSAMPLE_KB,
+        # Build a deduped (by product code) suggestion list of the closest
+        # near-misses so the user can spot the right product / spelling.
+        near_sorted = sorted(
+            [(r, s) for r, s in scored if s >= NEAR],
+            key=lambda rs: rs[1], reverse=True,
         )
+        seen_codes: set[str] = set()
+        suggestions: list[dict] = []
+        for r, _s in near_sorted:
+            c = (r.get("Product Code") or "").upper()
+            if c in seen_codes:
+                continue
+            seen_codes.add(c)
+            suggestions.append(r)
+            if len(suggestions) >= 3:
+                break
+
+        if suggestions:
+            lines = [
+                f"🤔 <b>No exact match for {h(query)}</b> under your name.",
+                "",
+                "<b>Did you mean one of these?</b>",
+            ]
+            for r in suggestions:
+                lines.append(
+                    f"  • {h(r.get('Product Name') or '—')} "
+                    f"(<code>{h(r.get('Product Code') or '—')}</code>)"
+                )
+            lines.append("")
+            lines.append(
+                "<i>Tap 🔎 Find another and try one of those names "
+                "(or check your spelling).</i>"
+            )
+            await send(update, "\n".join(lines), _LASTSAMPLE_KB)
+        else:
+            await send(
+                update,
+                f"🙈 <b>Not found in database.</b>\n\n"
+                f"No samples under your name (<b>{h(mms_name)}</b>) match "
+                f"<b>{h(query)}</b>. Double-check the spelling, or try a "
+                "shorter keyword like <i>spicy</i>, <i>BBQ</i>, or a code "
+                "prefix like <code>S-668</code>.",
+                _LASTSAMPLE_KB,
+            )
         return
 
     # Sort by date desc, but also keep score as a tiebreaker so a high-score

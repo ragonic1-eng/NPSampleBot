@@ -919,16 +919,19 @@ async def _run_lastsample_search(
             return True
         if q and q in name:
             return True
-        # Otherwise: every meaningful token from the query must appear in
-        # some token of the name. Substring either direction so 'chip'
-        # finds 'chips' and 'tomato' is still found by typing 'tom'.
+        # Otherwise: every meaningful token from the query must appear
+        # INSIDE some token of the name. Strictly one-directional so
+        # 'siracha' does NOT match a 'cha' token (the V1.8.8 bug — 'cha'
+        # in 'siracha' was True, falsely matching SHA CHA SAUCE). Typing a
+        # prefix still works ('tom' is in 'tomato'); typing a plural form
+        # of a singular product name will not match — user can adjust.
         if not q_tokens:
             return False
         name_tokens = _tokens(name)
         if not name_tokens:
             return False
         for qt in q_tokens:
-            if not any(qt in nt or nt in qt for nt in name_tokens):
+            if not any(qt in nt for nt in name_tokens):
                 return False
         return True
 

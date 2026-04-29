@@ -206,6 +206,15 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
             "mms_pulled": len(mms_rows), "rows_added": 0, "elapsed_secs": _elapsed(t0),
         }
 
+    # Step 6: Re-sort the whole tab by Sample Date Out so late-arriving older
+    # rows don't end up dangling at the bottom. Best-effort — never fail the
+    # sync over a sort error, the rows are already in the sheet.
+    try:
+        sorted_n = sheets.sort_fsl_by_date()
+        log.info("sync_engine: re-sorted %d FSL rows by date", sorted_n)
+    except Exception as e:  # noqa: BLE001
+        log.warning("sync_engine: sort_fsl_by_date failed: %s", e)
+
     sync_time = _now_utc()
     try:
         sheets.set_last_sample_sync(sync_time)

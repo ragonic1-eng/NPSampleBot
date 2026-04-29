@@ -254,6 +254,50 @@ def load_fsl_category_tab_map() -> dict[str, str]:
     return out
 
 
+def sort_fsl_by_date() -> int:
+    """Resort the entire 'Full Sample Listing' tab by Sample Date Out (asc).
+
+    Late-arriving MMS rows can be older than rows already in the sheet
+    (e.g. a March entry showing up after April was already written). After
+    every append we re-sort the whole table so the user always sees a
+    chronological log. Unparseable dates sink to the bottom so they're easy
+    to spot and fix.
+
+    Returns the number of data rows written back. Returns 0 if the tab is
+    missing or has no data rows. Header (row 1) is left untouched.
+    """
+    import datetime as _d
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(FSL_TAB)
+    except gspread.WorksheetNotFound:
+        return 0
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return 0
+    data = values[1:]
+    width = len(FSL_HEADER)
+    data = [r + [""] * (width - len(r)) if len(r) < width else r[:width] for r in data]
+
+    SENTINEL = _d.date(9999, 12, 31)
+
+    def _key(r):
+        d = _parse_iso_date(r[FSL_COL_DATE])
+        return (1, SENTINEL) if d is None else (0, d)
+
+    sorted_data = sorted(data, key=_key)
+    if sorted_data == data:
+        return 0  # already in order — skip the write
+
+    last_row = len(sorted_data) + 1
+    ws.update(
+        range_name=f"A2:J{last_row}",
+        values=sorted_data,
+        value_input_option="USER_ENTERED",
+    )
+    return len(sorted_data)
+
+
 def append_fsl_rows(rows: list[list[str]]) -> int:
     """Append rows to the bottom of Full Sample Listing.
 

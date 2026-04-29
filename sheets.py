@@ -652,23 +652,51 @@ def invalidate_caches() -> None:
     _samples_cache = None
 
 
+def _norm_tg_id(v) -> str:
+    """Normalize a Telegram User ID coming from the sheet for comparison.
+
+    gspread's get_all_records returns numeric-looking cells as int or float.
+    A cell typed as `1039554107` arrives as the int 1039554107, but if any
+    spreadsheet logic ever turned it into a float we'd get
+    `1039554107.0` — and str(...) would no longer match str(user.id).
+    Strip the trailing `.0`.
+    """
+    s = str(v).strip()
+    if not s:
+        return ""
+    try:
+        return str(int(float(s)))
+    except (ValueError, TypeError):
+        return s
+
+
 def get_user_mms_name(tg_user_id: int, username: str | None) -> str:
     """Return the MMS Name configured for this Telegram user, or "" if none.
 
-    Used by /lastsample to filter Full Sample Listing rows down to ones the
-    caller actually owns. The Authorized Users tab gained an "MMS Name"
-    column in V1.7.5 — the field is blank for users who haven't been mapped
-    yet, which the caller treats as "ask admin to fill this in."
+    Auto-retries against a force-refreshed user list on miss, so admins
+    don't have to remember /reload after editing the Authorized Users tab.
+    The first attempt uses the 5-minute cache (fast); if no row matches OR
+    the matched row has an empty MMS Name, we re-read the sheet and try
+    once more.
     """
-    uname = (username or "").lstrip("@").lower()
-    for row in load_users():
-        if str(row.get("Active", "")).strip().lower() not in {"y", "yes", "true", "1"}:
-            continue
-        row_id = str(row.get("Telegram User ID", "")).strip()
-        row_uname = str(row.get("Telegram Username", "")).lstrip("@").lower()
-        if (row_id and row_id == str(tg_user_id)) or (row_uname and row_uname == uname):
-            return str(row.get("MMS Name", "")).strip()
-    return ""
+    target_id = _norm_tg_id(tg_user_id)
+    target_uname = (username or "").lstrip("@").lower()
+
+    def _scan(users) -> str:
+        for row in users:
+            if str(row.get("Active", "")).strip().lower() not in {"y", "yes", "true", "1"}:
+                continue
+            row_id = _norm_tg_id(row.get("Telegram User ID", ""))
+            row_uname = str(row.get("Telegram Username", "")).lstrip("@").lower()
+            if (row_id and row_id == target_id) or (row_uname and row_uname == target_uname):
+                return str(row.get("MMS Name", "")).strip()
+        return ""
+
+    name = _scan(load_users(force=False))
+    if name:
+        return name
+    # Cache may be stale (user just filled in MMS Name). Re-read once.
+    return _scan(load_users(force=True))
 
 
 def load_fsl_rows_for_sales(sales_name: str) -> list[dict[str, str]]:

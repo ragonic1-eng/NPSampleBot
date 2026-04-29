@@ -809,7 +809,10 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Ask the admin to fill in the <b>MMS Name</b> column for your row "
             "in the <i>Authorized Users</i> tab — that's the name MMS records "
             "against your samples (e.g. <code>Alex</code>, <code>Joycelyn</code>). "
-            "Once it's set, /lastsample can find your past samples.",
+            "Once it's set, /lastsample can find your past samples.\n\n"
+            "<i>(I just refreshed the user list and still don't see an MMS Name "
+            "for you. Double-check that your row's <b>Active</b> column is "
+            "<code>Y</code> and that <b>MMS Name</b> isn't blank.)</i>",
         )
         return
 

@@ -478,7 +478,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Product lookup</b>",
         "/pp <code> — fetch price (Code · Name · R&amp;D Price · Raw Material Cost)",
         "/scan — send a photo, I OCR codes and run /pp on each",
-        "/lastsample — find the most recent sample you sent matching a keyword",
+        "/lastsample [keyword] — find the most recent sample you sent (e.g. <code>/lastsample asian thai</code>)",
         "",
         "<b>Account</b>",
         "/whoami — your Telegram ID and username",
@@ -788,7 +788,16 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """`/lastsample` — find the most recent sample this rep sent matching a keyword."""
+    """`/lastsample [keyword]` — find the most recent sample this rep sent.
+
+    Two ways to use it:
+      - ``/lastsample`` alone → bot prompts; user replies with a keyword.
+      - ``/lastsample asian thai`` → search runs immediately. This bypasses
+        the reply step entirely, which matters when Railway runs more than
+        one worker (the in-memory awaiting flag wouldn't survive a worker
+        switch, but a single-shot command always lands on the worker that
+        also processes its body).
+    """
     if not await _authorized(update):
         return
     user = update.effective_user
@@ -804,6 +813,15 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Inline-args shortcut: '/lastsample asian thai' goes straight to search.
+    # Falls back to the prompt-and-reply flow when no arg is given.
+    inline = " ".join(ctx.args).strip() if ctx.args else ""
+    if inline:
+        ctx.user_data["lastsample_mms_name"] = mms_name
+        ctx.user_data["lastsample_active_query"] = ""
+        await _run_lastsample_search(update, ctx, mms_name, inline, prev="")
+        return
+
     ctx.user_data["awaiting_lastsample_query"] = True
     ctx.user_data["lastsample_mms_name"] = mms_name
     # Reset accumulated query — every fresh /lastsample (or 🔎 Find another)
@@ -816,7 +834,10 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>📎 Reply to this message</b> with a product name or keyword "
         "(e.g. <i>BBQ</i>, <i>tom yum</i>, <i>S-668</i>). I'll search your "
         "samples in <i>Full Sample Listing</i> and show the most recent match.\n\n"
-        "<i>Tip: after I show a result, just type more words to narrow it down.</i>",
+        "<i>Tips:</i>\n"
+        "<i>  • After I show a result, just type more words to narrow it down.</i>\n"
+        "<i>  • Or skip this prompt entirely: type </i>"
+        "<code>/lastsample asian thai</code><i> in one go.</i>",
     )
 
 
@@ -3786,7 +3807,7 @@ def main():
             BotCommand("whoami", "Show your Telegram ID & username"),
             BotCommand("pp", "💲 Product price — e.g. /pp S-62RG3-19"),
             BotCommand("scan", "📷 Scan a photo for product code(s)"),
-            BotCommand("lastsample", "🔎 Find your last sample by keyword"),
+            BotCommand("lastsample", "🔎 Find your last sample — /lastsample <keyword>"),
             BotCommand("diag", "Diagnostics"),
             BotCommand("help", "Show all commands"),
         ]

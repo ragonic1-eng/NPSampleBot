@@ -866,6 +866,7 @@ async def _run_lastsample_search(
     mms_name: str,
     query: str,
     prev: str = "",
+    mode: str = "auto",
 ) -> None:
     """Search FSL rows owned by `mms_name` for `query`, reply with the latest match.
 
@@ -879,6 +880,15 @@ async def _run_lastsample_search(
     ``prev`` is just the query before the user's latest word — used to give
     the user a clear "I tried <prev + new>, found nothing, search reset"
     explanation when a refinement fails.
+
+    ``mode`` controls product-vs-customer routing (V1.9.5):
+      - ``"auto"`` — default. Search both. If query matches a product AND a
+        customer, ask the user which they meant via a disambiguation prompt.
+      - ``"product"`` — search Product Name only (skip the customer step).
+        Used by the disambiguation 'Product' button so the user's choice
+        sticks.
+      - ``"customer"`` — search Customer Name only. Used by the
+        disambiguation 'Customer' button.
     """
 
     def _re_arm(active: str) -> None:
@@ -970,27 +980,29 @@ async def _run_lastsample_search(
                 return False
         return True
 
-    candidates = [r for r in rows if _matches(r)]
-    if not candidates:
-        # PRODUCT search failed → fall through to CUSTOMER search.
-        # Same MMS-Name scope (only this rep's samples). Substring rules
-        # are slightly looser than product matching: each query token must
-        # appear ANYWHERE inside the full customer name string, not just
-        # within a single name token. Customer names have heavy
-        # punctuation and abbreviations (Pte Ltd, Co., parentheses…) so
-        # token-boundary matching would be too strict.
-        def _customer_matches(cust_name: str) -> bool:
-            cn = (cust_name or "").lower()
-            if not cn:
-                return False
-            if q and q in cn:
-                return True
-            if not q_tokens:
-                return False
-            return all(qt in cn for qt in q_tokens)
+    # === Compute both match sets up front (when mode allows). ===
+    # Product matches.
+    product_candidates = [r for r in rows if _matches(r)] if mode in ("auto", "product") else []
 
-        from datetime import date as _date
-        SENTINEL = _date(1900, 1, 1)
+    # Customer matches. Substring rules are slightly looser than product
+    # matching: each query token must appear ANYWHERE inside the full
+    # customer name string, not just within a single name token. Customer
+    # names have heavy punctuation and abbreviations (Pte Ltd, Co.,
+    # parentheses…) so token-boundary matching would be too strict.
+    def _customer_matches(cust_name: str) -> bool:
+        cn = (cust_name or "").lower()
+        if not cn:
+            return False
+        if q and q in cn:
+            return True
+        if not q_tokens:
+            return False
+        return all(qt in cn for qt in q_tokens)
+
+    from datetime import date as _date
+    SENTINEL = _date(1900, 1, 1)
+    sorted_customers: list[str] = []
+    if mode in ("auto", "customer"):
         cust_latest: dict[str, _date | None] = {}
         for r in rows:
             cust = (r.get("Customer Name") or "").strip()
@@ -1006,6 +1018,49 @@ async def _run_lastsample_search(
             reverse=True,
         )
 
+    # === Disambiguation: query matched both a product AND a customer. ===
+    # Only fires in 'auto' mode — the disambiguation buttons themselves
+    # call back with mode='product' or mode='customer' so we never recurse.
+    if mode == "auto" and product_candidates and sorted_customers:
+        # Encode the query into the callback so the choice survives worker
+        # switches (no reliance on ctx.user_data). Telegram callback_data
+        # limit is 64 bytes UTF-8; 'lsd:p:' prefix is 6 bytes, leaving 58
+        # for the query. Truncate at byte boundary if longer (rare —
+        # disambiguation queries are short keywords).
+        q_bytes = query.encode("utf-8")[:58]
+        q_safe = q_bytes.decode("utf-8", errors="ignore")
+        disambig_kb = kb([
+            [
+                ("🛍 Product Name", f"lsd:p:{q_safe}"),
+                ("👤 Customer Name", f"lsd:c:{q_safe}"),
+            ],
+            [
+                ("🔎 Find another", "lastsample:again"),
+                ("🏠 Main menu", "menu:home"),
+            ],
+        ])
+        n_prod = len(product_candidates)
+        n_cust = len(sorted_customers)
+        intro = [
+            f"🤔 <b>{h(query)}</b> matches both a product and a customer in your samples.",
+            "",
+            "<b>Which one are you looking for?</b>",
+            "",
+            f"  🛍  <b>Product Name</b> — {n_prod} sample"
+            f"{'s' if n_prod != 1 else ''} with <b>{h(query)}</b> in the product name",
+            f"  👤  <b>Customer Name</b> — {n_cust} customer"
+            f"{'s' if n_cust != 1 else ''} with <b>{h(query)}</b> in their name",
+        ]
+        await send(update, "\n".join(intro), disambig_kb)
+        # Reset the refinement chain — the next move is one of these buttons.
+        _re_arm("")
+        return
+
+    # Re-bind for downstream code (the rest of this function still uses
+    # the old name `candidates`).
+    candidates = product_candidates
+
+    if not candidates:
         if sorted_customers:
             # Found at least one customer matching the query. Per the user's
             # spec ('1 b'): list the customers as buttons even when there's
@@ -1063,10 +1118,8 @@ async def _run_lastsample_search(
         return
 
     # All matches are equally valid (binary containment). Sort by date desc
-    # so the user always sees the most recent sample. Unparseable dates
-    # sink to the bottom via the SENTINEL.
-    from datetime import date as _date
-    SENTINEL = _date(1900, 1, 1)
+    # so the user always sees the most recent sample. _date / SENTINEL are
+    # already in scope from the customer-match block above.
     candidates.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
     best = candidates[0]
 
@@ -2183,6 +2236,35 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # no-draft guard since /lastsample doesn't open a draft.
     if data == "lastsample:again":
         await cmd_lastsample(update, ctx)
+        return
+
+    # /lastsample disambiguation — user tapped 'Product Name' or
+    # 'Customer Name' on the disambig prompt. Callback data:
+    #   lsd:p:<query>   → search Product Name only
+    #   lsd:c:<query>   → search Customer Name only
+    # The query is encoded in the callback (truncated to fit Telegram's
+    # 64-byte limit) so the choice survives worker switches.
+    if data.startswith("lsd:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            return
+        choice, qtext = parts[1], parts[2]
+        if choice not in ("p", "c") or not qtext:
+            return
+        mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
+            sheets.get_user_mms_name,
+            update.effective_user.id, update.effective_user.username,
+        )
+        if not mms:
+            await send(
+                update,
+                "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
+                "on the <i>Authorized Users</i> tab, then re-run /lastsample.",
+            )
+            return
+        ctx.user_data["lastsample_mms_name"] = mms
+        forced = "product" if choice == "p" else "customer"
+        await _run_lastsample_search(update, ctx, mms, qtext, prev="", mode=forced)
         return
 
     # /lastsample customer pick — user tapped a customer suggestion. The

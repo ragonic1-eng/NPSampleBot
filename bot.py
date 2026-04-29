@@ -427,8 +427,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [("✏️ Enter a code (price lookup)", "menu:code")],
         [("📋 My sample requests", "menu:samples")],
     ]
-    if _is_update_sample_owner(user):
-        menu.append([("🔄 Sync MMS → Full Sample Listing", "menu:updsample")])
+    # MMS → Full Sample Listing sync is now automated weekly via the
+    # JobQueue (see main()). No manual Telegram trigger.
     await send(
         update,
         "👋 <b>Hi there — what can I help with?</b>",
@@ -488,249 +488,16 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "<b>🔧 Admin</b>",
             "/reload — refresh seasoning &amp; customer lists from Sheets",
             "/diag — diagnostics (auth / sheet visibility)",
-            "/updatesamplelist — pull fresh MMS samples into Full Sample Listing "
-            "(24h cooldown; append <code>force</code> to override)",
+            "<i>(MMS → Full Sample Listing sync runs automatically weekly — "
+            "see Railway logs for run history.)</i>",
         ]
     await send(update, "\n".join(lines))
 
 
-SAMPLE_SYNC_COOLDOWN_HOURS = 24
-
-
-async def cmd_update_sample_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """`/updatesamplelist` — pull fresh sample submissions from MMS into the
-    Full Sample Listing tab.
-
-    Behaviour:
-      - Logs into MMS with credentials from .env (MMS_USER / MMS_PASSWORD).
-      - Fetches every sample row whose Sample Date Out ∈ [SAMPLE_UPDATE_START,
-        today]. Same fetch logic the old SML sync used.
-      - Dedupes against existing FSL rows on (Sample Date Out, Product Code,
-        Customer Name) so re-runs only add genuinely new submissions.
-      - Enriches each new row with Country (from existing FSL customer-map
-        and heuristics first, Haiku as last resort), Taste describe (~20
-        keywords from cache or Haiku), Category (from the 6 category tabs
-        first, Haiku as fallback), and R&D Price (currency + price from MMS).
-      - Appends the enriched rows to the bottom of FSL.
-
-    Rate-limited: 24h cooldown unless invoked as `/updatesamplelist force`.
-    Restricted to UPDATE_SAMPLE_OWNER (from .env, default "ragonic").
-    """
-    if not await _authorized(update):
-        return
-    user = update.effective_user
-    if not _is_update_sample_owner(user):
-        await send(update, "🔒 This command is restricted.")
-        return
-    args = (ctx.args if hasattr(ctx, "args") else []) or []
-    force = any(a.lower() in {"force", "now", "--force"} for a in args)
-    await _run_update_sample_list(update, ctx, force=force)
-
-
-async def _run_update_sample_list(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, force: bool = False
-):
-    import datetime as _dt
-
-    import enrich
-    import mms_client
-    import requests
-
-    if not config.MMS_PASSWORD:
-        await send(update, "⚠️ MMS_PASSWORD is not configured. Set it on Railway and redeploy.")
-        return
-
-    # 24h cooldown — skip only if not forced.
-    if not force:
-        last = await asyncio.to_thread(sheets.get_last_sample_sync)
-        if last is not None:
-            if last.tzinfo is None:
-                last = last.replace(tzinfo=timezone.utc)
-            now_utc = datetime.now(timezone.utc)
-            age = now_utc - last
-            cooldown = _dt.timedelta(hours=SAMPLE_SYNC_COOLDOWN_HOURS)
-            if age < cooldown:
-                remaining = cooldown - age
-                hrs = int(remaining.total_seconds() // 3600)
-                mins = int((remaining.total_seconds() % 3600) // 60)
-                await send(
-                    update,
-                    "ℹ️ <b>Full Sample Listing is already up to date.</b>\n\n"
-                    f"Last synced: <b>{last.strftime('%d %b %Y %H:%M UTC')}</b>\n"
-                    f"Next auto-sync allowed in: <b>{hrs}h {mins}m</b>\n\n"
-                    "<i>MMS rarely changes within 24h, so we skip to save API "
-                    "quota. To force a fresh pull, run:</i>\n"
-                    "<code>/updatesamplelist force</code>",
-                )
-                return
-
-    try:
-        start_date = _dt.datetime.strptime(config.SAMPLE_UPDATE_START, "%Y-%m-%d").date()
-    except ValueError:
-        start_date = _dt.date(2026, 3, 1)
-    end_date = _dt.date.today()
-
-    status = await update.effective_chat.send_message(
-        f"⏳ Logging into MMS…\nSyncing <b>{start_date.strftime('%d %b %Y')}</b> → "
-        f"<b>{end_date.strftime('%d %b %Y')}</b>\n\n<i>{config.BOT_VERSION}</i>",
-        parse_mode=ParseMode.HTML,
-    )
-
-    async def _set(msg: str) -> None:
-        try:
-            await status.edit_text(msg + f"\n\n<i>{config.BOT_VERSION}</i>", parse_mode=ParseMode.HTML)
-        except Exception:  # noqa: BLE001
-            pass
-
-    # ---------- Step 1: MMS login + fetch ----------
-    session = requests.Session()
-    try:
-        ok = await asyncio.to_thread(
-            mms_client.login, session, config.MMS_USER, config.MMS_PASSWORD
-        )
-    except Exception as e:  # noqa: BLE001
-        log.exception("MMS login error: %s", e)
-        await _set(f"❌ MMS login error: <code>{h(str(e)[:200])}</code>")
-        return
-    if not ok:
-        await _set("❌ MMS login failed — check MMS_USER / MMS_PASSWORD env vars.")
-        return
-
-    await _set("✅ Logged into MMS.\n⏳ Fetching sample submissions…")
-    t0 = datetime.now(timezone.utc)
-    try:
-        mms_rows = await asyncio.to_thread(
-            mms_client.fetch_all_samples, session, start_date, end_date
-        )
-    except Exception as e:  # noqa: BLE001
-        log.exception("MMS fetch error: %s", e)
-        await _set(f"❌ MMS fetch failed: <code>{h(str(e)[:200])}</code>")
-        return
-
-    fetch_secs = (datetime.now(timezone.utc) - t0).total_seconds()
-    await _set(
-        f"✅ Pulled <b>{len(mms_rows)}</b> MMS rows in {fetch_secs:.0f}s.\n"
-        "⏳ Reading existing Full Sample Listing for dedupe…"
-    )
-
-    # ---------- Step 2: Dedupe against existing FSL ----------
-    try:
-        existing_keys = await asyncio.to_thread(sheets.load_fsl_dedupe_keys)
-        customer_map = await asyncio.to_thread(sheets.load_fsl_customer_country_map)
-        tab_map = await asyncio.to_thread(sheets.load_fsl_category_tab_map)
-    except Exception as e:  # noqa: BLE001
-        log.exception("FSL read failed: %s", e)
-        await _set(f"❌ Couldn't read Full Sample Listing: <code>{h(str(e)[:200])}</code>")
-        return
-
-    new_rows: list[mms_client.SampleRow] = []
-    for r in mms_rows:
-        code = (r.product_code or "").strip().upper()
-        date = (r.sample_date_out or "").strip()
-        cust = (r.customer_name or "").strip()
-        if not (code and date and cust):
-            continue
-        key = (date, code, " ".join(cust.lower().split()))
-        if key in existing_keys:
-            continue
-        new_rows.append(r)
-
-    if not new_rows:
-        sync_time = datetime.now(timezone.utc)
-        try:
-            await asyncio.to_thread(sheets.set_last_sample_sync, sync_time)
-        except Exception:  # noqa: BLE001
-            pass
-        await _set(
-            f"✅ <b>Full Sample Listing already up to date.</b>\n\n"
-            f"MMS rows pulled: {len(mms_rows)}\n"
-            f"Already present in FSL: {len(mms_rows)}\n"
-            f"➕ New rows added: 0"
-        )
-        return
-
-    # ---------- Step 3: Enrich each new row ----------
-    await _set(
-        f"⏳ Enriching <b>{len(new_rows)}</b> new rows "
-        "(Country / Taste / Category / Price)…"
-    )
-
-    country_cache, taste_cache, category_cache = enrich.load_all_caches()
-    haiku = enrich.haiku_client()
-
-    # Sort chronologically by Sample Date Out so they append in the right order.
-    def _date_key(r: mms_client.SampleRow):
-        d = r.sample_date_out_as_date()
-        return d or _dt.date(1900, 1, 1)
-    new_rows.sort(key=_date_key)
-
-    enriched: list[list[str]] = []
-    for r in new_rows:
-        country = enrich.resolve_country(
-            raw_country=r.country,
-            customer_name=r.customer_name,
-            customer_map=customer_map,
-            country_cache=country_cache,
-            haiku_client=haiku,
-        )
-        taste = enrich.resolve_taste(
-            code=r.product_code,
-            name=r.product_name,
-            taste_cache=taste_cache,
-            haiku_client=haiku,
-        )
-        category = enrich.resolve_category(
-            code=r.product_code,
-            name=r.product_name,
-            tab_map=tab_map,
-            category_cache=category_cache,
-            haiku_client=haiku,
-        )
-        enriched.append([
-            r.sales,
-            r.customer_name,
-            country,
-            r.product_code,
-            r.product_name,
-            r.quantity_g,
-            r.sample_date_out,
-            taste,
-            category,
-            r.rd_price,
-        ])
-
-    # ---------- Step 4: Append to FSL ----------
-    t1 = datetime.now(timezone.utc)
-    try:
-        appended = await asyncio.to_thread(sheets.append_fsl_rows, enriched)
-    except Exception as e:  # noqa: BLE001
-        log.exception("FSL append failed: %s", e)
-        await _set(f"❌ FSL append failed: <code>{h(str(e)[:200])}</code>")
-        return
-    write_secs = (datetime.now(timezone.utc) - t1).total_seconds()
-    total_secs = (datetime.now(timezone.utc) - t0).total_seconds()
-
-    # Record the successful run so the 24h cooldown starts ticking.
-    sync_time = datetime.now(timezone.utc)
-    try:
-        await asyncio.to_thread(sheets.set_last_sample_sync, sync_time)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Could not record last-sync timestamp: %s", e)
-
-    lines = [
-        "✅ <b>Full Sample Listing updated.</b>",
-        "",
-        f"Window: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}",
-        f"MMS rows pulled: <b>{len(mms_rows)}</b>",
-        f"Already in FSL: <b>{len(mms_rows) - len(new_rows)}</b>",
-        f"➕ New rows added: <b>{appended}</b>",
-        f"⏱ Fetch {fetch_secs:.0f}s · Append {write_secs:.0f}s · Total {total_secs:.0f}s",
-        "",
-        f"<i>Next auto-sync allowed after "
-        f"{(sync_time + _dt.timedelta(hours=SAMPLE_SYNC_COOLDOWN_HOURS)).strftime('%d %b %Y %H:%M UTC')} "
-        f"· use /updatesamplelist force to bypass.</i>",
-    ]
-    await _set("\n".join(lines))
+# /updatesamplelist Telegram command and its _run_update_sample_list helper
+# were retired in V1.7.1. The MMS → Full Sample Listing sync is now
+# automated via the JobQueue scheduled task in main(); see sync_engine.py
+# for the actual fetch+enrich+append logic.
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2197,14 +1964,11 @@ async def _handle_menu_callback(update, ctx, action: str):
             "paste up to 5 full codes separated by spaces.",
         )
         return
+    # menu:updsample retired in V1.7.1 — sync is now automated weekly. If
+    # a stale menu message gets tapped, route to the home menu so the user
+    # isn't left staring at a broken button.
     if action == "updsample":
-        # Admin-only — defence in depth (the button itself is hidden for
-        # non-admins in cmd_start). Routes to the same flow as the
-        # /updatesamplelist command.
-        if not _is_update_sample_owner(user):
-            await send(update, "🔒 This command is restricted.")
-            return
-        await _run_update_sample_list(update, ctx)
+        await cmd_start(update, ctx)
         return
 
 
@@ -3426,6 +3190,72 @@ def _preflight() -> list[str]:
     return errs
 
 
+async def _weekly_mms_sync_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback — runs MMS → Full Sample Listing sync.
+
+    The actual fetch + enrich + append lives in `sync_engine.run_mms_to_fsl_sync`,
+    a synchronous function we offload to a thread so the bot's event loop
+    isn't blocked by gspread / requests.
+    """
+    import sync_engine
+    log.info("weekly_mms_sync_job: starting")
+    try:
+        result = await asyncio.to_thread(sync_engine.run_mms_to_fsl_sync, False)
+        log.info("weekly_mms_sync_job: result %s", result)
+    except Exception as e:  # noqa: BLE001
+        log.exception("weekly_mms_sync_job failed: %s", e)
+
+
+async def _schedule_weekly_mms_sync(application: Application) -> None:
+    """Set up the recurring weekly job + catch-up if overdue.
+
+    Schedule:
+      - Every Monday at 02:00 UTC.
+      - On startup, if last successful sync was >7 days ago (or never),
+        kick off a one-shot run after a 60s delay so the bot has time to
+        finish initialising.
+    """
+    from datetime import time as _time
+    job_queue = application.job_queue
+    if job_queue is None:
+        log.warning("JobQueue not available — weekly sync NOT scheduled. "
+                    "Install python-telegram-bot[job-queue] to enable.")
+        return
+
+    # Recurring weekly run: Monday 02:00 UTC.
+    job_queue.run_daily(
+        _weekly_mms_sync_job,
+        time=_time(hour=2, minute=0, tzinfo=timezone.utc),
+        days=(0,),  # 0 = Monday in PTB's day numbering
+        name="weekly_mms_sync",
+    )
+    log.info("weekly_mms_sync_job scheduled: every Monday 02:00 UTC")
+
+    # Catch-up: if we're overdue (no run in the last 7 days), trigger once
+    # 60s after startup so the bot has fully initialised first.
+    try:
+        last = await asyncio.to_thread(sheets.get_last_sample_sync)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not read last sync timestamp: %s", e)
+        last = None
+    if last is None:
+        overdue = True
+        last_str = "never"
+    else:
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        overdue = (datetime.now(timezone.utc) - last) > timedelta(days=7)
+        last_str = last.isoformat(timespec="seconds")
+    if overdue:
+        log.info(
+            "weekly_mms_sync: last run was %s — scheduling catch-up in 60s",
+            last_str,
+        )
+        job_queue.run_once(_weekly_mms_sync_job, when=60, name="catchup_mms_sync")
+    else:
+        log.info("weekly_mms_sync: last run %s — no catch-up needed", last_str)
+
+
 def main():
     errs = _preflight()
     if errs:
@@ -3472,7 +3302,8 @@ def main():
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("updatesamplelist", cmd_update_sample_list))
+    # /updatesamplelist command retired in V1.7.1. The MMS → FSL sync is
+    # now scheduled by the JobQueue setup at the bottom of main().
 
     # Register Telegram's native blue slash-command menu so users see every
     # function the bot offers when they tap '/'. /updatesamplelist is NOT in
@@ -3499,7 +3330,12 @@ def main():
         except Exception as e:  # noqa: BLE001
             log.warning("set_my_commands (default) failed: %s", e)
 
-    app.post_init = _install_commands
+    # Compose post_init: install Telegram command menu AND schedule the
+    # weekly MMS → Full Sample Listing sync via JobQueue.
+    async def _post_init(application: Application) -> None:
+        await _install_commands(application)
+        await _schedule_weekly_mms_sync(application)
+    app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))

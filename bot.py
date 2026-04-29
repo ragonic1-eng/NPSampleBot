@@ -806,13 +806,17 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["awaiting_lastsample_query"] = True
     ctx.user_data["lastsample_mms_name"] = mms_name
+    # Reset accumulated query — every fresh /lastsample (or 🔎 Find another)
+    # starts the refinement chain over from blank.
+    ctx.user_data["lastsample_active_query"] = ""
     await send(
         update,
         "🔎 <b>Find your last sample</b>\n\n"
         f"You're set up as <b>{h(mms_name)}</b> in MMS.\n\n"
         "<b>📎 Reply to this message</b> with a product name or keyword "
         "(e.g. <i>BBQ</i>, <i>tom yum</i>, <i>S-668</i>). I'll search your "
-        "samples in <i>Full Sample Listing</i> and show the most recent match.",
+        "samples in <i>Full Sample Listing</i> and show the most recent match.\n\n"
+        "<i>Tip: after I show a result, just type more words to narrow it down.</i>",
     )
 
 
@@ -821,8 +825,32 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _LASTSAMPLE_KB = kb([[("🔎 Find another", "lastsample:again"), ("🏠 Main menu", "menu:home")]])
 
 
-async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> None:
-    """Search FSL rows owned by `mms_name` for `query`, reply with the latest match."""
+async def _run_lastsample_search(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    mms_name: str,
+    query: str,
+    prev: str = "",
+) -> None:
+    """Search FSL rows owned by `mms_name` for `query`, reply with the latest match.
+
+    Refinement protocol (V1.8.6+): the caller passes the accumulated query
+    string. If the search succeeds, we set ``lastsample_active_query`` to
+    that query and re-arm ``awaiting_lastsample_query`` so the next text
+    refines further. If the search fails, we clear ``lastsample_active_query``
+    so the next text starts a fresh search rather than appending to a query
+    we know returns nothing.
+
+    ``prev`` is just the query before the user's latest word — used to give
+    the user a clear "I tried <prev + new>, found nothing, search reset"
+    explanation when a refinement fails.
+    """
+
+    def _re_arm(active: str) -> None:
+        """Persist the new search context so the next text continues the chain."""
+        ctx.user_data["awaiting_lastsample_query"] = True
+        ctx.user_data["lastsample_active_query"] = active
+
     query = (query or "").strip()
     if len(query) < 2:
         await send(
@@ -831,6 +859,7 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
             "code prefix, or flavour keyword.",
             _LASTSAMPLE_KB,
         )
+        _re_arm(prev)  # leave whatever was there alone
         return
 
     try:
@@ -838,6 +867,7 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
     except Exception as e:  # noqa: BLE001
         log.exception("lastsample: FSL read failed")
         await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _LASTSAMPLE_KB)
+        _re_arm(prev)
         return
 
     if not rows:
@@ -847,6 +877,7 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
             "in Full Sample Listing yet.",
             _LASTSAMPLE_KB,
         )
+        _re_arm("")  # nothing to refine on
         return
 
     # Score each row against the query. Two-pass:
@@ -943,6 +974,16 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
             if len(suggestions) >= 3:
                 break
 
+        # Refinement context: if the user was narrowing an existing query,
+        # phrase the failure as "your refinement returned nothing — search
+        # has been reset" so they understand why their next message will be
+        # treated as a fresh search rather than yet another refinement.
+        was_refinement = bool(prev)
+        reset_note = (
+            "\n\n<i>🔄 Your search has been reset — send a fresh keyword to "
+            "start over, or tap 🏠 Main menu.</i>"
+            if was_refinement else ""
+        )
         if suggestions:
             lines = [
                 f"🤔 <b>No exact match for {h(query)}</b> under your name.",
@@ -956,8 +997,8 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
                 )
             lines.append("")
             lines.append(
-                "<i>Tap 🔎 Find another and try one of those names "
-                "(or check your spelling).</i>"
+                "<i>Send one of those names (or a fresh keyword) to try again.</i>"
+                + reset_note.replace("\n\n", "\n")
             )
             await send(update, "\n".join(lines), _LASTSAMPLE_KB)
         else:
@@ -967,9 +1008,11 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
                 f"No samples under your name (<b>{h(mms_name)}</b>) match "
                 f"<b>{h(query)}</b>. Double-check the spelling, or try a "
                 "shorter keyword like <i>spicy</i>, <i>BBQ</i>, or a code "
-                "prefix like <code>S-668</code>.",
+                f"prefix like <code>S-668</code>.{reset_note}",
                 _LASTSAMPLE_KB,
             )
+        # Reset the refinement chain — next text is a fresh search.
+        _re_arm("")
         return
 
     # Sort by date desc, but also keep score as a tiebreaker so a high-score
@@ -1006,18 +1049,27 @@ async def _run_lastsample_search(update: Update, mms_name: str, query: str) -> N
         f"<b>Customer Name:</b> {h(best.get('Customer Name') or '—')}",
         f"<b>R&amp;D Price:</b> {h(rd_display)}",
     ]
-    # If there are several plausible matches, hint at it so the user can
-    # refine — keeps the answer clear but not misleading.
+    # Show the user what their accumulated query is — useful after a few
+    # refinement steps so they don't lose track of context.
+    if prev:
+        lines.append("")
+        lines.append(f"<i>🔍 Searched: {h(query)}</i>")
+    # If there are several plausible matches, prompt the user to keep
+    # narrowing. Just type more words — refinement is now persistent.
     if len(candidates) > 1:
         others = sum(1 for _, s in candidates[1:] if s >= 70)
         if others:
-            lines.append("")
+            if not prev:
+                lines.append("")
             lines.append(
                 f"<i>({others} other match{'es' if others > 1 else ''} found — "
-                "send a more specific keyword to narrow further.)</i>"
+                "type more words to narrow further, or tap 🔎 Find another to start over.)</i>"
             )
 
     await send(update, "\n".join(lines), _LASTSAMPLE_KB)
+    # Persist this query so the next text the user sends is treated as a
+    # refinement on top of it.
+    _re_arm(query)
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1562,12 +1614,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         and "Find your last sample" in (replied.text or "")
     )
     if has_lastsample_flag or is_lastsample_reply:
-        mms_name = ctx.user_data.pop("lastsample_mms_name", "")
+        # Don't pop these — _run_lastsample_search rewrites them after the
+        # search so the next text message can refine. cmd_lastsample (or the
+        # 🔎 Find another button) is what clears them on a fresh start.
+        mms_name = ctx.user_data.get("lastsample_mms_name", "")
         if not mms_name:
             # Stateless fallback (multi-replica deploys): re-resolve from sheet.
             mms_name = await asyncio.to_thread(
                 sheets.get_user_mms_name, user.id, user.username
             )
+            ctx.user_data["lastsample_mms_name"] = mms_name
         if not mms_name:
             await send(
                 update,
@@ -1575,7 +1631,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "it on the <i>Authorized Users</i> tab, then re-run /lastsample.",
             )
             return
-        await _run_lastsample_search(update, mms_name, text)
+        # Refinement: append the new text to whatever query was active
+        # before. A "🔎 Find another" tap (which calls cmd_lastsample) wipes
+        # the active query, so the next message starts a fresh search.
+        active = (ctx.user_data.get("lastsample_active_query") or "").strip()
+        combined = (active + " " + text).strip() if active else text.strip()
+        await _run_lastsample_search(update, ctx, mms_name, combined, prev=active)
         return
 
     # Manual code-entry flow ("✏️ Enter a code" on the main menu): accept

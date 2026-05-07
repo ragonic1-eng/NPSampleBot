@@ -1371,23 +1371,29 @@ async def _run_lastsample_search(
     _re_arm(query)
 
 
+_CUST_PAGE_SIZE = 10
+
+
 async def _show_customer_samples(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     mms_name: str,
     customer_name: str,
     scope: str = "self",
+    page: int = 0,
 ) -> None:
-    """Render the latest 10 samples to ``customer_name`` in the given scope.
+    """Render a 10-sample page of samples to ``customer_name`` in ``scope``.
 
     scope='self'  — only samples this rep (mms_name) sent to that customer.
-    scope='all'   — admin view: every rep's samples to that customer, with
-                    the rep's name shown on each line so the admin can see
-                    who handled what.
+    scope='all'   — every rep's samples to that customer, with the rep's
+                    name shown on each line.
+    page          — 0-indexed page number (V1.10.4+). The view paginates
+                    in groups of _CUST_PAGE_SIZE so customers with many
+                    samples don't blow up the message.
 
-    Used by:
-      - /lastsample customer-pick callback   (scope='self')
-      - /alllastsample customer-pick callback (scope='all')
+    Pagination state is fully encoded in the callback button (scope, page,
+    customer hash) so it survives worker switches. No reliance on
+    ctx.user_data for the active page.
     """
     try:
         if scope == "all":
@@ -1416,7 +1422,15 @@ async def _show_customer_samples(
     from datetime import date as _date
     SENTINEL = _date(1900, 1, 1)
     matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
-    top = matches[:10]
+
+    total = len(matches)
+    total_pages = max(1, (total + _CUST_PAGE_SIZE - 1) // _CUST_PAGE_SIZE)
+    # Clamp the requested page so a stale callback (e.g. samples got
+    # archived between the click and the read) doesn't 404.
+    page = max(0, min(int(page or 0), total_pages - 1))
+    start = page * _CUST_PAGE_SIZE
+    end = min(start + _CUST_PAGE_SIZE, total)
+    page_rows = matches[start:end]
 
     def _fmt_price(raw: str) -> str:
         s = (raw or "").strip()
@@ -1429,18 +1443,24 @@ async def _show_customer_samples(
             return s  # already has currency text baked in
 
     title_suffix = " <i>(all reps)</i>" if scope == "all" else ""
+    page_marker = (
+        f"  <i>(page {page + 1} of {total_pages}, "
+        f"showing {start + 1}–{end} of {total})</i>"
+        if total_pages > 1
+        else ""
+    )
     lines = [
-        f"📋 <b>Last {len(top)} sample{'s' if len(top) > 1 else ''} to "
-        f"{h(customer_name)}:</b>{title_suffix}",
+        f"📋 <b>Samples to {h(customer_name)}:</b>"
+        f"{title_suffix}{page_marker}",
         "",
     ]
-    for i, r in enumerate(top, 1):
+    # Continuous numbering: row 11 on page 2 displays as '11.'
+    for i, r in enumerate(page_rows, start + 1):
         d = r.get("_date")
         date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
         name = r.get("Product Name") or "—"
         code = r.get("Product Code") or "—"
         price = _fmt_price(r.get("R&D Price") or "")
-        # In all-scope, prepend the rep so admin sees who handled each.
         if scope == "all":
             sales = (r.get("Sales") or "").strip() or "—"
             lines.append(
@@ -1451,20 +1471,38 @@ async def _show_customer_samples(
             lines.append(
                 f" {i}. {h(date_str)} · {h(name)} · <code>{h(code)}</code> · {h(price)}"
             )
-    if len(matches) > 10:
-        lines.append("")
-        lines.append(
-            f"<i>({len(matches) - 10} older sample"
-            f"{'s' if len(matches) - 10 > 1 else ''} hidden — refine your "
-            "search with a more specific keyword if you need them.)</i>"
-        )
 
     sync_footer = await _last_sync_footer()
     if sync_footer:
         lines.append("")
         lines.append(f"<i>{sync_footer}</i>")
 
-    await send(update, "\n".join(lines), _last_kb(scope))
+    # Pagination buttons. Callback format: lspg:<scope>:<page>:<cust_hash>
+    # where scope is 's' (self) or 'a' (all). Customer hash is the same
+    # md5[:10] used by the lsc / lscall callbacks, so we can re-derive
+    # the customer name on whichever worker handles the click.
+    cust_hash = _cust_hash(customer_name)
+    s_letter = "a" if scope == "all" else "s"
+    nav_row: list[tuple[str, str]] = []
+    if page > 0:
+        # 'First' jumps straight back to page 0 so deep paginators don't
+        # have to tap Prev many times.
+        nav_row.append(("⏮ First", f"lspg:{s_letter}:0:{cust_hash}"))
+        if page > 1:
+            nav_row.append(("◀ Prev", f"lspg:{s_letter}:{page - 1}:{cust_hash}"))
+    if end < total:
+        next_count = min(_CUST_PAGE_SIZE, total - end)
+        nav_row.append(
+            (f"Next {next_count} ▶", f"lspg:{s_letter}:{page + 1}:{cust_hash}")
+        )
+
+    again_cb = "lastsample:again_all" if scope == "all" else "lastsample:again"
+    btn_rows = []
+    if nav_row:
+        btn_rows.append(nav_row)
+    btn_rows.append([("🔎 Find another", again_cb), ("🏠 Main menu", "menu:home")])
+
+    await send(update, "\n".join(lines), kb(btn_rows))
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2576,6 +2614,71 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         await _show_customer_samples(update, ctx, mms, chosen, scope=cs_scope)
+        return
+
+    # /lastsample customer pagination — user tapped First / Prev / Next on
+    # the customer 10-sample view. Callback format:
+    #   lspg:<s|a>:<page>:<cust_hash>
+    # Everything needed to render the page is encoded here, so the
+    # callback works across worker switches and process restarts.
+    if data.startswith("lspg:"):
+        parts = data.split(":", 3)
+        if len(parts) < 4:
+            return
+        _, scope_letter, page_str, cust_hash = parts
+        cs_scope = "all" if scope_letter == "a" else "self"
+        try:
+            page = int(page_str)
+        except ValueError:
+            return
+        mms = ""
+        if cs_scope == "self":
+            mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
+                sheets.get_user_mms_name,
+                update.effective_user.id, update.effective_user.username,
+            )
+            if not mms:
+                await send(
+                    update,
+                    "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
+                    "on the <i>Authorized Users</i> tab, then re-run /lastsample.",
+                )
+                return
+            ctx.user_data["lastsample_mms_name"] = mms
+        ctx.user_data["lastsample_scope"] = cs_scope
+        # Re-derive the customer name from its hash by scanning the right
+        # FSL slice for this scope.
+        try:
+            if cs_scope == "all":
+                rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
+            else:
+                rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms)
+        except Exception as e:  # noqa: BLE001
+            log.exception("lastsample: FSL read failed during paginate callback")
+            await send(
+                update,
+                f"😕 Couldn't read Full Sample Listing: {h(str(e))}",
+                _last_kb(cs_scope),
+            )
+            return
+        seen_customers: set[str] = set()
+        for r in rows:
+            cust = (r.get("Customer Name") or "").strip()
+            if cust:
+                seen_customers.add(cust)
+        chosen: str | None = next(
+            (c for c in seen_customers if _cust_hash(c) == cust_hash),
+            None,
+        )
+        if chosen is None:
+            await send(
+                update,
+                "🤔 Couldn't match that customer in the latest data — please "
+                "tap 🔎 Find another and search again.",
+                _last_kb(cs_scope),
+            )
+            return
+        await _show_customer_samples(update, ctx, mms, chosen, scope=cs_scope, page=page)
         return
 
     # Main menu and /samples browsing work with or without a draft.

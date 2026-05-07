@@ -426,15 +426,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [("📷 Scan a product photo", "menu:scan")],
         [("✏️ Enter a code (price lookup)", "menu:code")],
         [("🤔 What I send ah?", "menu:lastsample")],
+        [("🌐 What everyone Send ah?", "menu:alllastsample")],
         [("📋 My sample requests", "menu:samples")],
     ]
-    # Admin-only entry to the all-reps search. Hidden for everyone else
-    # so the menu stays clean for sales reps.
-    if _is_update_sample_owner(user):
-        menu.insert(
-            5,  # right below 'What I send ah?' for thematic grouping
-            [("🌐 What everyone Send ah?", "menu:alllastsample")],
-        )
     # MMS → Full Sample Listing sync is now automated weekly via the
     # JobQueue (see main()). No manual Telegram trigger.
     await send(
@@ -485,7 +479,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Product lookup</b>",
         "/pp <code> — fetch price (Code · Name · R&amp;D Price · Raw Material Cost)",
         "/scan — send a photo, I OCR codes and run /pp on each",
-        "/lastsample [keyword] — find the most recent sample you sent (e.g. <code>/lastsample asian thai</code>)",
+        "/lastsample [keyword] — most recent sample <b>you</b> sent (e.g. <code>/lastsample asian thai</code>)",
+        "/alllastsample [keyword] — most recent sample <b>any rep</b> sent — shared visibility across the team",
         "",
         "<b>Account</b>",
         "/whoami — your Telegram ID and username",
@@ -497,7 +492,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "<b>🔧 Admin</b>",
             "/reload — refresh seasoning &amp; customer lists from Sheets",
             "/diag — diagnostics (auth / sheet visibility)",
-            "/alllastsample [keyword] — search ALL reps' samples (admin-only)",
             "<i>(MMS → Full Sample Listing sync runs automatically weekly — "
             "see Railway logs for run history.)</i>",
         ]
@@ -915,23 +909,14 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin-only `/alllastsample [keyword]` — same flow as /lastsample but
-    searches across ALL reps' samples, not just the caller's.
+    """`/alllastsample [keyword]` — same flow as /lastsample but searches
+    across ALL reps' samples, not just the caller's.
 
-    Useful for the overall admin to look up history regardless of which rep
-    handled the customer or quoted the product. Restricted to
-    config.UPDATE_SAMPLE_OWNER (the same gate as the legacy
-    /updatesamplelist) so reps can't spy on each other's pipelines.
+    V1.10.2: opened up to every authorized user (was admin-only in V1.10.x).
+    Sales reps can now look up what colleagues sent to a shared customer or
+    which variants of a product have been quoted before.
     """
     if not await _authorized(update):
-        return
-    user = update.effective_user
-    if not _is_update_sample_owner(user):
-        await send(
-            update,
-            "🛑 <b>Admin only.</b> /alllastsample is restricted — use "
-            "/lastsample to search just your own samples.",
-        )
         return
 
     inline = " ".join(ctx.args).strip() if ctx.args else ""
@@ -2447,11 +2432,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         choice, qtext = parts[0], parts[1]
         if choice not in ("p", "c") or not qtext:
             return
-        # Admin gate: 'all' callbacks are restricted in case someone
-        # forwards an admin's button into a non-admin's chat.
-        if ds_scope == "all" and not _is_update_sample_owner(update.effective_user):
-            await send(update, "🛑 <b>Admin only.</b> /alllastsample is restricted.")
-            return
         # Resolve mms only when needed for self-scope.
         mms = ""
         if ds_scope == "self":
@@ -2484,9 +2464,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cs_scope = "all" if data.startswith("lscall:") else "self"
         target_hash = data.split(":", 1)[1].strip()
         if not target_hash:
-            return
-        if cs_scope == "all" and not _is_update_sample_owner(update.effective_user):
-            await send(update, "🛑 <b>Admin only.</b> /alllastsample is restricted.")
             return
         mms = ""
         if cs_scope == "self":
@@ -4157,6 +4134,7 @@ def main():
             BotCommand("pp", "💲 Product price — e.g. /pp S-62RG3-19"),
             BotCommand("scan", "📷 Scan a photo for product code(s)"),
             BotCommand("lastsample", "🔎 Find your last sample — /lastsample <keyword>"),
+            BotCommand("alllastsample", "🌐 Search any rep's samples — /alllastsample <keyword>"),
             BotCommand("diag", "Diagnostics"),
             BotCommand("help", "Show all commands"),
         ]

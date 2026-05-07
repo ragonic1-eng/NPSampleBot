@@ -428,6 +428,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [("🤔 What I send ah?", "menu:lastsample")],
         [("📋 My sample requests", "menu:samples")],
     ]
+    # Admin-only entry to the all-reps search. Hidden for everyone else
+    # so the menu stays clean for sales reps.
+    if _is_update_sample_owner(user):
+        menu.insert(
+            5,  # right below 'What I send ah?' for thematic grouping
+            [("🌐 What everyone Send ah?", "menu:alllastsample")],
+        )
     # MMS → Full Sample Listing sync is now automated weekly via the
     # JobQueue (see main()). No manual Telegram trigger.
     await send(
@@ -2784,6 +2791,12 @@ async def _handle_menu_callback(update, ctx, action: str):
         # Same flow as the /lastsample command — reuse it so the prompt and
         # MMS-name lookup logic stay in one place.
         await cmd_lastsample(update, ctx)
+        return
+    if action == "alllastsample":
+        # Admin-only entry — cmd_alllastsample re-checks the gate, so even
+        # if a non-admin somehow gets this callback (forwarded button etc.)
+        # they're refused.
+        await cmd_alllastsample(update, ctx)
         return
     # menu:updsample retired in V1.7.1 — sync is now automated weekly. If
     # a stale menu message gets tapped, route to the home menu so the user

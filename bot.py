@@ -2091,7 +2091,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # search so the next text message can refine. cmd_lastsample /
         # cmd_alllastsample (or the 🔎 Find another button) is what clears
         # them on a fresh start.
-        scope = ctx.user_data.get("lastsample_scope", "self")
+        #
+        # Scope detection (V1.10.7 fix). Prefer the prompt text we're
+        # replying to: it's on the actual message, so multi-worker Railway
+        # deploys can determine scope without a shared state store. Only
+        # fall back to user_data when this isn't a reply path (i.e. flag
+        # set on this same worker).
+        if is_lastsample_reply and "Find ANY rep's last sample" in _replied_text:
+            scope = "all"
+        elif is_lastsample_reply and "Find your last sample" in _replied_text:
+            scope = "self"
+        else:
+            scope = ctx.user_data.get("lastsample_scope", "self")
         # In all-scope, mms_name doesn't matter (sheets.load_fsl_rows_all
         # ignores it). In self-scope, we need it.
         mms_name = ctx.user_data.get("lastsample_mms_name", "")

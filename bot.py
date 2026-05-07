@@ -894,6 +894,8 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # so any subsequent text/refinement is rep-scoped.
     ctx.user_data["lastsample_active_query"] = ""
     ctx.user_data["lastsample_scope"] = "self"
+    sync_footer = await _last_sync_footer()
+    sync_tail = f"\n\n<i>{sync_footer}</i>" if sync_footer else ""
     await send(
         update,
         "🔎 <b>Find your last sample</b>\n\n"
@@ -904,7 +906,8 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<i>Tips:</i>\n"
         "<i>  • After I show a result, just type more words to narrow it down.</i>\n"
         "<i>  • Or skip this prompt entirely: type </i>"
-        "<code>/lastsample asian thai</code><i> in one go.</i>",
+        "<code>/lastsample asian thai</code><i> in one go.</i>"
+        f"{sync_tail}",
     )
 
 
@@ -933,9 +936,11 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["awaiting_lastsample_query"] = True
     ctx.user_data["lastsample_scope"] = "all"
     ctx.user_data["lastsample_active_query"] = ""
+    sync_footer = await _last_sync_footer()
+    sync_tail = f"\n\n<i>{sync_footer}</i>" if sync_footer else ""
     await send(
         update,
-        "🌐 <b>Find ANY rep's last sample</b> <i>(admin)</i>\n\n"
+        "🌐 <b>Find ANY rep's last sample</b>\n\n"
         "This searches <b>all reps' samples</b> in Full Sample Listing — "
         "not just yours. Each result shows which rep handled the sample.\n\n"
         "<b>📎 Reply to this message</b> with a product name or keyword "
@@ -944,7 +949,8 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<i>Tips:</i>\n"
         "<i>  • After a result, type more words to narrow further.</i>\n"
         "<i>  • Or skip this prompt: type </i>"
-        "<code>/alllastsample q land</code><i> in one go.</i>",
+        "<code>/alllastsample q land</code><i> in one go.</i>"
+        f"{sync_tail}",
     )
 
 
@@ -958,6 +964,43 @@ _ALL_LASTSAMPLE_KB = kb([[("🔎 Find another", "lastsample:again_all"), ("🏠 
 def _last_kb(scope: str):
     """Pick the right footer keyboard for the active scope."""
     return _ALL_LASTSAMPLE_KB if scope == "all" else _LASTSAMPLE_KB
+
+
+# Cache the last-sync timestamp for 5 minutes so we don't read the
+# _sync_meta tab on every /lastsample reply. Staleness here only affects
+# the displayed timestamp, not the data itself — the FSL rows are
+# whatever load_fsl_rows_*() reads at the moment of search.
+_LAST_SYNC_CACHE: tuple[float, "object"] | None = None
+_LAST_SYNC_TTL = 5 * 60  # seconds
+
+
+async def _last_sync_footer() -> str:
+    """Render a subtle one-liner showing when FSL was last synced from MMS.
+
+    Used on /lastsample and /alllastsample replies so reps know how fresh
+    the data they're seeing is. Returns '' if we've never recorded a sync
+    (e.g. very fresh deploy with no run yet). Flags a warning when the
+    last sync is over a week old — the auto-sync runs weekly, so anything
+    older means something has broken.
+    """
+    global _LAST_SYNC_CACHE
+    import time as _t
+    now = _t.time()
+    if _LAST_SYNC_CACHE and now - _LAST_SYNC_CACHE[0] < _LAST_SYNC_TTL:
+        last = _LAST_SYNC_CACHE[1]
+    else:
+        last = await asyncio.to_thread(sheets.get_last_sample_sync)
+        _LAST_SYNC_CACHE = (now, last)
+    if last is None:
+        return ""
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=_tz.utc)
+    age = _dt.now(_tz.utc) - last
+    pretty = last.strftime("%d %b %Y, %H:%M UTC")
+    if age > _td(days=8):  # 1-day grace beyond the weekly cycle
+        return f"⚠️ Sample list last refreshed: {pretty} — over a week old."
+    return f"📅 Sample list last refreshed: {pretty}"
 
 
 def _cust_hash(name: str) -> str:
@@ -1227,6 +1270,10 @@ async def _run_lastsample_search(
                     f"<i>(Showing top {len(options)} by most-recent activity. "
                     "Refine with a longer keyword to narrow further.)</i>"
                 )
+            sync_footer = await _last_sync_footer()
+            if sync_footer:
+                intro.append("")
+                intro.append(f"<i>{sync_footer}</i>")
             await send(update, "\n".join(intro), kb(btn_rows))
             # Reset the refinement chain — the customer button is the next step.
             _re_arm("")
@@ -1242,13 +1289,15 @@ async def _run_lastsample_search(
             if scope == "all"
             else f"under your name (<b>{h(mms_name)}</b>)"
         )
+        sync_footer = await _last_sync_footer()
+        sync_tail = f"\n\n<i>{sync_footer}</i>" if sync_footer else ""
         await send(
             update,
             f"🙈 <b>No product found in your sample request list.</b>\n\n"
             f"Nothing {whose} has "
             f"<b>{h(query)}</b> in the Product Name or Customer Name. "
             "Double-check the spelling, or try a different keyword."
-            f"{reset_note}",
+            f"{reset_note}{sync_tail}",
             _last_kb(scope),
         )
         _re_arm("")
@@ -1310,6 +1359,11 @@ async def _run_lastsample_search(
             f"<i>({others} other match{'es' if others > 1 else ''} found — "
             "type more words to narrow further, or tap 🔎 Find another to start over.)</i>"
         )
+
+    sync_footer = await _last_sync_footer()
+    if sync_footer:
+        lines.append("")
+        lines.append(f"<i>{sync_footer}</i>")
 
     await send(update, "\n".join(lines), _last_kb(scope))
     # Persist this query so the next text the user sends is treated as a
@@ -1404,6 +1458,11 @@ async def _show_customer_samples(
             f"{'s' if len(matches) - 10 > 1 else ''} hidden — refine your "
             "search with a more specific keyword if you need them.)</i>"
         )
+
+    sync_footer = await _last_sync_footer()
+    if sync_footer:
+        lines.append("")
+        lines.append(f"<i>{sync_footer}</i>")
 
     await send(update, "\n".join(lines), _last_kb(scope))
 

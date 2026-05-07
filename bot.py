@@ -21,6 +21,7 @@ from typing import Any
 from telegram import (
     BotCommand,
     BotCommandScopeDefault,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -896,6 +897,11 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["lastsample_scope"] = "self"
     sync_footer = await _last_sync_footer()
     sync_tail = f"\n\n<i>{sync_footer}</i>" if sync_footer else ""
+    # ForceReply pops Telegram's reply-input UI so the user's next message
+    # auto-attaches as a Reply to this prompt. Critical for group chats:
+    # without it, a plain text reply gets eaten by privacy mode or lost
+    # across worker switches. selective=True scopes the force to the
+    # caller only — other group members aren't pestered.
     await send(
         update,
         "🔎 <b>Find your last sample</b>\n\n"
@@ -908,6 +914,10 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<i>  • Or skip this prompt entirely: type </i>"
         "<code>/lastsample asian thai</code><i> in one go.</i>"
         f"{sync_tail}",
+        ForceReply(
+            selective=True,
+            input_field_placeholder="e.g. tom yum, S-668, or customer name",
+        ),
     )
 
 
@@ -938,6 +948,9 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["lastsample_active_query"] = ""
     sync_footer = await _last_sync_footer()
     sync_tail = f"\n\n<i>{sync_footer}</i>" if sync_footer else ""
+    # ForceReply: same fix as cmd_lastsample. Group chats with privacy
+    # mode would otherwise drop a plain text reply, leaving the user
+    # stuck on the welcome prompt.
     await send(
         update,
         "🌐 <b>Find ANY rep's last sample</b>\n\n"
@@ -951,6 +964,10 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<i>  • Or skip this prompt: type </i>"
         "<code>/alllastsample q land</code><i> in one go.</i>"
         f"{sync_tail}",
+        ForceReply(
+            selective=True,
+            input_field_placeholder="e.g. q land, tom yum, S-668",
+        ),
     )
 
 

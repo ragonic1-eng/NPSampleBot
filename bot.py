@@ -302,15 +302,23 @@ def _kb_owner(chat_id: int, message_id: int) -> int | None:
 async def send(
     update: Update,
     text: str,
-    markup: InlineKeyboardMarkup | None = None,
+    markup=None,
     *,
     with_footer: bool = True,
+    force_new: bool = False,
 ):
     """Send/edit a message to the user.
 
-    The version + token footer is ON by default. Pass `with_footer=False` only
-    when stacking multiple bot replies for one logical action and you don't
-    want the footer to repeat on each fragment.
+    The version + token footer is ON by default. Pass ``with_footer=False``
+    only when stacking multiple bot replies for one logical action and you
+    don't want the footer to repeat on each fragment.
+
+    ``force_new=True`` bypasses the callback-edit fallback and always
+    sends a fresh message. Required when ``markup`` is a ForceReply or
+    ReplyKeyboardMarkup — Telegram's edit_message_text only accepts
+    InlineKeyboardMarkup, so without this flag the special markup is
+    silently dropped. Used by the /lastsample / /alllastsample welcome
+    prompts so ForceReply actually surfaces in group chats (V1.10.6 fix).
 
     If the message has inline buttons, the originating user is recorded so
     on_callback can refuse cross-user clicks in group chats.
@@ -319,7 +327,7 @@ async def send(
     user = update.effective_user
     stuck = bool(user and user.id in _stuck_reminder_users)
     sent_msg = None
-    if update.callback_query and not stuck:
+    if update.callback_query and not stuck and not force_new:
         try:
             await update.callback_query.edit_message_text(
                 full, reply_markup=markup, parse_mode=ParseMode.HTML
@@ -900,8 +908,14 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ForceReply pops Telegram's reply-input UI so the user's next message
     # auto-attaches as a Reply to this prompt. Critical for group chats:
     # without it, a plain text reply gets eaten by privacy mode or lost
-    # across worker switches. selective=True scopes the force to the
-    # caller only — other group members aren't pestered.
+    # across worker switches.
+    #
+    # force_new=True is mandatory: when this command is reached via the
+    # 'What I send ah?' button (callback_query), send() would otherwise
+    # try to edit_message_text(...), which silently drops ForceReply.
+    # selective=False so the reply UI works regardless of whether the
+    # caller is @mentioned in the prompt — Telegram's targeting rules
+    # are inconsistent for callback-driven messages.
     await send(
         update,
         "🔎 <b>Find your last sample</b>\n\n"
@@ -915,9 +929,10 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<code>/lastsample asian thai</code><i> in one go.</i>"
         f"{sync_tail}",
         ForceReply(
-            selective=True,
+            selective=False,
             input_field_placeholder="e.g. tom yum, S-668, or customer name",
         ),
+        force_new=True,
     )
 
 
@@ -948,9 +963,10 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["lastsample_active_query"] = ""
     sync_footer = await _last_sync_footer()
     sync_tail = f"\n\n<i>{sync_footer}</i>" if sync_footer else ""
-    # ForceReply: same fix as cmd_lastsample. Group chats with privacy
-    # mode would otherwise drop a plain text reply, leaving the user
-    # stuck on the welcome prompt.
+    # ForceReply + force_new — same fix as cmd_lastsample. Without
+    # force_new, a callback-tap entry edits the menu message instead of
+    # sending fresh, and ForceReply gets silently dropped (Telegram's
+    # edit_message_text only honours InlineKeyboardMarkup).
     await send(
         update,
         "🌐 <b>Find ANY rep's last sample</b>\n\n"
@@ -965,9 +981,10 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<code>/alllastsample q land</code><i> in one go.</i>"
         f"{sync_tail}",
         ForceReply(
-            selective=True,
+            selective=False,
             input_field_placeholder="e.g. q land, tom yum, S-668",
         ),
+        force_new=True,
     )
 
 

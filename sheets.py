@@ -776,6 +776,30 @@ def find_fsl_product_by_code(code: str) -> dict | None:
     return matches[0]
 
 
+def load_fsl_rows_all() -> list[dict[str, str]]:
+    """Return every Full Sample Listing row, regardless of Sales rep.
+
+    Admin-only path: /alllastsample uses this to search across all reps,
+    in contrast to load_fsl_rows_for_sales() which scopes to one rep.
+    Each row includes a parsed ``_date`` for sorting.
+    """
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(FSL_TAB)
+    except gspread.WorksheetNotFound:
+        return []
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    out: list[dict[str, str]] = []
+    for r in values[1:]:
+        padded = r + [""] * (len(FSL_HEADER) - len(r))
+        row = {hdr: padded[i] for i, hdr in enumerate(FSL_HEADER)}
+        row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
+        out.append(row)
+    return out
+
+
 def load_fsl_rows_for_sales(sales_name: str) -> list[dict[str, str]]:
     """Return every Full Sample Listing row whose Sales col matches sales_name
     (case-insensitive, whitespace-collapsed). Each row is a dict with the

@@ -490,6 +490,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "<b>🔧 Admin</b>",
             "/reload — refresh seasoning &amp; customer lists from Sheets",
             "/diag — diagnostics (auth / sheet visibility)",
+            "/alllastsample [keyword] — search ALL reps' samples (admin-only)",
             "<i>(MMS → Full Sample Listing sync runs automatically weekly — "
             "see Railway logs for run history.)</i>",
         ]
@@ -888,8 +889,10 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["awaiting_lastsample_query"] = True
     ctx.user_data["lastsample_mms_name"] = mms_name
     # Reset accumulated query — every fresh /lastsample (or 🔎 Find another)
-    # starts the refinement chain over from blank.
+    # starts the refinement chain over from blank. Scope locked to 'self'
+    # so any subsequent text/refinement is rep-scoped.
     ctx.user_data["lastsample_active_query"] = ""
+    ctx.user_data["lastsample_scope"] = "self"
     await send(
         update,
         "🔎 <b>Find your last sample</b>\n\n"
@@ -904,9 +907,65 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only `/alllastsample [keyword]` — same flow as /lastsample but
+    searches across ALL reps' samples, not just the caller's.
+
+    Useful for the overall admin to look up history regardless of which rep
+    handled the customer or quoted the product. Restricted to
+    config.UPDATE_SAMPLE_OWNER (the same gate as the legacy
+    /updatesamplelist) so reps can't spy on each other's pipelines.
+    """
+    if not await _authorized(update):
+        return
+    user = update.effective_user
+    if not _is_update_sample_owner(user):
+        await send(
+            update,
+            "🛑 <b>Admin only.</b> /alllastsample is restricted — use "
+            "/lastsample to search just your own samples.",
+        )
+        return
+
+    inline = " ".join(ctx.args).strip() if ctx.args else ""
+    if inline:
+        # No prompt step; run directly. mms_name is irrelevant in 'all' scope
+        # — _run_lastsample_search ignores it when scope='all'.
+        ctx.user_data["lastsample_scope"] = "all"
+        ctx.user_data["lastsample_active_query"] = ""
+        await _run_lastsample_search(
+            update, ctx, mms_name="", query=inline, prev="", scope="all",
+        )
+        return
+
+    ctx.user_data["awaiting_lastsample_query"] = True
+    ctx.user_data["lastsample_scope"] = "all"
+    ctx.user_data["lastsample_active_query"] = ""
+    await send(
+        update,
+        "🌐 <b>Find ANY rep's last sample</b> <i>(admin)</i>\n\n"
+        "This searches <b>all reps' samples</b> in Full Sample Listing — "
+        "not just yours. Each result shows which rep handled the sample.\n\n"
+        "<b>📎 Reply to this message</b> with a product name or keyword "
+        "(e.g. <i>BBQ</i>, <i>tom yum</i>, <i>S-668</i>) or a customer name. "
+        "I'll show the most recent matching sample regardless of who sent it.\n\n"
+        "<i>Tips:</i>\n"
+        "<i>  • After a result, type more words to narrow further.</i>\n"
+        "<i>  • Or skip this prompt: type </i>"
+        "<code>/alllastsample q land</code><i> in one go.</i>",
+    )
+
+
 # Reusable footer keyboard for every /lastsample reply — keeps the user in
-# the loop without making them retype the slash command.
+# the loop without making them retype the slash command. Two flavours so
+# the 'Find another' button reprompts in the right scope (self vs all-reps).
 _LASTSAMPLE_KB = kb([[("🔎 Find another", "lastsample:again"), ("🏠 Main menu", "menu:home")]])
+_ALL_LASTSAMPLE_KB = kb([[("🔎 Find another", "lastsample:again_all"), ("🏠 Main menu", "menu:home")]])
+
+
+def _last_kb(scope: str):
+    """Pick the right footer keyboard for the active scope."""
+    return _ALL_LASTSAMPLE_KB if scope == "all" else _LASTSAMPLE_KB
 
 
 def _cust_hash(name: str) -> str:
@@ -927,6 +986,7 @@ async def _run_lastsample_search(
     query: str,
     prev: str = "",
     mode: str = "auto",
+    scope: str = "self",
 ) -> None:
     """Search FSL rows owned by `mms_name` for `query`, reply with the latest match.
 
@@ -962,25 +1022,31 @@ async def _run_lastsample_search(
             update,
             "🤏 That's too short. Try at least 2 characters — a product name, "
             "code prefix, or flavour keyword.",
-            _LASTSAMPLE_KB,
+            _last_kb(scope),
         )
         _re_arm(prev)  # leave whatever was there alone
         return
 
+    # Scope-aware FSL load. 'self' filters to this rep; 'all' is admin-only
+    # and reads every row regardless of Sales.
     try:
-        rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
+        if scope == "all":
+            rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
+        else:
+            rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
     except Exception as e:  # noqa: BLE001
         log.exception("lastsample: FSL read failed")
-        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _LASTSAMPLE_KB)
+        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _last_kb(scope))
         _re_arm(prev)
         return
 
     if not rows:
+        whose = "any rep" if scope == "all" else f"<b>{h(mms_name)}</b>"
         await send(
             update,
-            f"📭 I don't see any samples logged under <b>{h(mms_name)}</b> "
+            f"📭 I don't see any samples logged under {whose} "
             "in Full Sample Listing yet.",
-            _LASTSAMPLE_KB,
+            _last_kb(scope),
         )
         _re_arm("")  # nothing to refine on
         return
@@ -1084,18 +1150,24 @@ async def _run_lastsample_search(
     if mode == "auto" and product_candidates and sorted_customers:
         # Encode the query into the callback so the choice survives worker
         # switches (no reliance on ctx.user_data). Telegram callback_data
-        # limit is 64 bytes UTF-8; 'lsd:p:' prefix is 6 bytes, leaving 58
-        # for the query. Truncate at byte boundary if longer (rare —
-        # disambiguation queries are short keywords).
-        q_bytes = query.encode("utf-8")[:58]
+        # limit is 64 bytes UTF-8; with 'lsdall:p:' (9 bytes) we leave 55
+        # for the query. Truncate at byte boundary if longer.
+        # Scope is encoded in the prefix:
+        #   lsd:p:<q>     → self-scope, product
+        #   lsd:c:<q>     → self-scope, customer
+        #   lsdall:p:<q>  → all-scope (admin), product
+        #   lsdall:c:<q>  → all-scope (admin), customer
+        prefix = "lsdall" if scope == "all" else "lsd"
+        q_bytes = query.encode("utf-8")[:55]
         q_safe = q_bytes.decode("utf-8", errors="ignore")
+        again_cb = "lastsample:again_all" if scope == "all" else "lastsample:again"
         disambig_kb = kb([
             [
-                ("🛍 Product Name", f"lsd:p:{q_safe}"),
-                ("👤 Customer Name", f"lsd:c:{q_safe}"),
+                ("🛍 Product Name", f"{prefix}:p:{q_safe}"),
+                ("👤 Customer Name", f"{prefix}:c:{q_safe}"),
             ],
             [
-                ("🔎 Find another", "lastsample:again"),
+                ("🔎 Find another", again_cb),
                 ("🏠 Main menu", "menu:home"),
             ],
         ])
@@ -1135,17 +1207,25 @@ async def _run_lastsample_search(
             # selection has expired'). A hash lets us re-derive the customer
             # name from the FSL on whichever worker handles the click —
             # state-free, multi-replica safe.
-            btn_rows = [[(c, f"lsc:{_cust_hash(c)}")] for c in options]
+            # Scope-aware callback prefix (lsc=self, lscall=all-reps).
+            cust_prefix = "lscall" if scope == "all" else "lsc"
+            again_cb = "lastsample:again_all" if scope == "all" else "lastsample:again"
+            btn_rows = [[(c, f"{cust_prefix}:{_cust_hash(c)}")] for c in options]
             btn_rows.append([
-                ("🔎 Find another", "lastsample:again"),
+                ("🔎 Find another", again_cb),
                 ("🏠 Main menu", "menu:home"),
             ])
             intro = [
                 f"🤔 <b>No products matched {h(query)}.</b>",
                 "",
                 f"But I found <b>{len(sorted_customers)}</b> customer"
-                f"{'s' if len(sorted_customers) != 1 else ''} you've sent samples to "
-                f"with <b>{h(query)}</b> in the name.",
+                f"{'s' if len(sorted_customers) != 1 else ''} "
+                + (
+                    "in Full Sample Listing"
+                    if scope == "all"
+                    else "you've sent samples to"
+                )
+                + f" with <b>{h(query)}</b> in the name.",
                 "",
                 "<b>Tap one to see their last 10 samples:</b>",
             ]
@@ -1165,14 +1245,19 @@ async def _run_lastsample_search(
             "\n\n<i>🔄 Your search has been reset — send a fresh keyword "
             "to start over, or tap 🏠 Main menu.</i>" if prev else ""
         )
+        whose = (
+            "in Full Sample Listing"
+            if scope == "all"
+            else f"under your name (<b>{h(mms_name)}</b>)"
+        )
         await send(
             update,
             f"🙈 <b>No product found in your sample request list.</b>\n\n"
-            f"Nothing under your name (<b>{h(mms_name)}</b>) has "
+            f"Nothing {whose} has "
             f"<b>{h(query)}</b> in the Product Name or Customer Name. "
             "Double-check the spelling, or try a different keyword."
             f"{reset_note}",
-            _LASTSAMPLE_KB,
+            _last_kb(scope),
         )
         _re_arm("")
         return
@@ -1200,8 +1285,11 @@ async def _run_lastsample_search(
     else:
         rd_display = "—"
 
+    title = "🎯 <b>Based on my search:</b>" + (
+        "  <i>(all reps)</i>" if scope == "all" else ""
+    )
     lines = [
-        "🎯 <b>Based on my search:</b>",
+        title,
         "",
         f"<b>Product Name:</b> {h(best.get('Product Name') or '—')}",
         f"<b>Product Code:</b> <code>{h(best.get('Product Code') or '—')}</code>",
@@ -1209,6 +1297,12 @@ async def _run_lastsample_search(
         f"<b>Customer Name:</b> {h(best.get('Customer Name') or '—')}",
         f"<b>R&amp;D Price:</b> {h(rd_display)}",
     ]
+    # In all-scope mode, expose which rep handled this sample so the admin
+    # can follow up with the right person. Hidden in self-scope (the rep
+    # IS the caller, no value in repeating their own name).
+    if scope == "all":
+        sales_rep = (best.get("Sales") or "").strip() or "—"
+        lines.insert(2, f"<b>Sales rep:</b> {h(sales_rep)}")
     # Show the user what their accumulated query is — useful after a few
     # refinement steps so they don't lose track of context.
     if prev:
@@ -1225,7 +1319,7 @@ async def _run_lastsample_search(
             "type more words to narrow further, or tap 🔎 Find another to start over.)</i>"
         )
 
-    await send(update, "\n".join(lines), _LASTSAMPLE_KB)
+    await send(update, "\n".join(lines), _last_kb(scope))
     # Persist this query so the next text the user sends is treated as a
     # refinement on top of it.
     _re_arm(query)
@@ -1236,20 +1330,27 @@ async def _show_customer_samples(
     ctx: ContextTypes.DEFAULT_TYPE,
     mms_name: str,
     customer_name: str,
+    scope: str = "self",
 ) -> None:
-    """Render the latest 10 samples this rep sent to ``customer_name``.
+    """Render the latest 10 samples to ``customer_name`` in the given scope.
 
-    Used by the customer-name fallback in /lastsample: after the user picks
-    a matching customer from the inline keyboard, we pull every FSL row
-    where Sales == mms_name AND Customer Name == customer_name (case- and
-    whitespace-insensitive equality), sort by Sample Date Out desc, take
-    the top 10.
+    scope='self'  — only samples this rep (mms_name) sent to that customer.
+    scope='all'   — admin view: every rep's samples to that customer, with
+                    the rep's name shown on each line so the admin can see
+                    who handled what.
+
+    Used by:
+      - /lastsample customer-pick callback   (scope='self')
+      - /alllastsample customer-pick callback (scope='all')
     """
     try:
-        rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
+        if scope == "all":
+            rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
+        else:
+            rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
     except Exception as e:  # noqa: BLE001
         log.exception("lastsample: FSL read failed for customer view")
-        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _LASTSAMPLE_KB)
+        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _last_kb(scope))
         return
 
     target = " ".join(customer_name.lower().split())
@@ -1258,10 +1359,11 @@ async def _show_customer_samples(
         if " ".join((r.get("Customer Name") or "").lower().split()) == target
     ]
     if not matches:
+        whose = "to" if scope == "all" else "you sent to"
         await send(
             update,
-            f"📭 I don't see any samples you sent to <b>{h(customer_name)}</b>.",
-            _LASTSAMPLE_KB,
+            f"📭 I don't see any samples {whose} <b>{h(customer_name)}</b>.",
+            _last_kb(scope),
         )
         return
 
@@ -1280,9 +1382,10 @@ async def _show_customer_samples(
         except ValueError:
             return s  # already has currency text baked in
 
+    title_suffix = " <i>(all reps)</i>" if scope == "all" else ""
     lines = [
         f"📋 <b>Last {len(top)} sample{'s' if len(top) > 1 else ''} to "
-        f"{h(customer_name)}:</b>",
+        f"{h(customer_name)}:</b>{title_suffix}",
         "",
     ]
     for i, r in enumerate(top, 1):
@@ -1291,9 +1394,17 @@ async def _show_customer_samples(
         name = r.get("Product Name") or "—"
         code = r.get("Product Code") or "—"
         price = _fmt_price(r.get("R&D Price") or "")
-        lines.append(
-            f" {i}. {h(date_str)} · {h(name)} · <code>{h(code)}</code> · {h(price)}"
-        )
+        # In all-scope, prepend the rep so admin sees who handled each.
+        if scope == "all":
+            sales = (r.get("Sales") or "").strip() or "—"
+            lines.append(
+                f" {i}. {h(date_str)} · <b>{h(sales)}</b> · {h(name)} · "
+                f"<code>{h(code)}</code> · {h(price)}"
+            )
+        else:
+            lines.append(
+                f" {i}. {h(date_str)} · {h(name)} · <code>{h(code)}</code> · {h(price)}"
+            )
     if len(matches) > 10:
         lines.append("")
         lines.append(
@@ -1302,7 +1413,7 @@ async def _show_customer_samples(
             "search with a more specific keyword if you need them.)</i>"
         )
 
-    await send(update, "\n".join(lines), _LASTSAMPLE_KB)
+    await send(update, "\n".join(lines), _last_kb(scope))
 
 
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1840,24 +1951,34 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     replied = getattr(msg, "reply_to_message", None) if msg else None
     has_lastsample_flag = bool(ctx.user_data.pop("awaiting_lastsample_query", None))
+    # Match either the self-scope prompt ('Find your last sample') or the
+    # admin all-scope prompt ('Find ANY rep's last sample').
+    _replied_text = (replied.text or "") if replied else ""
     is_lastsample_reply = bool(
         replied
         and getattr(replied, "from_user", None)
         and getattr(replied.from_user, "is_bot", False)
-        and "Find your last sample" in (replied.text or "")
+        and (
+            "Find your last sample" in _replied_text
+            or "Find ANY rep's last sample" in _replied_text
+        )
     )
     if has_lastsample_flag or is_lastsample_reply:
         # Don't pop these — _run_lastsample_search rewrites them after the
-        # search so the next text message can refine. cmd_lastsample (or the
-        # 🔎 Find another button) is what clears them on a fresh start.
+        # search so the next text message can refine. cmd_lastsample /
+        # cmd_alllastsample (or the 🔎 Find another button) is what clears
+        # them on a fresh start.
+        scope = ctx.user_data.get("lastsample_scope", "self")
+        # In all-scope, mms_name doesn't matter (sheets.load_fsl_rows_all
+        # ignores it). In self-scope, we need it.
         mms_name = ctx.user_data.get("lastsample_mms_name", "")
-        if not mms_name:
+        if scope == "self" and not mms_name:
             # Stateless fallback (multi-replica deploys): re-resolve from sheet.
             mms_name = await asyncio.to_thread(
                 sheets.get_user_mms_name, user.id, user.username
             )
             ctx.user_data["lastsample_mms_name"] = mms_name
-        if not mms_name:
+        if scope == "self" and not mms_name:
             await send(
                 update,
                 "🛑 I can't see your <b>MMS Name</b> — ask the admin to set "
@@ -1865,11 +1986,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         # Refinement: append the new text to whatever query was active
-        # before. A "🔎 Find another" tap (which calls cmd_lastsample) wipes
-        # the active query, so the next message starts a fresh search.
+        # before. A "🔎 Find another" tap wipes the active query, so the
+        # next message starts a fresh search.
         active = (ctx.user_data.get("lastsample_active_query") or "").strip()
         combined = (active + " " + text).strip() if active else text.strip()
-        await _run_lastsample_search(update, ctx, mms_name, combined, prev=active)
+        await _run_lastsample_search(
+            update, ctx, mms_name, combined, prev=active, scope=scope,
+        )
         return
 
     # Manual code-entry flow ("✏️ Enter a code" on the main menu): accept
@@ -2291,70 +2414,101 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _handle_again(update, ctx, data.split(":", 1)[1])
         return
 
-    # /lastsample "Find another" button — re-arm the awaiting flag and reprompt
-    # without forcing the user to retype the slash command. Lives BEFORE the
-    # no-draft guard since /lastsample doesn't open a draft.
+    # /lastsample "Find another" button. Two flavours:
+    #   lastsample:again      → reprompt for the rep-scoped search
+    #   lastsample:again_all  → reprompt for the admin all-reps search
+    # Live BEFORE the no-draft guard since /lastsample doesn't open a draft.
     if data == "lastsample:again":
         await cmd_lastsample(update, ctx)
         return
-
-    # /lastsample disambiguation — user tapped 'Product Name' or
-    # 'Customer Name' on the disambig prompt. Callback data:
-    #   lsd:p:<query>   → search Product Name only
-    #   lsd:c:<query>   → search Customer Name only
-    # The query is encoded in the callback (truncated to fit Telegram's
-    # 64-byte limit) so the choice survives worker switches.
-    if data.startswith("lsd:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            return
-        choice, qtext = parts[1], parts[2]
-        if choice not in ("p", "c") or not qtext:
-            return
-        mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
-            sheets.get_user_mms_name,
-            update.effective_user.id, update.effective_user.username,
-        )
-        if not mms:
-            await send(
-                update,
-                "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
-                "on the <i>Authorized Users</i> tab, then re-run /lastsample.",
-            )
-            return
-        ctx.user_data["lastsample_mms_name"] = mms
-        forced = "product" if choice == "p" else "customer"
-        await _run_lastsample_search(update, ctx, mms, qtext, prev="", mode=forced)
+    if data == "lastsample:again_all":
+        await cmd_alllastsample(update, ctx)
         return
 
-    # /lastsample customer pick — user tapped a customer suggestion. The
-    # callback_data is 'lsc:<hash>' where hash = first 10 hex chars of the
-    # customer name's md5. We re-derive the customer list from FSL on
-    # whichever worker handles the click and find the one whose hash
-    # matches. State-free → survives multi-replica deploys, the 5-min
-    # ctx.user_data window, and process restarts.
-    if data.startswith("lsc:"):
+    # /lastsample disambiguation — user tapped 'Product Name' or
+    # 'Customer Name' on the disambig prompt. Two prefix flavours:
+    #   lsd:p:<q> / lsd:c:<q>        → self-scope (rep-only)
+    #   lsdall:p:<q> / lsdall:c:<q>  → all-scope (admin)
+    # Query is encoded in the callback so the choice survives worker
+    # switches without ctx.user_data.
+    if data.startswith("lsd:") or data.startswith("lsdall:"):
+        ds_scope = "all" if data.startswith("lsdall:") else "self"
+        body = data.split(":", 1)[1]  # 'p:<query>' or 'c:<query>'
+        parts = body.split(":", 1)
+        if len(parts) < 2:
+            return
+        choice, qtext = parts[0], parts[1]
+        if choice not in ("p", "c") or not qtext:
+            return
+        # Admin gate: 'all' callbacks are restricted in case someone
+        # forwards an admin's button into a non-admin's chat.
+        if ds_scope == "all" and not _is_update_sample_owner(update.effective_user):
+            await send(update, "🛑 <b>Admin only.</b> /alllastsample is restricted.")
+            return
+        # Resolve mms only when needed for self-scope.
+        mms = ""
+        if ds_scope == "self":
+            mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
+                sheets.get_user_mms_name,
+                update.effective_user.id, update.effective_user.username,
+            )
+            if not mms:
+                await send(
+                    update,
+                    "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
+                    "on the <i>Authorized Users</i> tab, then re-run /lastsample.",
+                )
+                return
+            ctx.user_data["lastsample_mms_name"] = mms
+        ctx.user_data["lastsample_scope"] = ds_scope
+        forced = "product" if choice == "p" else "customer"
+        await _run_lastsample_search(
+            update, ctx, mms, qtext, prev="", mode=forced, scope=ds_scope,
+        )
+        return
+
+    # /lastsample customer pick — user tapped a customer suggestion. Two
+    # prefix flavours:
+    #   lsc:<hash>     → self-scope; load this rep's FSL rows
+    #   lscall:<hash>  → all-scope (admin); load the entire FSL
+    # Hash is first 10 hex chars of the customer name's md5; we re-derive
+    # the candidate set on whichever worker handles the click. State-free.
+    if data.startswith("lsc:") or data.startswith("lscall:"):
+        cs_scope = "all" if data.startswith("lscall:") else "self"
         target_hash = data.split(":", 1)[1].strip()
         if not target_hash:
             return
-        mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
-            sheets.get_user_mms_name,
-            update.effective_user.id, update.effective_user.username,
-        )
-        if not mms:
-            await send(
-                update,
-                "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
-                "on the <i>Authorized Users</i> tab, then re-run /lastsample.",
-            )
+        if cs_scope == "all" and not _is_update_sample_owner(update.effective_user):
+            await send(update, "🛑 <b>Admin only.</b> /alllastsample is restricted.")
             return
-        ctx.user_data["lastsample_mms_name"] = mms
-        # Re-derive the unique customer set this rep has sent to.
+        mms = ""
+        if cs_scope == "self":
+            mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
+                sheets.get_user_mms_name,
+                update.effective_user.id, update.effective_user.username,
+            )
+            if not mms:
+                await send(
+                    update,
+                    "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
+                    "on the <i>Authorized Users</i> tab, then re-run /lastsample.",
+                )
+                return
+            ctx.user_data["lastsample_mms_name"] = mms
+        ctx.user_data["lastsample_scope"] = cs_scope
+        # Re-derive the unique customer set in the right scope.
         try:
-            rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms)
+            if cs_scope == "all":
+                rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
+            else:
+                rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms)
         except Exception as e:  # noqa: BLE001
             log.exception("lastsample: FSL read failed during customer-pick callback")
-            await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _LASTSAMPLE_KB)
+            await send(
+                update,
+                f"😕 Couldn't read Full Sample Listing: {h(str(e))}",
+                _last_kb(cs_scope),
+            )
             return
         seen_customers: set[str] = set()
         for r in rows:
@@ -2367,18 +2521,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         if chosen is None:
             log.warning(
-                "lsc callback: no customer matches hash %s for mms=%r "
+                "lsc callback: no customer matches hash %s for scope=%s mms=%r "
                 "(saw %d customers)",
-                target_hash, mms, len(seen_customers),
+                target_hash, cs_scope, mms, len(seen_customers),
             )
             await send(
                 update,
                 "🤔 Couldn't match that customer in the latest data — please "
                 "tap 🔎 Find another and search again.",
-                _LASTSAMPLE_KB,
+                _last_kb(cs_scope),
             )
             return
-        await _show_customer_samples(update, ctx, mms, chosen)
+        await _show_customer_samples(update, ctx, mms, chosen, scope=cs_scope)
         return
 
     # Main menu and /samples browsing work with or without a draft.
@@ -3970,6 +4124,7 @@ def main():
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("lastsample", cmd_lastsample))
+    app.add_handler(CommandHandler("alllastsample", cmd_alllastsample))
     # /updatesamplelist command retired in V1.7.1. The MMS → FSL sync is
     # now scheduled by the JobQueue setup at the bottom of main().
 

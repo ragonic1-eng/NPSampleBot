@@ -551,6 +551,69 @@ _PP_CODE_RE = re.compile(
 )
 
 
+# V1.12.6 — smarter text match used by /lastsample, /alllastsample, and the
+# 🔎 Search seasonings flow. Three-pass: original substring → alphanumeric-
+# stripped substring (handles "Datong"/"Da tong") → token-level WRatio for
+# typos. Designed to fix the known V1.8.8 false-positive case (peri →
+# pepper) while still catching common typos and spacing variations.
+_ALNUM_ONLY_RE = re.compile(r"[^a-z0-9]+")
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> bool:
+    """Match `query` against `target` with progressive tolerance.
+
+    Pass 1: exact lowercase substring of the original target.
+    Pass 2: alphanumeric-stripped substring (handles spacing & punctuation
+            variations — "Datong" → "Da tong", "S.G. Foods" → "sg foods").
+    Pass 3: rapidfuzz WRatio against each whitespace-tokenised target term
+            AND the squished-target string. Threshold 80 is high enough to
+            reject the V1.8.8 false-positive (peri → pepper, score 77) but
+            low enough to catch common typos:
+                rendnag → rendang seasoning  → 86
+                rendng  → rendang seasoning  → 92
+                cheez   → cheese seasoning   → 80
+                Datng   → Da tong            → 91
+            Pass 3 only runs for queries with ≥ 4 alphanumeric characters,
+            so 'peri' (4 chars but score 77) and shorter queries are
+            handled by Pass 1/2 only and fuzzy can't kick in.
+
+    Code matching should stay STRICT and is handled separately by callers
+    — fuzzy on product codes would be too risky (a 1-char distance could
+    match the wrong SKU).
+    """
+    if not query or not target:
+        return False
+    q_low = query.lower().strip()
+    t_low = target.lower().strip()
+    # Pass 1
+    if q_low and q_low in t_low:
+        return True
+    # Pass 2
+    qn = _ALNUM_ONLY_RE.sub("", q_low)
+    if not qn:
+        return False
+    tn = _ALNUM_ONLY_RE.sub("", t_low)
+    if qn in tn:
+        return True
+    # Pass 3 — fuzzy fallback (only for non-trivial queries)
+    if len(qn) < 4:
+        return False
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        return False
+    # Compare against every whitespace token AND the full squished string,
+    # so 'rendnag' matches 'rendang' (token) even though the full target
+    # 'rendang seasoning' would dilute the WRatio.
+    target_tokens = _TOKEN_RE.findall(t_low)
+    target_tokens.append(tn)
+    for tok in target_tokens:
+        if tok and fuzz.WRatio(qn, tok) >= fuzzy_threshold:
+            return True
+    return False
+
+
 def _dedupe_codes(codes: list[str], cap: int = 5) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -1240,8 +1303,11 @@ async def _run_seasoning_search(
         rows = [r for r in rows
                 if _row_price(r) is not None and 0 < _row_price(r) <= max_price]
 
-    # Strict containment matching — same rules as /lastsample so behaviour
-    # is consistent across both flows.
+    # V1.12.6: smart match (spacing/typo-tolerant) on Product Name +
+    # exact substring on code & taste describe. Code stays strict because
+    # fuzzy on codes is risky. Taste stays strict-ish because the heuristic
+    # taste descriptions overlap heavily and fuzzy would cross-match
+    # unrelated products.
     if cleaned:
         _word_re = re.compile(r"[a-z0-9]+")
         _STOPWORDS = {"and", "or", "the", "of", "with", "in", "for", "to"}
@@ -1257,20 +1323,26 @@ async def _run_seasoning_search(
             name = (row.get("Product Name") or "").lower()
             code = (row.get("Product Code") or "").lower()
             taste = (row.get("Taste describe") or "").lower()
-            if q_lower in code or q_lower in name or q_lower in taste:
+            # Code & taste — exact substring (strict).
+            if q_lower in code or q_lower in taste:
                 return True
-            if not q_tokens:
-                return False
-            # Tokens may appear in name OR taste describe (so 'spicy
-            # chicken' matches a product whose name says 'CHICKEN' and
-            # whose taste describe mentions 'spicy savoury chicken').
-            haystack_tokens = _tokens(name) + _tokens(taste)
-            if not haystack_tokens:
-                return False
-            for qt in q_tokens:
-                if not any(qt in nt for nt in haystack_tokens):
-                    return False
-            return True
+            # Name — smart match (handles spacing & typos).
+            if _smart_text_match(cleaned, name):
+                return True
+            # Multi-word AND check across name + taste (precision filter
+            # for queries like "spicy chicken below 4 usd"). Kept strict
+            # so this branch doesn't open up unrelated products.
+            if q_tokens and len(q_tokens) > 1:
+                haystack_tokens = _tokens(name) + _tokens(taste)
+                if haystack_tokens:
+                    ok = True
+                    for qt in q_tokens:
+                        if not any(qt in nt for nt in haystack_tokens):
+                            ok = False
+                            break
+                    if ok:
+                        return True
+            return False
 
         matches = [r for r in rows if _matches(r)]
     else:
@@ -1561,46 +1633,52 @@ async def _run_lastsample_search(
     def _matches(row: dict) -> bool:
         name = (row.get("Product Name") or "").lower()
         code = (row.get("Product Code") or "").lower()
-        # Whole-string substring shortcuts — handles 'S-668', exact-name
-        # copy/paste, and multi-word phrases that happen to appear verbatim.
+        # Code matching stays STRICT — codes are precise and a 1-char
+        # fuzzy match could route to the wrong SKU. Substring is fine:
+        # typing 'S-668' should still surface 'S-668U1-02'.
         if q and q in code:
             return True
-        if q and q in name:
+        # Product NAME — smart match (handles spacing, punctuation, typos).
+        # V1.12.6: was strict containment which missed 'Datong' → 'Da tong'
+        # and 'rendnag' → 'rendang'. Now uses _smart_text_match which
+        # progressively relaxes (exact → alphanumeric-stripped → fuzzy).
+        if _smart_text_match(query, name):
             return True
-        # Otherwise: every meaningful token from the query must appear
-        # INSIDE some token of the name. Strictly one-directional so
-        # 'siracha' does NOT match a 'cha' token (the V1.8.8 bug — 'cha'
-        # in 'siracha' was True, falsely matching SHA CHA SAUCE). Typing a
-        # prefix still works ('tom' is in 'tomato'); typing a plural form
-        # of a singular product name will not match — user can adjust.
-        if not q_tokens:
-            return False
-        name_tokens = _tokens(name)
-        if not name_tokens:
-            return False
-        for qt in q_tokens:
-            if not any(qt in nt for nt in name_tokens):
-                return False
-        return True
+        # Multi-word AND check (kept as a precision filter for queries
+        # like "spicy chicken below 4 usd"): if the user typed multiple
+        # tokens, every meaningful token must appear somewhere in the
+        # name (substring inside a name token in EITHER direction).
+        if q_tokens and len(q_tokens) > 1:
+            name_tokens = _tokens(name)
+            if name_tokens:
+                ok = True
+                for qt in q_tokens:
+                    if not any(qt in nt for nt in name_tokens):
+                        ok = False
+                        break
+                if ok:
+                    return True
+        return False
 
     # === Compute both match sets up front (when mode allows). ===
     # Product matches.
     product_candidates = [r for r in rows if _matches(r)] if mode in ("auto", "product") else []
 
-    # Customer matches. Substring rules are slightly looser than product
-    # matching: each query token must appear ANYWHERE inside the full
-    # customer name string, not just within a single name token. Customer
-    # names have heavy punctuation and abbreviations (Pte Ltd, Co.,
-    # parentheses…) so token-boundary matching would be too strict.
+    # Customer matches. V1.12.6: routed through _smart_text_match so
+    # 'Datong' finds 'Da tong group' (alphanumeric-stripped substring),
+    # and typos like 'Datng' fuzzy-match 'Da tong' (WRatio ≥ 80). The
+    # existing token-AND check is also kept so multi-word queries like
+    # 'q land' still narrow correctly to 'queensland trading' even when
+    # the squished form ('qland') happens to substring-match.
     def _customer_matches(cust_name: str) -> bool:
         cn = (cust_name or "").lower()
         if not cn:
             return False
-        if q and q in cn:
+        if _smart_text_match(query, cn):
             return True
-        if not q_tokens:
-            return False
-        return all(qt in cn for qt in q_tokens)
+        if q_tokens and len(q_tokens) > 1 and all(qt in cn for qt in q_tokens):
+            return True
+        return False
 
     from datetime import date as _date
     SENTINEL = _date(1900, 1, 1)

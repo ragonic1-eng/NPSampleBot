@@ -34,8 +34,17 @@ import config
 
 log = logging.getLogger(__name__)
 
-# Same shape NPProductBot uses — must start with "S-" then 3+ alnum, optional dash + suffix.
-_CODE_RE = re.compile(r"\bS-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,4})?\b", re.IGNORECASE)
+# Match seasoning codes from OCR output. V1.12.1: aligned with bot.py's
+# _PP_CODE_RE — [SJTB]- + 3+ alnum + up to 6 suffix segments of up to 6
+# chars each. Was previously S-only with one short suffix; that truncated
+# multi-segment codes like B-39HA1-23-02 → B-39HA1-23 and silently
+# returned the wrong product. Same prefix set as bot.py so OCR and code-
+# entry behave identically across S- (Singapore), B- (legacy Singapore),
+# J- (Indonesia), T- (Thailand, when ready).
+_CODE_RE = re.compile(
+    r"\b[SJTB]-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,6}\b",
+    re.IGNORECASE,
+)
 
 # Per-character ambiguity table. Each set is "chars Sonnet might confuse with
 # this one." We try every swap when a code fails catalog validation.

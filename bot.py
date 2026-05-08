@@ -541,9 +541,12 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #           T- (Thailand, Bangkok factory). find_fsl_product_by_code in
 #           sheets.py auto-routes by prefix to the matching tab, so /pp
 #           and the new search just need to extract the code.
-# Anchored on [SJT]- + 3+ alphanumerics so we don't grab unrelated tokens.
+#   V1.12.1: added B- (legacy / older codes that share the Singapore
+#           tab — 205 of them survived in FSL after the Jakarta cleanup,
+#           and reps still look them up). Same factory routing as S-.
+# Anchored on [SJTB]- + 3+ alphanumerics so we don't grab unrelated tokens.
 _PP_CODE_RE = re.compile(
-    r"\b[SJT]-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,6}\b",
+    r"\b[SJTB]-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,6}\b",
     re.IGNORECASE,
 )
 

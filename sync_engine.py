@@ -78,6 +78,7 @@ def _process_region(
     region_rows: list["mms_client.SampleRow"],
     haiku_client,
     metrics: dict,
+    skip_enrichment: bool = False,
 ) -> dict:
     """Dedupe → enrich → append → sort for one region. Returns a stats dict.
 
@@ -85,6 +86,13 @@ def _process_region(
     self-cache logic is fully isolated per region. Singapore's existing
     behaviour is unchanged because it goes through the same code path with
     country='derive'.
+
+    skip_enrichment=True writes blank taste/category and still hardcodes
+    'Indonesia' for J- country. Used by the V1.11.0 backfill so we don't
+    burn API credits — Sonnet does the enrichment in chat afterwards
+    against the populated rows. Singapore mode + skip is still safe (would
+    leave country blank for unmapped customers, but the backfill never
+    targets Singapore with skip_enrichment=True).
     """
     tab, country_mode = _REGIONS[region]
 
@@ -183,41 +191,66 @@ def _process_region(
 
     enriched: list[list[str]] = []
     for r in new_rows:
-        country, country_src = _resolve_country_tracked(r)
-        metrics[f"country_{country_src}"] += 1
+        if skip_enrichment:
+            # Country still hardcoded for Indonesia mode; for derive mode
+            # we only use the FREE lookups (raw country / customer map /
+            # tokens / suffix) — skip the Haiku fallback. Empty if nothing
+            # cheap matches.
+            if country_mode == "Indonesia":
+                country = "Indonesia"
+            else:
+                country = ""
+                if (r.country or "").strip():
+                    country = enrich.normalize_country(r.country)
+                elif r.customer_name:
+                    cust_norm = " ".join(r.customer_name.lower().split())
+                    if customer_map.get(cust_norm):
+                        country = enrich.normalize_country(customer_map[cust_norm])
+                    elif enrich._country_from_tokens(r.customer_name):
+                        country = enrich._country_from_tokens(r.customer_name)
+                    elif enrich._country_from_suffix(r.customer_name):
+                        country = enrich._country_from_suffix(r.customer_name)
+            metrics["country_free"] += 1
+            taste = ""
+            category = ""
+            metrics["taste_free"] += 1
+            metrics["category_free"] += 1
+        else:
+            country, country_src = _resolve_country_tracked(r)
+            metrics[f"country_{country_src}"] += 1
 
-        code_upper = (r.product_code or "").strip().upper()
-        # Taste source classification (for cost reporting).
-        taste_src = "haiku"
-        if not code_upper:
-            taste_src = "free"
-        elif fsl_taste_map.get(code_upper):
-            taste_src = "free"
-        elif code_upper in taste_cache and taste_cache[code_upper]:
-            taste_src = "free"
-        taste = enrich.resolve_taste(
-            code=r.product_code, name=r.product_name,
-            taste_cache=taste_cache, haiku_client=haiku_client,
-            fsl_map=fsl_taste_map,
-        )
-        metrics[f"taste_{taste_src}"] += 1
+            code_upper = (r.product_code or "").strip().upper()
+            # Taste source classification (for cost reporting).
+            taste_src = "haiku"
+            if not code_upper:
+                taste_src = "free"
+            elif fsl_taste_map.get(code_upper):
+                taste_src = "free"
+            elif code_upper in taste_cache and taste_cache[code_upper]:
+                taste_src = "free"
+            taste = enrich.resolve_taste(
+                code=r.product_code, name=r.product_name,
+                taste_cache=taste_cache, haiku_client=haiku_client,
+                fsl_map=fsl_taste_map,
+            )
+            metrics[f"taste_{taste_src}"] += 1
 
-        # Category source classification.
-        cat_src = "haiku"
-        if not code_upper:
-            cat_src = "free"
-        elif code_upper in tab_map:
-            cat_src = "free"
-        elif fsl_category_map.get(code_upper) in enrich.CATEGORIES:
-            cat_src = "free"
-        elif code_upper in category_cache and category_cache[code_upper] in enrich.CATEGORIES:
-            cat_src = "free"
-        category = enrich.resolve_category(
-            code=r.product_code, name=r.product_name,
-            tab_map=tab_map, category_cache=category_cache,
-            haiku_client=haiku_client, fsl_map=fsl_category_map,
-        )
-        metrics[f"category_{cat_src}"] += 1
+            # Category source classification.
+            cat_src = "haiku"
+            if not code_upper:
+                cat_src = "free"
+            elif code_upper in tab_map:
+                cat_src = "free"
+            elif fsl_category_map.get(code_upper) in enrich.CATEGORIES:
+                cat_src = "free"
+            elif code_upper in category_cache and category_cache[code_upper] in enrich.CATEGORIES:
+                cat_src = "free"
+            category = enrich.resolve_category(
+                code=r.product_code, name=r.product_name,
+                tab_map=tab_map, category_cache=category_cache,
+                haiku_client=haiku_client, fsl_map=fsl_category_map,
+            )
+            metrics[f"category_{cat_src}"] += 1
 
         enriched.append([
             r.sales,
@@ -260,6 +293,7 @@ def run_mms_to_fsl_sync(
     force: bool = False,
     start_override: dt.date | None = None,
     regions: tuple[str, ...] = ("S", "J"),
+    skip_enrichment: bool = False,
 ) -> dict:
     """Pull fresh sample submissions from MMS and append new ones to the
     matching FSL tab. Both Singapore (S-) and Indonesia (J-) are processed
@@ -370,7 +404,10 @@ def run_mms_to_fsl_sync(
     for region in regions:
         region_rows = rows_by_region.get(region, [])
         try:
-            res = _process_region(region, region_rows, haiku_client, metrics)
+            res = _process_region(
+                region, region_rows, haiku_client, metrics,
+                skip_enrichment=skip_enrichment,
+            )
         except Exception as e:  # noqa: BLE001
             log.exception("sync_engine: region %s failed", region)
             res = {
@@ -415,6 +452,7 @@ if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     force = "--force" in sys.argv
+    skip_enrichment = "--skip-enrichment" in sys.argv
     # Optional region filter: --region=S or --region=J
     regions = ("S", "J")
     for arg in sys.argv:
@@ -430,5 +468,8 @@ if __name__ == "__main__":
                 ).date()
             except ValueError:
                 pass
-    result = run_mms_to_fsl_sync(force=force, regions=regions, start_override=start_override)
+    result = run_mms_to_fsl_sync(
+        force=force, regions=regions, start_override=start_override,
+        skip_enrichment=skip_enrichment,
+    )
     print(json.dumps(result, indent=2, default=str))

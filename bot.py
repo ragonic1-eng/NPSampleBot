@@ -1412,11 +1412,25 @@ async def _run_seasoning_search(
         rows = [r for r in rows
                 if _row_price(r) is not None and 0 < _row_price(r) <= max_price]
 
-    # V1.12.6: smart match (spacing/typo-tolerant) on Product Name +
-    # exact substring on code & taste describe. Code stays strict because
-    # fuzzy on codes is risky. Taste stays strict-ish because the heuristic
-    # taste descriptions overlap heavily and fuzzy would cross-match
-    # unrelated products.
+    # V1.12.11 — name-priority matching with taste fallback.
+    #
+    # Reps want results where the QUERY appears in the Product Name
+    # first. Taste describe is a useful fallback only when nothing
+    # matches by name. Previously the matcher treated name and taste
+    # equally, which produced confusing results like 'KOPI SEASONING'
+    # showing up for a query of 'BBQ' just because the taste describe
+    # mentioned BBQ-style smoke notes.
+    #
+    # Scoring rules per row:
+    #   • Code substring match  → score = max + 1 (highest priority)
+    #   • Smart name match      → score = max (handles typos/spacing)
+    #   • # of query tokens that appear in the name → graded score
+    #   • No name hit + taste hit → score = 0, flagged 'taste_only'
+    # Rows with score > 0 OR taste_only are kept; sorted by
+    # (score desc, date desc); deduped by code.
+    matches: list[dict] = []
+    matches_taste_only: set[str] = set()  # codes flagged as taste-only
+
     if cleaned:
         _word_re = re.compile(r"[a-z0-9]+")
         _STOPWORDS = {"and", "or", "the", "of", "with", "in", "for", "to"}
@@ -1428,32 +1442,92 @@ async def _run_seasoning_search(
         q_lower = cleaned.lower()
         q_tokens = _tokens(cleaned)
 
-        def _matches(row: dict) -> bool:
+        # V1.12.11 — TF-weighted name scoring. For a multi-token query,
+        # rarer tokens contribute more to the score. This matches user
+        # intent: typing 'peri hot spicy' should surface 'PERI PERI
+        # SEASONING' (rare token 'peri' is the specific keyword) ahead
+        # of generic 'HOT & SPICY SEASONING' (common adjectives).
+        # Token frequency is computed per-call across the in-window
+        # rows we have — close enough to global IDF for our 36-month
+        # dataset and avoids stale precomputed indexes.
+        from collections import Counter as _Counter
+        token_freq: _Counter = _Counter()
+        for _r in rows:
+            token_freq.update(_tokens(_r.get("Product Name") or ""))
+
+        # Per-token weight: 1000 / sqrt(freq), so a token in 1 product
+        # gets ~1000, in 100 products ~100, in 2000 products ~22. The
+        # square root softens the curve so common-but-still-meaningful
+        # terms (chicken, BBQ) still contribute meaningfully.
+        import math
+        def _token_weight(t: str) -> float:
+            f = max(1, token_freq.get(t, 1))
+            return 1000.0 / math.sqrt(f)
+
+        # Sentinel scores: code substring match wins everything; full-
+        # query substring is a clean exact name match.
+        CODE_BONUS = 1_000_000
+        EXACT_NAME_BONUS = 100_000
+
+        def _name_score(row: dict) -> int:
+            """Higher = stronger name match. 0 = no name match."""
             name = (row.get("Product Name") or "").lower()
             code = (row.get("Product Code") or "").lower()
+            if q_lower and q_lower in code:
+                return CODE_BONUS
+            if q_lower and q_lower in name:
+                return EXACT_NAME_BONUS
+            if not q_tokens:
+                # No tokens (e.g. very short query) — try smart match only.
+                if _smart_text_match(cleaned, name):
+                    return 1000  # base hit
+                return 0
+            name_tokens = _tokens(name)
+            if not name_tokens:
+                # Smart match handles spacing/typos when tokens fail.
+                return 1000 if _smart_text_match(cleaned, name) else 0
+            score = 0.0
+            matched_any = False
+            for qt in q_tokens:
+                if any(qt in nt for nt in name_tokens):
+                    matched_any = True
+                    score += _token_weight(qt)
+            if not matched_any and _smart_text_match(cleaned, name):
+                # Spacing/typo fallback when no token literally matched.
+                return 1000
+            return int(score)
+
+        def _taste_match(row: dict) -> bool:
             taste = (row.get("Taste describe") or "").lower()
-            # Code & taste — exact substring (strict).
-            if q_lower in code or q_lower in taste:
+            if not taste:
+                return False
+            if q_lower and q_lower in taste:
                 return True
-            # Name — smart match (handles spacing & typos).
-            if _smart_text_match(cleaned, name):
-                return True
-            # Multi-word AND check across name + taste (precision filter
-            # for queries like "spicy chicken below 4 usd"). Kept strict
-            # so this branch doesn't open up unrelated products.
-            if q_tokens and len(q_tokens) > 1:
-                haystack_tokens = _tokens(name) + _tokens(taste)
-                if haystack_tokens:
-                    ok = True
-                    for qt in q_tokens:
-                        if not any(qt in nt for nt in haystack_tokens):
-                            ok = False
-                            break
-                    if ok:
-                        return True
+            if q_tokens:
+                taste_tokens = _tokens(taste)
+                return any(
+                    any(qt in tt for tt in taste_tokens)
+                    for qt in q_tokens
+                )
             return False
 
-        matches = [r for r in rows if _matches(r)]
+        scored: list[tuple[int, bool, dict]] = []  # (name_score, taste_only, row)
+        for r in rows:
+            ns = _name_score(r)
+            if ns > 0:
+                scored.append((ns, False, r))
+            elif _taste_match(r):
+                scored.append((0, True, r))
+
+        # Sort: name matches first by score desc, then everything by date desc.
+        scored.sort(
+            key=lambda x: (-x[0], -(x[2].get("_date") or SENTINEL).toordinal()),
+        )
+        matches = [r for (_, _, r) in scored]
+        matches_taste_only = {
+            (r.get("Product Code") or "").strip().upper()
+            for (ns, t_only, r) in scored if t_only
+        }
     else:
         # Pure price-filter query — show recent rows matching the cap.
         matches = rows
@@ -1477,12 +1551,10 @@ async def _run_seasoning_search(
         )
         return
 
-    # Dedupe by product code, keeping the most-recent sample event for
-    # each unique code. Reps want to see "10 distinct products that match"
-    # rather than "10 sample events" (which can be the same product
-    # repeated). Sample frequency is included as a small popularity tag
-    # so reps can still tell "this code has been requested often".
-    matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
+    # Dedupe by product code, keeping the FIRST occurrence (which is the
+    # highest-scored or most-recent depending on the sort applied above).
+    # Sample frequency is shown as a tag so reps can tell which products
+    # have been requested often.
     by_code: dict[str, dict] = {}
     code_counts: dict[str, int] = {}
     for r in matches:
@@ -1491,18 +1563,36 @@ async def _run_seasoning_search(
             continue
         code_counts[code] = code_counts.get(code, 0) + 1
         if code not in by_code:
-            by_code[code] = r  # first occurrence is the most recent (already sorted)
-    unique_matches = list(by_code.values())  # already in date-desc order
+            by_code[code] = r
+    unique_matches = list(by_code.values())
     top = unique_matches[:_SEARCH_TOP_N]
     total_unique = len(unique_matches)
     total_events = len(matches)
 
-    # Header. Plural-handling for the count.
+    # Count name vs taste-only buckets in the displayed top-N.
+    n_name = sum(
+        1 for r in top
+        if (r.get("Product Code") or "").strip().upper() not in matches_taste_only
+    )
+    n_taste = len(top) - n_name
+
+    # Header. Plural-handling for the count + a callout when results
+    # split between name matches and taste-only fallbacks.
     header_bits = [f"🔎 <b>{label} — {len(top)} of {total_unique} products</b>"]
     if max_price is not None:
         header_bits.append(f"   <i>≤ ${max_price:g} USD</i>")
     if cleaned:
         header_bits.append(f"   <i>matching “{h(cleaned)}”</i>")
+    if n_name == 0 and n_taste > 0:
+        header_bits.append(
+            "   <i>No matches by product name — showing taste-similar "
+            "recommendations instead.</i>"
+        )
+    elif n_taste > 0:
+        header_bits.append(
+            f"   <i>{n_name} by name · {n_taste} taste-similar fallback"
+            f"{'s' if n_taste != 1 else ''}.</i>"
+        )
     lines: list[str] = header_bits + [""]
 
     def _fmt_price(raw: str) -> str:
@@ -1540,9 +1630,16 @@ async def _run_seasoning_search(
         taste = (r.get("Taste describe") or "").strip()
         category = (r.get("Category") or "").strip()
         n_samples = code_counts.get(code, 1)
+        is_taste_only = code in matches_taste_only
 
-        # Line 1: number + product name (bold).
-        lines.append(f"<b>{i}. {h(name)}</b>")
+        # Line 1: number + product name (bold) + a small flag if this
+        # row matched only by taste (helps the rep distinguish
+        # 'PERI PERI SEASONING' which has the keyword in its name from
+        # 'KOPI SEASONING' which only mentions it in the taste describe).
+        name_line = f"<b>{i}. {h(name)}</b>"
+        if is_taste_only:
+            name_line += "  <i>· taste-similar</i>"
+        lines.append(name_line)
         # Line 2: code · price · date · category · sample count — each piece
         # HTML-escaped at construction so we don't accidentally emit broken
         # markup if a sheet cell contains < > & chars.

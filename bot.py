@@ -576,9 +576,17 @@ def _lastsample_query_tokens(s: str) -> list[str]:
 
 def _match_lastsample_product(row: dict, query: str) -> bool:
     """Match a single FSL row against `query` for the /lastsample +
-    /alllastsample product search. Three layers:
-      1. Code substring (strict — fuzzy on a code could route to the
-         wrong SKU).
+    /alllastsample product search.
+
+    V1.12.8: when the query is itself a product code (matches
+    _PP_CODE_RE), we match ONLY against the code column — not against
+    name or taste. Reps typing a code want THAT code; running fuzzy
+    name match on a code-shaped query produced bizarre cross-prefix
+    false positives (e.g. 'J-54Df1-04' → 'TEXTURE & FLAVOUR IMPROVER
+    #2-04' because '04' is a target token).
+
+    Otherwise, three layers:
+      1. Code substring (strict — fuzzy on a code is too risky).
       2. Product name smart match (V1.12.6 — handles spacing & typos).
       3. Multi-word AND check across name tokens (precision filter for
          queries like 'spicy chicken below 4 usd').
@@ -586,6 +594,14 @@ def _match_lastsample_product(row: dict, query: str) -> bool:
     name = (row.get("Product Name") or "").lower()
     code = (row.get("Product Code") or "").lower()
     q = (query or "").lower().strip()
+
+    # Code-shaped query: search codes only.
+    if _PP_CODE_RE.fullmatch(q.upper()) or _PP_CODE_RE.search(q.upper()):
+        # The query looks like a code (or contains one). Match strictly
+        # against the row's code — substring is fine so a base 'S-668'
+        # surfaces all '-XX' variants.
+        return bool(q) and q in code
+
     if q and q in code:
         return True
     if _smart_text_match(query, name):
@@ -656,7 +672,14 @@ def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> boo
     # Compare against every whitespace token AND the full squished string,
     # so 'rendnag' matches 'rendang' (token) even though the full target
     # 'rendang seasoning' would dilute the WRatio.
-    target_tokens = _TOKEN_RE.findall(t_low)
+    #
+    # Skip very short target tokens (< 4 chars) — V1.12.8 fix. Short
+    # numeric tokens like '04' or '12' inside a target like 'TEXTURE
+    # FLAVOUR IMPROVER #2-04' get partial_ratio = 100 against any query
+    # whose squished form contains those digits (e.g. 'J-54Df1-04' →
+    # 'j54df104' contains '04'). That produced the bizarre false match
+    # where typing a J-code returned an unrelated S-code product.
+    target_tokens = [t for t in _TOKEN_RE.findall(t_low) if len(t) >= 4]
     target_tokens.append(tn)
     for tok in target_tokens:
         if tok and fuzz.WRatio(qn, tok) >= fuzzy_threshold:
@@ -1682,39 +1705,14 @@ async def _run_lastsample_search(
     q = query.lower().strip()
     q_tokens = _tokens(query)
 
-    def _matches(row: dict) -> bool:
-        name = (row.get("Product Name") or "").lower()
-        code = (row.get("Product Code") or "").lower()
-        # Code matching stays STRICT — codes are precise and a 1-char
-        # fuzzy match could route to the wrong SKU. Substring is fine:
-        # typing 'S-668' should still surface 'S-668U1-02'.
-        if q and q in code:
-            return True
-        # Product NAME — smart match (handles spacing, punctuation, typos).
-        # V1.12.6: was strict containment which missed 'Datong' → 'Da tong'
-        # and 'rendnag' → 'rendang'. Now uses _smart_text_match which
-        # progressively relaxes (exact → alphanumeric-stripped → fuzzy).
-        if _smart_text_match(query, name):
-            return True
-        # Multi-word AND check (kept as a precision filter for queries
-        # like "spicy chicken below 4 usd"): if the user typed multiple
-        # tokens, every meaningful token must appear somewhere in the
-        # name (substring inside a name token in EITHER direction).
-        if q_tokens and len(q_tokens) > 1:
-            name_tokens = _tokens(name)
-            if name_tokens:
-                ok = True
-                for qt in q_tokens:
-                    if not any(qt in nt for nt in name_tokens):
-                        ok = False
-                        break
-                if ok:
-                    return True
-        return False
-
     # === Compute both match sets up front (when mode allows). ===
-    # Product matches.
-    product_candidates = [r for r in rows if _matches(r)] if mode in ("auto", "product") else []
+    # Product matches — use the top-level helper so the matching rules
+    # (code-shape detection, smart text match, AND-tokens fallback) are
+    # identical to what the lspr: pagination callback uses.
+    product_candidates = (
+        [r for r in rows if _match_lastsample_product(r, query)]
+        if mode in ("auto", "product") else []
+    )
 
     # Customer matches. V1.12.6: routed through _smart_text_match so
     # 'Datong' finds 'Da tong group' (alphanumeric-stripped substring),

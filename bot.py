@@ -1449,18 +1449,42 @@ async def _run_seasoning_search(
         rate = _USD_RATE.get(cur_norm)
         return v * rate if rate is not None else None
 
-    soft_price_fallback = False
+    # V1.12.13 — price cap is now a SOFT ranking signal, not a hard
+    # filter. Why: a search like 'hot squid below 4.5' was returning 10
+    # products that match 'hot' but NONE related to squid, because all
+    # 4 squid products were over the cap. The rep wanted to see the
+    # squid options even at $4.63 — they can decide whether to push for
+    # a cheaper variant. Hiding the relevant matches entirely was
+    # actively misleading.
+    #
+    # New behaviour:
+    #   • All rows go through scoring + sorting.
+    #   • In-budget items rank higher when scores tie (so a strictly
+    #     in-budget exact-match wins).
+    #   • Over-budget items still appear, with a '⚠️ over $X' marker
+    #     in the meta line.
+    #   • Header reflects whether the result mix is mostly in-budget or
+    #     mostly above (so the rep knows what they're looking at).
+    #
+    # We compute the over-budget set up front so the renderer can flag
+    # individual rows without re-parsing prices.
+    over_budget_codes: set[str] = set()
+    n_over_budget_total = 0
     if max_price is not None:
-        before = list(rows)  # remember pre-filter set for soft fallback
-        rows = [r for r in rows
-                if _row_price_usd(r) is not None
-                and _row_price_usd(r) <= max_price]
-        if not rows:
-            # Strict filter killed everything → fall back to no-cap so the
-            # rep can see closest-to-budget products. We surface the
-            # trade-off in the header so they know we softened the filter.
-            rows = before
-            soft_price_fallback = True
+        for r in rows:
+            usd = _row_price_usd(r)
+            code = (r.get("Product Code") or "").strip().upper()
+            if usd is None:
+                # Unknown currency / missing price — treat as over budget
+                # so it doesn't displace known in-budget rows. Reps still
+                # see it via the marker.
+                if code:
+                    over_budget_codes.add(code)
+                n_over_budget_total += 1
+            elif usd > max_price:
+                if code:
+                    over_budget_codes.add(code)
+                n_over_budget_total += 1
 
     # V1.12.11 — name-priority matching with taste fallback.
     #
@@ -1569,10 +1593,20 @@ async def _run_seasoning_search(
             elif _taste_match(r):
                 scored.append((0, True, r))
 
-        # Sort: name matches first by score desc, then everything by date desc.
-        scored.sort(
-            key=lambda x: (-x[0], -(x[2].get("_date") or SENTINEL).toordinal()),
-        )
+        # Sort: name score desc → in-budget first when scores tie → date
+        # desc. The in-budget tiebreaker means a strictly-in-budget
+        # 100,000-score row beats an over-budget 100,000-score row, but
+        # an over-budget 340-score row (e.g. HOT & SPICY SQUID for the
+        # 'hot squid' query) still beats an in-budget 51-score row
+        # (HOT CHICKEN matching only the common 'hot' token).
+        def _sort_key(x):
+            ns, _t_only, r = x
+            code = (r.get("Product Code") or "").strip().upper()
+            in_budget = 0 if code not in over_budget_codes else 1
+            d = r.get("_date") or SENTINEL
+            return (-ns, in_budget, -d.toordinal())
+
+        scored.sort(key=_sort_key)
         matches = [r for (_, _, r) in scored]
         matches_taste_only = {
             (r.get("Product Code") or "").strip().upper()
@@ -1626,17 +1660,28 @@ async def _run_seasoning_search(
     )
     n_taste = len(top) - n_name
 
-    # Header. Plural-handling for the count + a callout when results
-    # split between name matches and taste-only fallbacks.
+    # Count over-budget items in the displayed top-N (for header callout).
+    n_over_budget_shown = sum(
+        1 for r in top
+        if (r.get("Product Code") or "").strip().upper() in over_budget_codes
+    )
+
+    # Header. Plural-handling for the count + callouts for taste-only
+    # fallback and over-budget items in the visible page.
     header_bits = [f"🔎 <b>{label} — {len(top)} of {total_unique} products</b>"]
     if max_price is not None:
-        if soft_price_fallback:
+        if n_over_budget_shown == 0:
+            header_bits.append(f"   <i>≤ ${max_price:g} USD</i>")
+        elif n_over_budget_shown == len(top):
             header_bits.append(
                 f"   ⚠️ <i>No products under <b>${max_price:g} USD</b> — "
                 "showing closest above-budget options.</i>"
             )
         else:
-            header_bits.append(f"   <i>≤ ${max_price:g} USD</i>")
+            header_bits.append(
+                f"   <i>${max_price:g} USD budget · {n_over_budget_shown} "
+                f"of {len(top)} are over budget (relevance-ranked).</i>"
+            )
     if cleaned:
         header_bits.append(f"   <i>matching “{h(cleaned)}”</i>")
     if n_name == 0 and n_taste > 0:
@@ -1687,14 +1732,17 @@ async def _run_seasoning_search(
         category = (r.get("Category") or "").strip()
         n_samples = code_counts.get(code, 1)
         is_taste_only = code in matches_taste_only
+        is_over_budget = code in over_budget_codes
 
-        # Line 1: number + product name (bold) + a small flag if this
-        # row matched only by taste (helps the rep distinguish
-        # 'PERI PERI SEASONING' which has the keyword in its name from
-        # 'KOPI SEASONING' which only mentions it in the taste describe).
+        # Line 1: number + product name (bold) + small flags for taste-
+        # similar fallback (didn't match by name) and over-budget (price
+        # exceeds the rep's filter — but matched their keywords so we
+        # surface it anyway with a clear marker).
         name_line = f"<b>{i}. {h(name)}</b>"
         if is_taste_only:
             name_line += "  <i>· taste-similar</i>"
+        if is_over_budget and max_price is not None:
+            name_line += f"  ⚠️ <i>over ${max_price:g}</i>"
         lines.append(name_line)
         # Line 2: code · price · date · category · sample count — each piece
         # HTML-escaped at construction so we don't accidentally emit broken

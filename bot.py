@@ -437,7 +437,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     #     that lets reps explore the SG / ID / TH sample history without
     #     raising a sample request
     menu = [
-        [("🌶 Find a seasoning & raise request", "menu:new")],
+        [("🌶 Raise a sample request", "menu:new")],
         [("🔎 Search seasonings", "menu:search")],
         [("📷 Scan a product photo", "menu:scan")],
         [("✏️ Enter a code (price lookup)", "menu:code")],
@@ -2010,15 +2010,19 @@ async def ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE, d: state.Draft):
 
 
 async def q_seasoning(update, ctx, d: state.Draft):
+    # V1.12.3 — this stage is now CODE-ONLY. Browsing/search has moved to
+    # the standalone 🔎 Search seasonings button. If the rep doesn't have
+    # a code yet they should pop back to the main menu and search there.
     current = d.data.get("seasoning", "")
     hint = f"\n\nCurrent: <i>{h(current)}</i>" if current else ""
     await send(
         update,
         "🌶 <b>Seasoning Requested</b>\n\n"
-        "Type what you're looking for — I'll suggest the closest matches.\n\n"
-        "💡 You can add filters: "
-        "<i>cheese for bangladesh</i> · <i>bbq under $3</i> · "
-        "<i>spicy chinese style</i>" + hint,
+        "Paste the <b>product code</b> you want to send a sample of.\n\n"
+        "<i>Examples:</i> <code>S-668U1</code>, <code>J-49JS1-03</code>, "
+        "<code>B-39HA1-23</code>\n\n"
+        "<i>Don't have a code yet? Tap 🏠 Main menu → 🔎 Search seasonings "
+        "to find one first.</i>" + hint,
         kb([nav_row(include_back=False)]),
     )
     d.sub = "ask"
@@ -2643,214 +2647,149 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
-    chat = update.effective_chat
+    """Code-only entry handler (V1.12.3+).
 
-    # Conversational refinement: keep a short query history within the same
-    # seasoning-stage session. Each new line the user types ADDS to their
-    # search intent rather than replacing it. So:
-    #   "instant soup seasoning"  → search "instant soup seasoning"
-    #   then "i want more spicy"  → search "instant soup seasoning · spicy"
-    # Cleared when the user picks a candidate, taps "🔄 Start over", or
-    # cancels the draft.
-    history: list[str] = list(ctx.user_data.get("seasoning_queries", []))
-    history.append(text)
-    # Cap history so it doesn't grow forever — only the last 4 turns count.
-    if len(history) > 4:
-        history = history[-4:]
-    ctx.user_data["seasoning_queries"] = history
-    combined_query = " · ".join(history)
+    The 'find a seasoning' search step has moved to the standalone 🔎
+    Search seasonings menu button. This stage now strictly accepts a
+    product code — anything else gets a friendly redirect to the search
+    flow. Lookup cascade:
+      1. Seasoning Master sheet (S-codes — full catalog with category
+         and curated price). Best UX when present because category info
+         drives downstream stages (e.g. quantity question for oils).
+      2. FSL / Jakarta tab via sheets.find_fsl_product_by_code, which
+         already auto-routes by [SJTB]- prefix. Picks up J-codes (no
+         Master entry yet), legacy B-codes, and any S-code that's in
+         the sample tab but not yet in Master.
+      3. Otherwise: tell the rep we couldn't find it.
+    """
+    chat = update.effective_chat
+    text = (text or "").strip()
+
+    # Step 0: must be a recognisable code. _PP_CODE_RE matches [SJTB]-XXX
+    # with up to 6 suffix segments (same shape /pp accepts).
+    code_hits = _PP_CODE_RE.findall(text)
+    if not code_hits:
+        await send(
+            update,
+            "🤔 That doesn't look like a product code.\n\n"
+            "Please paste a code like <code>S-668U1</code>, "
+            "<code>J-49JS1-03</code>, or <code>B-39HA1-23</code>.\n\n"
+            "<i>Don't have a code yet? Tap 🏠 Main menu → 🔎 Search "
+            "seasonings to find one first.</i>",
+            kb([
+                [("🏠 Main menu", "menu:home")],
+                [("🔎 Search seasonings", "menu:search")],
+                nav_row(include_back=False),
+            ]),
+        )
+        return
+    code = code_hits[0].upper()
 
     try:
         await chat.send_action("typing")
     except Exception:  # noqa: BLE001
         pass
-    # Visible loader so the user knows we're working.
-    placeholder = None
-    try:
-        placeholder = await chat.send_message(
-            "🔍 Searching the catalog…",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:  # noqa: BLE001
-        placeholder = None
 
-    async def _drop_loader() -> None:
-        if placeholder is not None:
-            try:
-                await placeholder.delete()
-            except Exception:  # noqa: BLE001 — message may have been edited/deleted
-                pass
-
+    # Step 1: Try the Seasoning Master sheet first (S-codes get richer
+    # category data here). find_codes_matching also handles base→variant
+    # expansion, so a base "S-668U1" surfaces all "-XX" SKUs for the user
+    # to pick from.
     try:
         seasonings = await asyncio.to_thread(sheets.load_seasonings)
     except Exception as e:  # noqa: BLE001
-        log.exception("load_seasonings failed: %s", e)
-        await _drop_loader()
-        await send(update, "⚠️ Couldn't read the seasoning master sheet. Continuing with your text.")
-        d.data["seasoning"] = text
-        d.matched_code = ""
-        d.matched_price = ""
-        ctx.user_data.pop("seasoning_queries", None)
-        await _advance(update, ctx, d)
-        return
+        log.warning("load_seasonings failed (continuing with FSL fallback): %s", e)
+        seasonings = []
 
-    # Code-first match: if the user pasted a product code (exact, prefix or
-    # suffix-trim variant), skip fuzzy name search and ask them to confirm.
-    # `find_codes_matching` returns multiple if the user typed a base (e.g.
-    # "S-668U1") that has several catalog variants ("S-668U1-02",
-    # "S-668U1-03"), so the user can pick the right SKU.
-    code_matches = matcher.find_codes_matching(text, seasonings)
+    code_matches = matcher.find_codes_matching(code, seasonings) if seasonings else []
     if code_matches:
         ctx.user_data["seasoning_candidates"] = code_matches[:5]
-        ctx.user_data["seasoning_query"] = text
+        ctx.user_data["seasoning_query"] = code
         if len(code_matches) == 1:
             c = code_matches[0]
             cat = c.get("category") or ""
             cat_str = f" · <i>{h(cat)}</i>" if cat else ""
             price = c.get("price") or "—"
-            code = c.get("code") or "—"
             msg = (
-                f"🎯 <b>Code match</b> for <code>{h(text)}</code>:\n\n"
+                f"🎯 <b>Code match</b> for <code>{h(code)}</code>:\n\n"
                 f"<b>{h(c['name'])}</b>{cat_str}\n"
-                f"    code <code>{h(code)}</code> · {h(price)}\n\n"
+                f"    code <code>{h(c.get('code') or '—')}</code> · {h(price)}\n\n"
                 "Use this product?"
             )
             buttons = [
                 [("✅ Yes, use it", "ssn:0")],
-                [("🔍 No, search by name", "ssn:retry")],
+                [("🔄 Different code", "ssn:reset")],
                 nav_row(include_back=False),
             ]
         else:
             lines = [
-                f"🎯 <b>Found {len(code_matches)} matches</b> for <code>{h(text)}</code>:",
+                f"🎯 <b>{len(code_matches)} variants</b> for <code>{h(code)}</code> — pick the right one:",
                 "",
             ]
             buttons = []
-            shown = code_matches[:5]
-            for i, c in enumerate(shown):
+            for i, c in enumerate(code_matches[:5]):
                 cat = c.get("category") or ""
                 cat_str = f" · <i>{h(cat)}</i>" if cat else ""
                 price = c.get("price") or "—"
-                code = c.get("code") or "—"
                 lines.append(
                     f"<b>{i+1}. {h(c['name'])}</b>{cat_str}\n"
-                    f"    code <code>{h(code)}</code> · {h(price)}"
+                    f"    code <code>{h(c.get('code') or '—')}</code> · {h(price)}"
                 )
                 label = f"{i+1}. {c.get('code', '')} · {c['name']}"
                 if len(label) > 40:
                     label = label[:38] + "…"
                 buttons.append([(label, f"ssn:{i}")])
-            lines.append("\nPick the one you want, or refine your code.")
-            buttons.append([("🔍 Search by name instead", "ssn:retry")])
+            buttons.append([("🔄 Different code", "ssn:reset")])
             buttons.append(nav_row(include_back=False))
             msg = "\n".join(lines)
-        await _drop_loader()
         await send(update, msg, kb(buttons))
         return
 
-    # Smart match: fuzzy-pool (name + category) + past-submissions boost,
-    # then Claude rerank on the top 10. matcher also parses price filters
-    # like "below 4.5 usd" / "under $3" out of the query. We feed it the
-    # COMBINED query so multi-turn refinement keeps prior context.
+    # Step 2: FSL / Jakarta tab fallback (handles J-, B-, and S-codes that
+    # exist in sample history but not in Seasoning Master). find_fsl_
+    # product_by_code auto-routes by prefix — S/B → FSL_TAB, J → Jakarta.
     try:
-        past = await asyncio.to_thread(sheets.load_past_submissions)
+        fsl_row = await asyncio.to_thread(sheets.find_fsl_product_by_code, code)
     except Exception as e:  # noqa: BLE001
-        log.warning("load_past_submissions failed: %s", e)
-        past = []
+        log.warning("find_fsl_product_by_code failed for %s: %s", code, e)
+        fsl_row = None
 
-    # Pure local search — no AI tokens consumed. The matcher does the work:
-    #   • token_set_ratio + WRatio scorer (order-insensitive, typo-tolerant)
-    #   • generic-term stripping ("seasoning"/"powder"/"flavour" don't dominate)
-    #   • category fold (catalog tab name is part of the choice string)
-    #   • past-submissions boost (codes used for similar past queries lift)
-    #   • code dedupe (same code in two tabs collapses to one row)
-    # On the test set this ranks the right items at score 100 without help
-    # from Claude. We keep ai.rerank_seasonings around in case we ever want
-    # to re-enable it for harder queries.
-    pool_candidates = matcher.top_seasonings(
-        combined_query, seasonings, limit=10, pool=40, past_submissions=past
-    )
-    _cleaned, max_price = matcher.parse_seasoning_query(combined_query)
-
-    # If a price cap was set but it killed the pool entirely, fall back to
-    # the same search WITHOUT the cap so the user still gets the closest
-    # matches (just above their budget). We surface the trade-off in the
-    # message so the user can decide whether to refine.
-    soft_price = False
-    if not pool_candidates and max_price is not None:
-        pool_candidates = matcher.top_seasonings(
-            combined_query, seasonings, limit=10, pool=40,
-            past_submissions=past, strict_price=False,
+    if fsl_row:
+        cand = {
+            "code": (fsl_row.get("Product Code") or code).strip().upper(),
+            "name": (fsl_row.get("Product Name") or "").strip(),
+            "category": (fsl_row.get("Category") or "").strip(),
+            "price": (fsl_row.get("R&D Price") or "").strip(),
+        }
+        ctx.user_data["seasoning_candidates"] = [cand]
+        ctx.user_data["seasoning_query"] = code
+        cat_str = f" · <i>{h(cand['category'])}</i>" if cand["category"] else ""
+        price_str = cand["price"] or "—"
+        await send(
+            update,
+            f"🎯 <b>Code match</b> for <code>{h(code)}</code> "
+            "<i>(from sample list)</i>:\n\n"
+            f"<b>{h(cand['name'])}</b>{cat_str}\n"
+            f"    code <code>{h(cand['code'])}</code> · {h(price_str)}\n\n"
+            "Use this product?",
+            kb([
+                [("✅ Yes, use it", "ssn:0")],
+                [("🔄 Different code", "ssn:reset")],
+                nav_row(include_back=False),
+            ]),
         )
-        soft_price = True
+        return
 
-    top = pool_candidates[:5]
-
-    ctx.user_data["seasoning_candidates"] = top
-    ctx.user_data["seasoning_query"] = text  # latest only — used by "Use my text"
-
-    # Surface the price filter status so the user always knows what's been applied.
-    if soft_price and not top:
-        # Even the soft fallback found nothing — query has no matches at any price.
-        cap_note = (
-            f"\n⚠️ <i>No matches in the catalog for that query — even at any price.</i>"
-        )
-    elif soft_price:
-        cap_note = (
-            f"\n⚠️ <i>No matches under <b>${max_price:g} USD</b> — "
-            "showing the closest above-budget options instead.</i>"
-        )
-    elif max_price is not None:
-        cap_note = f"\n<i>Filtered to ≤ ${max_price:g} USD.</i>"
-    else:
-        cap_note = ""
-
-    # Header reflects the running search context. Multi-turn → show history.
-    if len(history) > 1:
-        header = (
-            f"🔍 <b>Searching:</b> "
-            + " <b>+</b> ".join(f"<i>{h(q)}</i>" for q in history)
-            + cap_note
-        )
-    else:
-        header = f"You typed: <b>{h(text)}</b>{cap_note}"
-
-    if not top:
-        msg = (
-            f"{header}\n\nNo close matches in the catalog. "
-            "You can keep your text as-is, refine it, or start over."
-        )
-        buttons = [
-            [("📝 Use my latest text as-is", "ssn:raw")],
-            [("🔄 Start search over", "ssn:reset")],
+    # Step 3: not found anywhere.
+    await send(
+        update,
+        f"🤷 Couldn't find <code>{h(code)}</code> in any catalog.\n\n"
+        "Double-check the spelling, or use 🔎 Search seasonings to look it up first.",
+        kb([
+            [("🔎 Search seasonings", "menu:search")],
+            [("🔄 Different code", "ssn:reset")],
             nav_row(include_back=False),
-        ]
-    else:
-        lines = [header, "\nClosest matches:"]
-        buttons = []
-        for i, s in enumerate(top):
-            cat = s.get("category") or ""
-            cat_str = f" · <i>{h(cat)}</i>" if cat else ""
-            price = s.get("price") or "—"
-            code = s.get("code") or "—"
-            lines.append(
-                f"<b>{i+1}. {h(s['name'])}</b>{cat_str}\n"
-                f"    code {h(code)} · {h(price)}"
-            )
-            label = f"{i+1}. {s['name']}"
-            if len(label) > 40:
-                label = label[:38] + "…"
-            buttons.append([(label, f"ssn:{i}")])
-        if len(history) > 1:
-            lines.append("\n<i>💡 Type more to refine further, or tap Start over to reset.</i>")
-        else:
-            lines.append("\n<i>💡 Type more to refine, or pick a match above.</i>")
-        buttons.append([("📝 Use my latest text as-is", "ssn:raw")])
-        buttons.append([("🔄 Start search over", "ssn:reset")])
-        buttons.append(nav_row(include_back=False))
-        msg = "\n".join(lines)
-    await _drop_loader()
-    await send(update, msg, kb(buttons))
+        ]),
+    )
 
 
 async def _handle_company_text(update, ctx, d: state.Draft, text: str):
@@ -3495,33 +3434,24 @@ async def _handle_nav(update, ctx, d: state.Draft, action: str):
 
 
 async def _handle_seasoning_pick(update, ctx, d: state.Draft, payload: str):
-    if payload == "retry":
-        # User rejected the code match — prompt them to type a name instead.
-        ctx.user_data.pop("seasoning_candidates", None)
-        ctx.user_data.pop("seasoning_queries", None)
-        await send(
-            update,
-            "OK — type the <b>product name</b> (or a hint like "
-            "<i>cheese below 4.5 usd</i>) and I'll search the catalog.",
-            kb([nav_row(include_back=False)]),
-        )
-        return
-    if payload == "reset":
-        # Clear the running query history and re-prompt the seasoning question.
+    # V1.12.3: 'retry' (search-by-name) and 'raw' (use-text-as-is) paths
+    # are gone. The seasoning stage is now strictly code-only. We treat
+    # legacy 'retry' callbacks the same as 'reset' so old menu messages
+    # don't break for users who tap them after a deploy.
+    if payload in ("retry", "reset"):
         ctx.user_data.pop("seasoning_candidates", None)
         ctx.user_data.pop("seasoning_queries", None)
         ctx.user_data.pop("seasoning_query", None)
-        await send(
-            update,
-            "🔄 Search reset. Type what you're looking for and I'll start over.",
-            kb([nav_row(include_back=False)]),
-        )
+        await q_seasoning(update, ctx, d)
         return
+    # 'raw' — kept as a no-op redirect so any stray callback from a
+    # pre-V1.12.3 message also routes back to the prompt cleanly.
     if payload == "raw":
-        d.data["seasoning"] = ctx.user_data.get("seasoning_query", "")
-        d.matched_code = ""
-        d.matched_price = ""
-        d.matched_category = ""
+        ctx.user_data.pop("seasoning_candidates", None)
+        ctx.user_data.pop("seasoning_queries", None)
+        ctx.user_data.pop("seasoning_query", None)
+        await q_seasoning(update, ctx, d)
+        return
     else:
         try:
             idx = int(payload)

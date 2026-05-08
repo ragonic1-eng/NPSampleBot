@@ -4225,32 +4225,36 @@ async def _weekly_mms_sync_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _schedule_weekly_mms_sync(application: Application) -> None:
-    """Set up the recurring weekly job + catch-up if overdue.
+    """Set up the recurring twice-weekly job + catch-up if overdue.
 
-    Schedule:
-      - Every Monday at 02:00 UTC.
-      - On startup, if last successful sync was >7 days ago (or never),
+    Schedule (V1.11.0):
+      - Monday + Thursday at 02:00 UTC (gap = 3-4 days each way).
+      - On startup, if last successful sync was >4 days ago (or never),
         kick off a one-shot run after a 60s delay so the bot has time to
         finish initialising.
+
+    Each run pulls both Singapore (S- codes → FSL_TAB) and Indonesia
+    (J- codes → JAKARTA_FSL_TAB) in a single MMS round-trip.
     """
     from datetime import time as _time
     job_queue = application.job_queue
     if job_queue is None:
-        log.warning("JobQueue not available — weekly sync NOT scheduled. "
+        log.warning("JobQueue not available — sync NOT scheduled. "
                     "Install python-telegram-bot[job-queue] to enable.")
         return
 
-    # Recurring weekly run: Monday 02:00 UTC.
+    # Recurring twice-weekly run: Monday + Thursday 02:00 UTC.
+    # PTB day numbering: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun.
     job_queue.run_daily(
         _weekly_mms_sync_job,
         time=_time(hour=2, minute=0, tzinfo=timezone.utc),
-        days=(0,),  # 0 = Monday in PTB's day numbering
-        name="weekly_mms_sync",
+        days=(0, 3),
+        name="biweekly_mms_sync",
     )
-    log.info("weekly_mms_sync_job scheduled: every Monday 02:00 UTC")
+    log.info("mms_sync scheduled: Monday + Thursday 02:00 UTC")
 
-    # Catch-up: if we're overdue (no run in the last 7 days), trigger once
-    # 60s after startup so the bot has fully initialised first.
+    # Catch-up: if we're overdue (no run in the last 4 days, given the
+    # 3-4 day cycle), trigger once 60s after startup.
     try:
         last = await asyncio.to_thread(sheets.get_last_sample_sync)
     except Exception as e:  # noqa: BLE001
@@ -4262,16 +4266,16 @@ async def _schedule_weekly_mms_sync(application: Application) -> None:
     else:
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
-        overdue = (datetime.now(timezone.utc) - last) > timedelta(days=7)
+        overdue = (datetime.now(timezone.utc) - last) > timedelta(days=4)
         last_str = last.isoformat(timespec="seconds")
     if overdue:
         log.info(
-            "weekly_mms_sync: last run was %s — scheduling catch-up in 60s",
+            "mms_sync: last run was %s — scheduling catch-up in 60s",
             last_str,
         )
         job_queue.run_once(_weekly_mms_sync_job, when=60, name="catchup_mms_sync")
     else:
-        log.info("weekly_mms_sync: last run %s — no catch-up needed", last_str)
+        log.info("mms_sync: last run %s — no catch-up needed", last_str)
 
 
 def main():
@@ -4306,6 +4310,14 @@ def main():
             "Could not access the OPS sheet. Check that the service account "
             "email has Editor access to OPS_SHEET_ID."
         )
+
+    log.info("Ensuring Indonesia FSL tab exists…")
+    try:
+        sheets.ensure_jakarta_tab()
+    except Exception as e:  # noqa: BLE001
+        # Non-fatal — the bot can still serve Singapore queries even if the
+        # Jakarta tab bootstrap fails. Log loudly and carry on.
+        log.exception("ensure_jakarta_tab failed: %s", e)
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 

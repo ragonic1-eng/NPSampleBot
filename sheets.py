@@ -157,12 +157,31 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
 
 # ---------- Full Sample Listing (transactional sample-out log) ----------
 
-FSL_TAB = "Full Sample Listing"
+FSL_TAB = "Full Sample Listing"               # Singapore / S- codes (default)
+JAKARTA_FSL_TAB = "Full Sample Listing Jakarta"  # Indonesia / J- codes (V1.11.0)
 FSL_HEADER = [
     "Sales", "Customer Name", "Country", "Product Code", "Product Name",
     "Quantity (g)", "Sample Date Out", "Taste describe", "Category",
     "R&D Price",
 ]
+
+# Code-prefix → tab routing. Used by /pp's FSL fallback and by the sync
+# engine to send each MMS row to the right tab. Single source of truth so
+# we don't have to teach every helper the prefix rules.
+FSL_TAB_BY_PREFIX = {
+    "S": FSL_TAB,
+    "J": JAKARTA_FSL_TAB,
+}
+
+
+def fsl_tab_for_code(code: str) -> str:
+    """Return the FSL tab name a product code belongs to, defaulting to
+    the main FSL_TAB when the prefix is unknown (e.g. legacy B- codes that
+    we currently leave in the main tab)."""
+    code = (code or "").strip().upper()
+    if not code:
+        return FSL_TAB
+    return FSL_TAB_BY_PREFIX.get(code.split("-", 1)[0], FSL_TAB)
 # Index positions for the 10-col layout (0-indexed in the values matrix).
 FSL_COL_SALES = 0
 FSL_COL_CUSTOMER = 1
@@ -185,23 +204,23 @@ def _norm_customer(name: str) -> str:
     return " ".join((name or "").lower().split())
 
 
-def load_fsl_dedupe_keys() -> set[tuple[str, str, str]]:
+def load_fsl_dedupe_keys(tab: str = FSL_TAB) -> set[tuple[str, str, str]]:
     """Return the set of (sample_date_out, product_code, normalized_customer)
-    tuples for every row already in Full Sample Listing.
+    tuples for every row already in the target FSL tab.
 
     Kept as a thin wrapper so callers that only want dedupe don't have to
     pay for the full state load. sync_engine prefers ``load_fsl_state()``.
     """
-    return load_fsl_state()["dedupe_keys"]
+    return load_fsl_state(tab=tab)["dedupe_keys"]
 
 
-def load_fsl_customer_country_map() -> dict[str, str]:
+def load_fsl_customer_country_map(tab: str = FSL_TAB) -> dict[str, str]:
     """Back-compat wrapper. Prefer ``load_fsl_state()`` which returns this
     plus the taste/category maps in a single sheet read."""
-    return load_fsl_state()["customer_country"]
+    return load_fsl_state(tab=tab)["customer_country"]
 
 
-def load_fsl_state() -> dict:
+def load_fsl_state(tab: str = FSL_TAB) -> dict:
     """Single FSL read returning every map sync_engine needs.
 
     Returns:
@@ -226,7 +245,7 @@ def load_fsl_state() -> dict:
     from collections import Counter
     sh = _open_seasoning_master()
     try:
-        ws = sh.worksheet(FSL_TAB)
+        ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         return {
             "dedupe_keys": set(),
@@ -289,8 +308,8 @@ def load_fsl_category_tab_map() -> dict[str, str]:
     return out
 
 
-def sort_fsl_by_date() -> int:
-    """Resort the entire 'Full Sample Listing' tab by Sample Date Out (asc).
+def sort_fsl_by_date(tab: str = FSL_TAB) -> int:
+    """Resort the target FSL tab by Sample Date Out (asc).
 
     Late-arriving MMS rows can be older than rows already in the sheet
     (e.g. a March entry showing up after April was already written). After
@@ -304,7 +323,7 @@ def sort_fsl_by_date() -> int:
     import datetime as _d
     sh = _open_seasoning_master()
     try:
-        ws = sh.worksheet(FSL_TAB)
+        ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         return 0
     values = ws.get_all_values()
@@ -333,19 +352,21 @@ def sort_fsl_by_date() -> int:
     return len(sorted_data)
 
 
-def append_fsl_rows(rows: list[list[str]]) -> int:
-    """Append rows to the bottom of Full Sample Listing.
+def append_fsl_rows(rows: list[list[str]], tab: str = FSL_TAB) -> int:
+    """Append rows to the bottom of the target FSL tab.
 
     Each row must already be a 10-element list matching FSL_HEADER. Returns
     the number of rows actually appended. Header is refreshed if missing.
+    The tab is auto-created if it doesn't yet exist (used by the Indonesia
+    backfill the first time it runs).
     """
     if not rows:
         return 0
     sh = _open_seasoning_master()
     try:
-        ws = sh.worksheet(FSL_TAB)
+        ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=FSL_TAB, rows=2000, cols=len(FSL_HEADER))
+        ws = sh.add_worksheet(title=tab, rows=2000, cols=len(FSL_HEADER))
 
     # Ensure header.
     first = ws.row_values(1)
@@ -750,9 +771,11 @@ def find_fsl_product_by_code(code: str) -> dict | None:
     code_upper = (code or "").strip().upper()
     if not code_upper:
         return None
+    # Route by prefix: J- → Jakarta tab, otherwise → main FSL tab.
+    tab = fsl_tab_for_code(code_upper)
     sh = _open_seasoning_master()
     try:
-        ws = sh.worksheet(FSL_TAB)
+        ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         return None
     values = ws.get_all_values()
@@ -776,8 +799,8 @@ def find_fsl_product_by_code(code: str) -> dict | None:
     return matches[0]
 
 
-def load_fsl_rows_all() -> list[dict[str, str]]:
-    """Return every Full Sample Listing row, regardless of Sales rep.
+def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
+    """Return every row from the target FSL tab, regardless of Sales rep.
 
     Admin-only path: /alllastsample uses this to search across all reps,
     in contrast to load_fsl_rows_for_sales() which scopes to one rep.
@@ -785,7 +808,7 @@ def load_fsl_rows_all() -> list[dict[str, str]]:
     """
     sh = _open_seasoning_master()
     try:
-        ws = sh.worksheet(FSL_TAB)
+        ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         return []
     values = ws.get_all_values()
@@ -800,18 +823,18 @@ def load_fsl_rows_all() -> list[dict[str, str]]:
     return out
 
 
-def load_fsl_rows_for_sales(sales_name: str) -> list[dict[str, str]]:
-    """Return every Full Sample Listing row whose Sales col matches sales_name
-    (case-insensitive, whitespace-collapsed). Each row is a dict with the
-    FSL_HEADER columns as keys + a parsed `_date` (datetime.date | None) for
-    sorting. Returns [] if the sales name is empty or the tab is missing.
+def load_fsl_rows_for_sales(sales_name: str, tab: str = FSL_TAB) -> list[dict[str, str]]:
+    """Return every FSL row whose Sales col matches sales_name in the target
+    tab (case-insensitive, whitespace-collapsed). Each row is a dict with
+    the FSL_HEADER columns as keys + a parsed `_date` (datetime.date | None)
+    for sorting. Returns [] if the sales name is empty or the tab is missing.
     """
     if not (sales_name or "").strip():
         return []
     target = " ".join(sales_name.lower().split())
     sh = _open_seasoning_master()
     try:
-        ws = sh.worksheet(FSL_TAB)
+        ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         return []
     values = ws.get_all_values()
@@ -956,10 +979,58 @@ def _open_master():
     return _get_client().open_by_key(config.SEASONING_SHEET_ID)
 
 
-# ---- Sync metadata (last /updatesamplelist run) ----
+# ---- Sync metadata (last sync run, per tab) ----
 
 _SYNC_META_TAB = "_sync_meta"
 _SYNC_KEY_LAST_RUN = "sample_master_last_sync_utc"
+
+# Per-tab last-sync key. Indonesia gets its own so its cooldown / catch-up
+# logic doesn't trip on the Singapore timestamp (and vice versa).
+_SYNC_KEY_BY_TAB = {
+    FSL_TAB: _SYNC_KEY_LAST_RUN,
+    JAKARTA_FSL_TAB: "sample_master_last_sync_utc_jakarta",
+}
+
+
+def ensure_jakarta_tab() -> None:
+    """Make sure the Indonesia FSL tab exists with the right header.
+
+    Called from bot startup. Idempotent — does nothing if the tab is
+    already correct. If a typo'd 'Full sample list jakatar' tab exists
+    (e.g. left over from manual sheet creation), we rename it in place
+    so any links / bookmarks the user had remain valid. Otherwise create
+    a fresh empty tab with the standard FSL_HEADER.
+
+    Critically: does NOT touch the main FSL tab. Singapore data is
+    completely untouched by this bootstrap.
+    """
+    sh = _open_seasoning_master()
+    existing = {ws.title: ws for ws in sh.worksheets()}
+    if JAKARTA_FSL_TAB in existing:
+        ws = existing[JAKARTA_FSL_TAB]
+        first = ws.row_values(1)
+        if first != FSL_HEADER:
+            if ws.col_count < len(FSL_HEADER):
+                ws.add_cols(len(FSL_HEADER) - ws.col_count)
+            ws.update(values=[FSL_HEADER], range_name="A1")
+        return
+    # Look for the typo'd version and rename it in place.
+    for typo in ("Full sample list jakatar", "Full Sample List Jakatar",
+                 "Full sample list Jakarta", "Full Sample list jakarta"):
+        if typo in existing:
+            existing[typo].update_title(JAKARTA_FSL_TAB)
+            log.info("Renamed tab %r -> %r", typo, JAKARTA_FSL_TAB)
+            ws = sh.worksheet(JAKARTA_FSL_TAB)
+            first = ws.row_values(1)
+            if first != FSL_HEADER:
+                if ws.col_count < len(FSL_HEADER):
+                    ws.add_cols(len(FSL_HEADER) - ws.col_count)
+                ws.update(values=[FSL_HEADER], range_name="A1")
+            return
+    # Fresh create.
+    ws = sh.add_worksheet(title=JAKARTA_FSL_TAB, rows=2000, cols=len(FSL_HEADER))
+    ws.update(values=[FSL_HEADER], range_name="A1")
+    log.info("Created tab %r", JAKARTA_FSL_TAB)
 
 
 def _open_sync_meta_ws():
@@ -996,14 +1067,16 @@ def _open_sync_meta_ws():
         return ws
 
 
-def get_last_sample_sync():
-    """Return the UTC datetime of the last successful /updatesamplelist run,
-    or ``None`` if we've never recorded one."""
+def get_last_sample_sync(tab: str = FSL_TAB):
+    """Return the UTC datetime of the last successful sync for ``tab``,
+    or ``None`` if we've never recorded one. Singapore (FSL_TAB) and
+    Indonesia (JAKARTA_FSL_TAB) each have their own meta key."""
     import datetime as _d
+    target_key = _SYNC_KEY_BY_TAB.get(tab, _SYNC_KEY_LAST_RUN)
     try:
         ws = _open_sync_meta_ws()
         for row in ws.get_all_values()[1:]:  # skip header
-            if len(row) >= 2 and row[0].strip() == _SYNC_KEY_LAST_RUN:
+            if len(row) >= 2 and row[0].strip() == target_key:
                 raw = row[1].strip()
                 if not raw:
                     return None
@@ -1012,13 +1085,14 @@ def get_last_sample_sync():
                 except ValueError:
                     return None
     except Exception as e:  # noqa: BLE001
-        log.warning("get_last_sample_sync failed: %s", e)
+        log.warning("get_last_sample_sync(%s) failed: %s", tab, e)
     return None
 
 
-def set_last_sample_sync(when) -> None:
-    """Upsert the last-run timestamp (UTC ISO) into _sync_meta."""
+def set_last_sample_sync(when, tab: str = FSL_TAB) -> None:
+    """Upsert the last-run timestamp (UTC ISO) into _sync_meta for ``tab``."""
     import datetime as _d
+    target_key = _SYNC_KEY_BY_TAB.get(tab, _SYNC_KEY_LAST_RUN)
     try:
         ws = _open_sync_meta_ws()
         iso = (
@@ -1028,13 +1102,13 @@ def set_last_sample_sync(when) -> None:
         )
         rows = ws.get_all_values()
         for i, row in enumerate(rows[1:], start=2):  # header is row 1
-            if len(row) >= 1 and row[0].strip() == _SYNC_KEY_LAST_RUN:
-                ws.update(range_name=f"A{i}:B{i}", values=[[_SYNC_KEY_LAST_RUN, iso]])
+            if len(row) >= 1 and row[0].strip() == target_key:
+                ws.update(range_name=f"A{i}:B{i}", values=[[target_key, iso]])
                 return
-        ws.append_row([_SYNC_KEY_LAST_RUN, iso])
+        ws.append_row([target_key, iso])
     except Exception as e:  # noqa: BLE001
         # Never let meta-write failure abort a successful sync.
-        log.warning("set_last_sample_sync failed: %s", e)
+        log.warning("set_last_sample_sync(%s) failed: %s", tab, e)
 
 
 def load_sample_master() -> tuple[list[str], list[list[str]]]:

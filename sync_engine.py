@@ -1,22 +1,32 @@
 """MMS → Full Sample Listing sync, runnable without a Telegram update.
 
-Used by:
-  - bot.py's weekly auto-sync job (no UI, no admin trigger)
-  - One-off scripts if we ever need a manual rerun outside Telegram
+V1.11.0: now handles BOTH Singapore (FSL_TAB) and Indonesia (JAKARTA_FSL_TAB).
+A single MMS pull is split by code prefix:
+  S-XXX → Full Sample Listing       (existing behaviour, country derived per customer)
+  J-XXX → Full Sample Listing Jakarta (V1.11.0+, country hardcoded to 'Indonesia')
+Anything else (e.g. legacy B- codes) defaults to FSL_TAB so we don't lose data.
 
-The function is synchronous (intended to be called via asyncio.to_thread
-from the JobQueue callback) so it can use the blocking gspread / requests
-clients without contaminating the bot's event loop.
+Singapore data is **never** modified — the sync only ever appends to its
+own region's tab. Re-sort runs per-tab. Singapore behaviour pre-V1.11.0
+is preserved bit-for-bit.
+
+Used by:
+  - bot.py's twice-weekly auto-sync job (Mon + Thu 02:00 UTC)
+  - One-off scripts (e.g. `_jakarta_initial_backfill.py`)
 
 Returns a result dict callers can log / report:
   {
     "status": "ok" | "cooldown" | "no_credentials" | "error",
     "mms_pulled": int,
-    "rows_added": int,
+    "rows_added": int,                # total across both regions
     "elapsed_secs": float,
-    "window": (start_iso, end_iso),     # only on status="ok"
-    "last_sync": iso,                    # only on status="cooldown"
-    "error": str,                        # only on status="error"
+    "window": (start_iso, end_iso),
+    "regions": [
+      {"region": "S", "tab": "Full Sample Listing", "fetched": int, "added": int},
+      {"region": "J", "tab": "Full Sample Listing Jakarta", "fetched": int, "added": int},
+    ],
+    "haiku_calls": int,
+    "free_lookups": int,
   }
 """
 from __future__ import annotations
@@ -33,10 +43,18 @@ import sheets
 
 log = logging.getLogger(__name__)
 
-# How often the sync may run before we refuse (force=False). The weekly
-# scheduler runs every 7 days so this is mostly a guard against overlapping
-# manual + automated runs. Same value as the legacy /updatesamplelist gate.
+# How often the sync may run before we refuse (force=False). The scheduler
+# now runs twice a week, so this guard mostly stops overlapping manual +
+# automated runs.
 SAMPLE_SYNC_COOLDOWN_HOURS = 24
+
+# Region routing. Code prefix → (target tab, country mode).
+#   country='derive' — use the existing per-customer resolution
+#   country='Indonesia' — hardcode every row's Country to 'Indonesia'
+_REGIONS = {
+    "S": (sheets.FSL_TAB, "derive"),
+    "J": (sheets.JAKARTA_FSL_TAB, "Indonesia"),
+}
 
 
 def _now_utc() -> dt.datetime:
@@ -47,10 +65,215 @@ def _elapsed(t0: dt.datetime) -> float:
     return (_now_utc() - t0).total_seconds()
 
 
-def run_mms_to_fsl_sync(force: bool = False) -> dict:
-    """Pull fresh sample submissions from MMS and append new ones to FSL.
+def _row_region(row: "mms_client.SampleRow") -> str:
+    """Return 'S', 'J', or 'S' (default) for a sample row's product code."""
+    code = (row.product_code or "").strip().upper()
+    if not code:
+        return "S"  # treat empty-code rows as legacy/default
+    return code.split("-", 1)[0] if code.split("-", 1)[0] in _REGIONS else "S"
 
-    Cooldown: 24h between successful runs unless `force=True`.
+
+def _process_region(
+    region: str,
+    region_rows: list["mms_client.SampleRow"],
+    haiku_client,
+    metrics: dict,
+) -> dict:
+    """Dedupe → enrich → append → sort for one region. Returns a stats dict.
+
+    Reads the region's own FSL state, so the dedupe / customer-country /
+    self-cache logic is fully isolated per region. Singapore's existing
+    behaviour is unchanged because it goes through the same code path with
+    country='derive'.
+    """
+    tab, country_mode = _REGIONS[region]
+
+    # Region-scoped FSL state (single sheet read).
+    try:
+        state = sheets.load_fsl_state(tab=tab)
+    except Exception as e:  # noqa: BLE001
+        log.exception("sync_engine[%s]: FSL state read failed", tab)
+        return {"region": region, "tab": tab, "fetched": len(region_rows),
+                "added": 0, "error": f"fsl_read: {e}"}
+
+    existing_keys = state["dedupe_keys"]
+    customer_map = state["customer_country"]
+    fsl_taste_map = state["code_taste"]
+    fsl_category_map = state["code_category"]
+    # Category-tab lookup (the 6 manual tabs Snack / Noodle ... / Beverage)
+    # is only meaningful for Singapore S- codes — Indonesia products aren't
+    # listed there. Skip the read entirely for J-.
+    if region == "S":
+        try:
+            tab_map = sheets.load_fsl_category_tab_map()
+        except Exception as e:  # noqa: BLE001
+            log.warning("sync_engine[%s]: category tab map read failed: %s", tab, e)
+            tab_map = {}
+    else:
+        tab_map = {}
+
+    log.info(
+        "sync_engine[%s]: %d MMS rows · state: %d dedupe, %d customers, "
+        "%d code-taste, %d code-category",
+        tab, len(region_rows), len(existing_keys), len(customer_map),
+        len(fsl_taste_map), len(fsl_category_map),
+    )
+
+    # Dedupe.
+    new_rows: list[mms_client.SampleRow] = []
+    for r in region_rows:
+        code = (r.product_code or "").strip().upper()
+        date = (r.sample_date_out or "").strip()
+        cust = (r.customer_name or "").strip()
+        if not (code and date and cust):
+            continue
+        key = (date, code, " ".join(cust.lower().split()))
+        if key in existing_keys:
+            continue
+        new_rows.append(r)
+    log.info("sync_engine[%s]: %d new rows after dedupe", tab, len(new_rows))
+
+    # Bump the region's last-sync timestamp regardless — even on zero-new
+    # we want the cooldown clock to start ticking.
+    if not new_rows:
+        try:
+            sheets.set_last_sample_sync(_now_utc(), tab=tab)
+        except Exception as e:  # noqa: BLE001
+            log.warning("sync_engine[%s]: set_last_sample_sync failed: %s", tab, e)
+        return {"region": region, "tab": tab, "fetched": len(region_rows), "added": 0}
+
+    # Chronological sort before enrichment so the appended block is in date
+    # order (the per-tab sort_fsl_by_date at the end re-sorts the whole tab
+    # anyway, but this keeps the appended block coherent if the sort step
+    # fails for some reason).
+    new_rows.sort(
+        key=lambda r: r.sample_date_out_as_date() or dt.date(1900, 1, 1)
+    )
+
+    country_cache, taste_cache, category_cache = enrich.load_all_caches()
+
+    def _resolve_country_tracked(r):
+        """Country resolution with metrics tracking. Indonesia mode skips
+        all the lookup work and hardcodes the value, which means zero
+        Haiku spend per row for the Indonesia sync."""
+        if country_mode == "Indonesia":
+            return "Indonesia", "free"
+        # Singapore mode = original V1.7.4 cascade.
+        if (r.country or "").strip():
+            return enrich.normalize_country(r.country), "free"
+        if not r.customer_name:
+            return "", "free"
+        cust_norm = " ".join(r.customer_name.lower().split())
+        if customer_map.get(cust_norm):
+            return enrich.normalize_country(customer_map[cust_norm]), "free"
+        if enrich._country_from_tokens(r.customer_name):
+            return enrich._country_from_tokens(r.customer_name), "free"
+        if enrich._country_from_suffix(r.customer_name):
+            return enrich._country_from_suffix(r.customer_name), "free"
+        out = enrich.resolve_country(
+            raw_country=r.country, customer_name=r.customer_name,
+            customer_map=customer_map, country_cache=country_cache,
+            haiku_client=haiku_client,
+        )
+        was_cached = (
+            r.customer_name in country_cache
+            and country_cache[r.customer_name] == out
+        )
+        return out, ("free" if was_cached else "haiku")
+
+    enriched: list[list[str]] = []
+    for r in new_rows:
+        country, country_src = _resolve_country_tracked(r)
+        metrics[f"country_{country_src}"] += 1
+
+        code_upper = (r.product_code or "").strip().upper()
+        # Taste source classification (for cost reporting).
+        taste_src = "haiku"
+        if not code_upper:
+            taste_src = "free"
+        elif fsl_taste_map.get(code_upper):
+            taste_src = "free"
+        elif code_upper in taste_cache and taste_cache[code_upper]:
+            taste_src = "free"
+        taste = enrich.resolve_taste(
+            code=r.product_code, name=r.product_name,
+            taste_cache=taste_cache, haiku_client=haiku_client,
+            fsl_map=fsl_taste_map,
+        )
+        metrics[f"taste_{taste_src}"] += 1
+
+        # Category source classification.
+        cat_src = "haiku"
+        if not code_upper:
+            cat_src = "free"
+        elif code_upper in tab_map:
+            cat_src = "free"
+        elif fsl_category_map.get(code_upper) in enrich.CATEGORIES:
+            cat_src = "free"
+        elif code_upper in category_cache and category_cache[code_upper] in enrich.CATEGORIES:
+            cat_src = "free"
+        category = enrich.resolve_category(
+            code=r.product_code, name=r.product_name,
+            tab_map=tab_map, category_cache=category_cache,
+            haiku_client=haiku_client, fsl_map=fsl_category_map,
+        )
+        metrics[f"category_{cat_src}"] += 1
+
+        enriched.append([
+            r.sales,
+            r.customer_name,
+            country,
+            r.product_code,
+            r.product_name,
+            r.quantity_g,
+            r.sample_date_out,
+            taste,
+            category,
+            r.rd_price,
+        ])
+
+    # Append + sort + record sync time. All three are best-effort: a failure
+    # downstream of append shouldn't lose the rows we already wrote.
+    try:
+        appended = sheets.append_fsl_rows(enriched, tab=tab)
+    except Exception as e:  # noqa: BLE001
+        log.exception("sync_engine[%s]: append failed", tab)
+        return {"region": region, "tab": tab, "fetched": len(region_rows),
+                "added": 0, "error": f"append: {e}"}
+
+    try:
+        n_sorted = sheets.sort_fsl_by_date(tab=tab)
+        log.info("sync_engine[%s]: re-sorted %d rows by date", tab, n_sorted)
+    except Exception as e:  # noqa: BLE001
+        log.warning("sync_engine[%s]: sort failed: %s", tab, e)
+
+    try:
+        sheets.set_last_sample_sync(_now_utc(), tab=tab)
+    except Exception as e:  # noqa: BLE001
+        log.warning("sync_engine[%s]: set_last_sample_sync failed: %s", tab, e)
+
+    return {"region": region, "tab": tab, "fetched": len(region_rows),
+            "added": appended}
+
+
+def run_mms_to_fsl_sync(
+    force: bool = False,
+    start_override: dt.date | None = None,
+    regions: tuple[str, ...] = ("S", "J"),
+) -> dict:
+    """Pull fresh sample submissions from MMS and append new ones to the
+    matching FSL tab. Both Singapore (S-) and Indonesia (J-) are processed
+    by default; pass ``regions=('S',)`` or ``('J',)`` to limit.
+
+    ``start_override`` lets callers (e.g. the Indonesia initial backfill
+    script) request a much earlier window than the default
+    config.SAMPLE_UPDATE_START. The MMS round-trip is the same whether we
+    fetch 2 months or 10 years of history — the dedupe step ensures we
+    only enrich+append rows we haven't seen.
+
+    Cooldown: 24h between successful runs unless ``force=True``. Gated on
+    Singapore's last-sync (kept simple — both regions are usually in lock-
+    step on the twice-weekly schedule).
     """
     t0 = _now_utc()
 
@@ -63,9 +286,9 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
             "elapsed_secs": 0.0,
         }
 
-    # 24h cooldown.
+    # 24h cooldown (Singapore's clock).
     if not force:
-        last = sheets.get_last_sample_sync()
+        last = sheets.get_last_sample_sync(tab=sheets.FSL_TAB)
         if last is not None:
             if last.tzinfo is None:
                 last = last.replace(tzinfo=dt.timezone.utc)
@@ -84,12 +307,16 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
                 }
 
     # Date window.
-    try:
-        start_date = dt.datetime.strptime(config.SAMPLE_UPDATE_START, "%Y-%m-%d").date()
-    except ValueError:
-        start_date = dt.date(2026, 3, 1)
+    if start_override is not None:
+        start_date = start_override
+    else:
+        try:
+            start_date = dt.datetime.strptime(config.SAMPLE_UPDATE_START, "%Y-%m-%d").date()
+        except ValueError:
+            start_date = dt.date(2026, 3, 1)
     end_date = dt.date.today()
-    log.info("sync_engine: starting MMS pull window %s → %s", start_date, end_date)
+    log.info("sync_engine: starting MMS pull window %s → %s (regions=%s)",
+             start_date, end_date, regions)
 
     # Step 1: MMS login.
     session = requests.Session()
@@ -107,7 +334,7 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
             "mms_pulled": 0, "rows_added": 0, "elapsed_secs": _elapsed(t0),
         }
 
-    # Step 2: Fetch.
+    # Step 2: Single MMS fetch — both regions share the same pull.
     try:
         mms_rows = mms_client.fetch_all_samples(session, start_date, end_date)
     except Exception as e:  # noqa: BLE001
@@ -116,151 +343,46 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
             "status": "error", "error": f"fetch: {e}",
             "mms_pulled": 0, "rows_added": 0, "elapsed_secs": _elapsed(t0),
         }
-    log.info("sync_engine: pulled %d MMS rows", len(mms_rows))
+    log.info("sync_engine: pulled %d MMS rows total", len(mms_rows))
 
-    # Step 3: Read FSL state for dedupe + lookup maps.
-    # ONE sheet read returns dedupe set, customer→country, code→taste,
-    # code→category. Past enriched rows act as a free, persistent cache so
-    # already-seen product codes / customers never trigger another Haiku
-    # call — even after Railway wipes the on-disk JSON caches on redeploy.
-    try:
-        state = sheets.load_fsl_state()
-        existing_keys = state["dedupe_keys"]
-        customer_map = state["customer_country"]
-        fsl_taste_map = state["code_taste"]
-        fsl_category_map = state["code_category"]
-        tab_map = sheets.load_fsl_category_tab_map()
-    except Exception as e:  # noqa: BLE001
-        log.exception("sync_engine: FSL read failed")
-        return {
-            "status": "error", "error": f"fsl_read: {e}",
-            "mms_pulled": len(mms_rows), "rows_added": 0, "elapsed_secs": _elapsed(t0),
-        }
-    log.info(
-        "sync_engine: FSL state — %d dedupe keys, %d known customers, "
-        "%d codes with taste, %d codes with category, %d codes in tab_map",
-        len(existing_keys), len(customer_map), len(fsl_taste_map),
-        len(fsl_category_map), len(tab_map),
-    )
-
-    # Filter to genuinely new rows.
-    new_rows: list[mms_client.SampleRow] = []
+    # Step 3: Split rows by region prefix, then process each.
+    rows_by_region: dict[str, list[mms_client.SampleRow]] = {r: [] for r in regions}
+    other_count = 0
     for r in mms_rows:
-        code = (r.product_code or "").strip().upper()
-        date = (r.sample_date_out or "").strip()
-        cust = (r.customer_name or "").strip()
-        if not (code and date and cust):
-            continue
-        key = (date, code, " ".join(cust.lower().split()))
-        if key in existing_keys:
-            continue
-        new_rows.append(r)
-    log.info("sync_engine: %d new rows after dedupe", len(new_rows))
+        reg = _row_region(r)
+        if reg in rows_by_region:
+            rows_by_region[reg].append(r)
+        else:
+            other_count += 1
+    if other_count:
+        log.info("sync_engine: %d MMS rows had unhandled prefix (skipped this run)", other_count)
 
-    # If MMS gave us nothing new, still bump the last-sync timestamp so the
-    # cooldown clock starts ticking and Railway logs clearly say "checked".
-    if not new_rows:
-        try:
-            sheets.set_last_sample_sync(_now_utc())
-        except Exception as e:  # noqa: BLE001
-            log.warning("sync_engine: set_last_sample_sync failed: %s", e)
-        return {
-            "status": "ok",
-            "mms_pulled": len(mms_rows),
-            "rows_added": 0,
-            "elapsed_secs": _elapsed(t0),
-            "window": (start_date.isoformat(), end_date.isoformat()),
-        }
+    haiku_client = enrich.haiku_client()
 
-    # Step 4: Sort chronologically and enrich each new row.
-    def _date_key(r: mms_client.SampleRow):
-        return r.sample_date_out_as_date() or dt.date(1900, 1, 1)
-    new_rows.sort(key=_date_key)
-
-    country_cache, taste_cache, category_cache = enrich.load_all_caches()
-    haiku = enrich.haiku_client()
-
-    # Track which path each field came from so the result dict can report
-    # how many Haiku calls were actually needed vs avoided. The "fsl" / "free"
-    # buckets are zero-cost; "haiku" is the only paid path.
+    # Shared metrics accumulator across regions for the final cost summary.
     metrics = {
         "country_free": 0, "country_haiku": 0,
         "taste_free": 0, "taste_haiku": 0,
         "category_free": 0, "category_haiku": 0,
     }
 
-    def _resolve_country_tracked(r):
-        # Free paths short-circuit before Haiku is ever consulted. We classify
-        # by whether a free signal would have answered first.
-        if (r.country or "").strip(): return enrich.normalize_country(r.country), "free"
-        if not r.customer_name: return "", "free"
-        cust_norm = " ".join(r.customer_name.lower().split())
-        if customer_map.get(cust_norm): return enrich.normalize_country(customer_map[cust_norm]), "free"
-        if enrich._country_from_tokens(r.customer_name): return enrich._country_from_tokens(r.customer_name), "free"
-        if enrich._country_from_suffix(r.customer_name): return enrich._country_from_suffix(r.customer_name), "free"
-        # Genuine miss — would call Haiku (or hit on-disk cache).
-        out = enrich.resolve_country(
-            raw_country=r.country, customer_name=r.customer_name,
-            customer_map=customer_map, country_cache=country_cache,
-            haiku_client=haiku,
-        )
-        # On-disk cache hit also counts as free; only true paid call counts as haiku.
-        was_cached = r.customer_name in country_cache and country_cache[r.customer_name] == out
-        return out, ("free" if was_cached else "haiku")
-
-    enriched: list[list[str]] = []
-    for r in new_rows:
-        country, country_src = _resolve_country_tracked(r)
-        metrics[f"country_{country_src}"] += 1
-
-        code_upper = (r.product_code or "").strip().upper()
-        # Taste: classify before resolving so we can count cleanly.
-        taste_src = "haiku"
-        if not code_upper:
-            taste_src = "free"
-        elif fsl_taste_map.get(code_upper):
-            taste_src = "free"
-        elif code_upper in taste_cache and taste_cache[code_upper]:
-            taste_src = "free"
-        taste = enrich.resolve_taste(
-            code=r.product_code, name=r.product_name,
-            taste_cache=taste_cache, haiku_client=haiku,
-            fsl_map=fsl_taste_map,
-        )
-        metrics[f"taste_{taste_src}"] += 1
-
-        # Category: same classify-before pattern.
-        cat_src = "haiku"
-        if not code_upper:
-            cat_src = "free"
-        elif code_upper in tab_map:
-            cat_src = "free"
-        elif fsl_category_map.get(code_upper) in enrich.CATEGORIES:
-            cat_src = "free"
-        elif code_upper in category_cache and category_cache[code_upper] in enrich.CATEGORIES:
-            cat_src = "free"
-        category = enrich.resolve_category(
-            code=r.product_code, name=r.product_name,
-            tab_map=tab_map, category_cache=category_cache,
-            haiku_client=haiku, fsl_map=fsl_category_map,
-        )
-        metrics[f"category_{cat_src}"] += 1
-
-        enriched.append([
-            r.sales,
-            r.customer_name,
-            country,
-            r.product_code,
-            r.product_name,
-            r.quantity_g,
-            r.sample_date_out,
-            taste,
-            category,
-            r.rd_price,
-        ])
+    region_results: list[dict] = []
+    for region in regions:
+        region_rows = rows_by_region.get(region, [])
+        try:
+            res = _process_region(region, region_rows, haiku_client, metrics)
+        except Exception as e:  # noqa: BLE001
+            log.exception("sync_engine: region %s failed", region)
+            res = {
+                "region": region, "tab": _REGIONS[region][0],
+                "fetched": len(region_rows), "added": 0, "error": str(e),
+            }
+        region_results.append(res)
 
     haiku_total = metrics["country_haiku"] + metrics["taste_haiku"] + metrics["category_haiku"]
     free_total = metrics["country_free"] + metrics["taste_free"] + metrics["category_free"]
+    total_added = sum(r.get("added", 0) for r in region_results)
+
     log.info(
         "sync_engine: enrichment cost — %d Haiku calls, %d free lookups "
         "(country: %d free / %d haiku · taste: %d free / %d haiku · "
@@ -270,42 +392,17 @@ def run_mms_to_fsl_sync(force: bool = False) -> dict:
         metrics["taste_free"], metrics["taste_haiku"],
         metrics["category_free"], metrics["category_haiku"],
     )
-
-    # Step 5: Append to FSL.
-    try:
-        appended = sheets.append_fsl_rows(enriched)
-    except Exception as e:  # noqa: BLE001
-        log.exception("sync_engine: FSL append failed")
-        return {
-            "status": "error", "error": f"fsl_append: {e}",
-            "mms_pulled": len(mms_rows), "rows_added": 0, "elapsed_secs": _elapsed(t0),
-        }
-
-    # Step 6: Re-sort the whole tab by Sample Date Out so late-arriving older
-    # rows don't end up dangling at the bottom. Best-effort — never fail the
-    # sync over a sort error, the rows are already in the sheet.
-    try:
-        sorted_n = sheets.sort_fsl_by_date()
-        log.info("sync_engine: re-sorted %d FSL rows by date", sorted_n)
-    except Exception as e:  # noqa: BLE001
-        log.warning("sync_engine: sort_fsl_by_date failed: %s", e)
-
-    sync_time = _now_utc()
-    try:
-        sheets.set_last_sample_sync(sync_time)
-    except Exception as e:  # noqa: BLE001
-        log.warning("sync_engine: set_last_sample_sync failed: %s", e)
-
     log.info(
-        "sync_engine: appended %d new rows in %.1fs (window %s → %s)",
-        appended, _elapsed(t0), start_date, end_date,
+        "sync_engine: total appended %d rows in %.1fs (window %s → %s)",
+        total_added, _elapsed(t0), start_date, end_date,
     )
     return {
         "status": "ok",
         "mms_pulled": len(mms_rows),
-        "rows_added": appended,
+        "rows_added": total_added,
         "elapsed_secs": _elapsed(t0),
         "window": (start_date.isoformat(), end_date.isoformat()),
+        "regions": region_results,
         "haiku_calls": haiku_total,
         "free_lookups": free_total,
         "enrichment_metrics": metrics,
@@ -318,5 +415,20 @@ if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     force = "--force" in sys.argv
-    result = run_mms_to_fsl_sync(force=force)
+    # Optional region filter: --region=S or --region=J
+    regions = ("S", "J")
+    for arg in sys.argv:
+        if arg.startswith("--region="):
+            regions = tuple(arg.split("=", 1)[1].upper().split(","))
+    # Optional start-date override: --start=2010-01-01
+    start_override = None
+    for arg in sys.argv:
+        if arg.startswith("--start="):
+            try:
+                start_override = dt.datetime.strptime(
+                    arg.split("=", 1)[1], "%Y-%m-%d"
+                ).date()
+            except ValueError:
+                pass
+    result = run_mms_to_fsl_sync(force=force, regions=regions, start_override=start_override)
     print(json.dumps(result, indent=2, default=str))

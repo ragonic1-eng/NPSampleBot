@@ -558,6 +558,56 @@ _PP_CODE_RE = re.compile(
 # pepper) while still catching common typos and spacing variations.
 _ALNUM_ONLY_RE = re.compile(r"[^a-z0-9]+")
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Stopwords used by token-aware matching — short connectors that would
+# otherwise pollute multi-word AND checks (e.g. 'fish AND chip' must
+# still match 'fish & chips' after the connector is dropped).
+_LASTSAMPLE_STOPWORDS = frozenset({"and", "or", "the", "of", "with", "in", "for", "to"})
+
+
+def _lastsample_query_tokens(s: str) -> list[str]:
+    """Lowercase + strip stopwords + drop 1-char tokens. Used by both
+    /lastsample's matcher and the pagination callback so behaviour is
+    identical across them."""
+    return [
+        t for t in _TOKEN_RE.findall((s or "").lower())
+        if len(t) >= 2 and t not in _LASTSAMPLE_STOPWORDS
+    ]
+
+
+def _match_lastsample_product(row: dict, query: str) -> bool:
+    """Match a single FSL row against `query` for the /lastsample +
+    /alllastsample product search. Three layers:
+      1. Code substring (strict — fuzzy on a code could route to the
+         wrong SKU).
+      2. Product name smart match (V1.12.6 — handles spacing & typos).
+      3. Multi-word AND check across name tokens (precision filter for
+         queries like 'spicy chicken below 4 usd').
+    """
+    name = (row.get("Product Name") or "").lower()
+    code = (row.get("Product Code") or "").lower()
+    q = (query or "").lower().strip()
+    if q and q in code:
+        return True
+    if _smart_text_match(query, name):
+        return True
+    q_tokens = _lastsample_query_tokens(query)
+    if q_tokens and len(q_tokens) > 1:
+        name_tokens = _lastsample_query_tokens(name)
+        if name_tokens:
+            for qt in q_tokens:
+                if not any(qt in nt for nt in name_tokens):
+                    return False
+            return True
+    return False
+
+
+def _filter_lastsample_products(rows: list[dict], query: str) -> list[dict]:
+    """Filter `rows` to product matches and return them sorted date-desc."""
+    matches = [r for r in rows if _match_lastsample_product(r, query)]
+    from datetime import date as _date
+    SENTINEL = _date(1900, 1, 1)
+    matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
+    return matches
 
 
 def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> bool:
@@ -1057,12 +1107,13 @@ async def cmd_lastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔎 <b>Find your last sample</b>\n\n"
         f"You're set up as <b>{h(mms_name)}</b> in MMS.\n\n"
         "<b>📎 Reply to this message</b> with a product name or keyword "
-        "(e.g. <i>BBQ</i>, <i>tom yum</i>, <i>S-668</i>). I'll search your "
-        "samples in <i>Full Sample Listing</i> and show the most recent match.\n\n"
+        "(e.g. <i>BBQ</i>, <i>tom yum</i>, <i>S-668</i>). I'll show your "
+        "<b>10 most recent matches</b> from <i>Full Sample Listing</i>, "
+        "with Next-page buttons if you have more.\n\n"
         "<i>Tips:</i>\n"
-        "<i>  • After I show a result, just type more words to narrow it down.</i>\n"
-        "<i>  • Or skip this prompt entirely: type </i>"
-        "<code>/lastsample asian thai</code><i> in one go.</i>"
+        "<i>  • Type more words to narrow further (e.g. add a region or flavour).</i>\n"
+        "<i>  • Spelling flexible — I handle small typos and missing spaces.</i>\n"
+        "<i>  • Or skip this prompt: </i><code>/lastsample asian thai</code><i> in one go.</i>"
         f"{sync_tail}",
         ForceReply(
             selective=False,
@@ -1107,14 +1158,15 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update,
         "🌐 <b>Find ANY rep's last sample</b>\n\n"
         "This searches <b>all reps' samples</b> in Full Sample Listing — "
-        "not just yours. Each result shows which rep handled the sample.\n\n"
+        "not just yours.\n\n"
         "<b>📎 Reply to this message</b> with a product name or keyword "
         "(e.g. <i>BBQ</i>, <i>tom yum</i>, <i>S-668</i>) or a customer name. "
-        "I'll show the most recent matching sample regardless of who sent it.\n\n"
+        "I'll show the <b>10 most recent matches</b>, who sent each, and "
+        "Next-page buttons for older results.\n\n"
         "<i>Tips:</i>\n"
-        "<i>  • After a result, type more words to narrow further.</i>\n"
-        "<i>  • Or skip this prompt: type </i>"
-        "<code>/alllastsample q land</code><i> in one go.</i>"
+        "<i>  • Type more words to narrow further.</i>\n"
+        "<i>  • Spelling flexible — I handle small typos and missing spaces.</i>\n"
+        "<i>  • Or skip this prompt: </i><code>/alllastsample q land</code><i> in one go.</i>"
         f"{sync_tail}",
         ForceReply(
             selective=False,
@@ -1823,72 +1875,135 @@ async def _run_lastsample_search(
         _re_arm("")
         return
 
-    # All matches are equally valid (binary containment). Sort by date desc
-    # so the user always sees the most recent sample. _date / SENTINEL are
-    # already in scope from the customer-match block above.
+    # V1.12.7 — paginated top-N display instead of single best match.
+    # Sort by date desc, then defer to _show_lastsample_results to render
+    # one page of 10 with Prev/Next buttons. Refinement chain is still
+    # re-armed so typing more text narrows further.
     candidates.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
-    best = candidates[0]
-
-    # Format date nicely; fall back to the raw string if parsing failed.
-    raw_date = best.get("Sample Date Out", "") or ""
-    parsed = best.get("_date")
-    pretty_date = parsed.strftime("%d %b %Y") if parsed else raw_date
-
-    # R&D price may be blank or numeric — render trimmed, and add USD suffix
-    # only when the value looks numeric.
-    rd_raw = (best.get("R&D Price") or "").strip()
-    if rd_raw:
-        try:
-            float(rd_raw)
-            rd_display = f"{rd_raw} USD"
-        except ValueError:
-            rd_display = rd_raw
-    else:
-        rd_display = "—"
-
-    title = "🎯 <b>Based on my search:</b>" + (
-        "  <i>(all reps)</i>" if scope == "all" else ""
+    await _show_lastsample_results(
+        update, ctx, candidates, query=query, scope=scope, page=0,
+        with_prev=bool(prev),
     )
-    lines = [
-        title,
-        "",
-        f"<b>Product Name:</b> {h(best.get('Product Name') or '—')}",
-        f"<b>Product Code:</b> <code>{h(best.get('Product Code') or '—')}</code>",
-        f"<b>Last sent out:</b> {h(pretty_date or '—')}",
-        f"<b>Customer Name:</b> {h(best.get('Customer Name') or '—')}",
-        f"<b>R&amp;D Price:</b> {h(rd_display)}",
+    _re_arm(query)
+
+
+_LASTSAMPLE_PAGE_SIZE = 10
+
+
+def _query_hash(q: str) -> str:
+    """10-char md5 of the query — used in pagination callbacks so the page
+    state survives across multi-replica deploys without depending on
+    user_data. We re-derive matches by re-running the search with this
+    query on whichever worker handles the click."""
+    import hashlib
+    return hashlib.md5((q or "").encode("utf-8")).hexdigest()[:10]
+
+
+async def _show_lastsample_results(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    candidates: list[dict],
+    query: str,
+    scope: str,
+    page: int,
+    with_prev: bool = False,
+) -> None:
+    """Render one page of /lastsample (or /alllastsample) results.
+
+    candidates : already date-sorted (most-recent first), already
+                 filtered against the query.
+    query      : the active search string — shown in the header and
+                 used as the pagination key.
+    scope      : 'self' or 'all'.
+    page       : 0-indexed page number.
+    with_prev  : True when this is a refinement turn (the rep typed
+                 more words) — adds a small 'searched:' note.
+    """
+    total = len(candidates)
+    total_pages = max(1, (total + _LASTSAMPLE_PAGE_SIZE - 1) // _LASTSAMPLE_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    start = page * _LASTSAMPLE_PAGE_SIZE
+    end = min(start + _LASTSAMPLE_PAGE_SIZE, total)
+    page_rows = candidates[start:end]
+
+    label = "Everyone's samples" if scope == "all" else "Your samples"
+    header_bits = [
+        f"🎯 <b>{label} — {start + 1}–{end} of {total} matches</b>"
     ]
-    # In all-scope mode, expose which rep handled this sample so the admin
-    # can follow up with the right person. Hidden in self-scope (the rep
-    # IS the caller, no value in repeating their own name).
-    if scope == "all":
-        sales_rep = (best.get("Sales") or "").strip() or "—"
-        lines.insert(2, f"<b>Sales rep:</b> {h(sales_rep)}")
-    # Show the user what their accumulated query is — useful after a few
-    # refinement steps so they don't lose track of context.
-    if prev:
+    if query:
+        header_bits.append(f"   <i>matching “{h(query)}”</i>")
+    if with_prev:
+        header_bits.append(f"   <i>(refined query)</i>")
+    lines: list[str] = header_bits + [""]
+
+    def _fmt_price(raw: str) -> str:
+        s = (raw or "").strip()
+        if not s:
+            return ""
+        try:
+            float(s)
+            return f"USD {s}"
+        except ValueError:
+            return s
+
+    for i, r in enumerate(page_rows, start + 1):
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        name = (r.get("Product Name") or "—").strip()
+        code = (r.get("Product Code") or "—").strip().upper()
+        price_str = _fmt_price(r.get("R&D Price") or "")
+        customer = (r.get("Customer Name") or "—").strip()
+        sales = (r.get("Sales") or "").strip()
+
+        # Line 1: number + product name (bold).
+        lines.append(f"<b>{i}. {h(name)}</b>")
+        # Line 2: code · price · date — meta line, bullet-separated.
+        meta_parts: list[str] = [f"<code>{h(code)}</code>"]
+        if price_str:
+            meta_parts.append(h(price_str))
+        meta_parts.append(h(date_str))
+        lines.append("   " + " · ".join(meta_parts))
+        # Line 3: customer (always) + sales rep (only in all-scope).
+        cust_line = f"   👤 {h(customer)}"
+        if scope == "all" and sales:
+            cust_line += f"  <i>· sent by {h(sales)}</i>"
+        lines.append(cust_line)
+        # Spacer between results.
         lines.append("")
-        lines.append(f"<i>🔍 Searched: {h(query)}</i>")
-    # If there are several plausible matches, prompt the user to keep
-    # narrowing. Just type more words — refinement is persistent.
-    others = len(candidates) - 1
-    if others > 0:
-        if not prev:
-            lines.append("")
-        lines.append(
-            f"<i>({others} other match{'es' if others > 1 else ''} found — "
-            "type more words to narrow further, or tap 🔎 Find another to start over.)</i>"
-        )
 
     sync_footer = await _last_sync_footer()
     if sync_footer:
-        lines.append("")
         lines.append(f"<i>{sync_footer}</i>")
 
-    await send(update, "\n".join(lines), _last_kb(scope))
-    # Persist this query so the next text the user sends is treated as a
-    # refinement on top of it.
-    _re_arm(query)
+    # Pagination buttons. Encoded as lspr:<s|a>:<page>:<query_hash>.
+    # Stash the query against the hash in user_data so the page-flip
+    # callback can recover it; on multi-replica deploys we fall back to
+    # re-deriving from sheet on whichever worker handles the click.
+    qhash = _query_hash(query)
+    s_letter = "a" if scope == "all" else "s"
+    pager_state = ctx.user_data.setdefault("lspr_query_cache", {})
+    pager_state[qhash] = {"query": query, "scope": scope}
+    # Keep the cache from growing forever — only the 8 most recent.
+    if len(pager_state) > 8:
+        for k in list(pager_state.keys())[:-8]:
+            pager_state.pop(k, None)
+
+    nav_row: list[tuple[str, str]] = []
+    if page > 0:
+        if page > 1:
+            nav_row.append(("⏮ First", f"lspr:{s_letter}:0:{qhash}"))
+        nav_row.append(("◀ Prev", f"lspr:{s_letter}:{page - 1}:{qhash}"))
+    if end < total:
+        next_count = min(_LASTSAMPLE_PAGE_SIZE, total - end)
+        nav_row.append((f"Next {next_count} ▶", f"lspr:{s_letter}:{page + 1}:{qhash}"))
+
+    again_cb = "lastsample:again_all" if scope == "all" else "lastsample:again"
+    btn_rows: list[list[tuple[str, str]]] = []
+    if nav_row:
+        btn_rows.append(nav_row)
+    btn_rows.append([("🔎 Find another", again_cb), ("🏠 Main menu", "menu:home")])
+
+    await send(update, "\n".join(lines).rstrip(), kb(btn_rows))
 
 
 _CUST_PAGE_SIZE = 10
@@ -3184,6 +3299,78 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         await _show_customer_samples(update, ctx, mms, chosen, scope=cs_scope, page=page)
+        return
+
+    # V1.12.7 — /lastsample + /alllastsample product-results pagination.
+    # Format: lspr:<s|a>:<page>:<query_hash>. We recover the query from
+    # ctx.user_data['lspr_query_cache']; on a cache miss (e.g. multi-
+    # replica deploy where the click landed on a different worker), we
+    # ask the rep to re-search. Could be made fully stateless by
+    # encoding the query in the callback like lsd: does, but query can
+    # be long (refined multi-word) and Telegram caps callback_data at
+    # 64 bytes — the cache approach is simpler.
+    if data.startswith("lspr:"):
+        parts = data.split(":", 3)
+        if len(parts) < 4:
+            return
+        _, scope_letter, page_str, qhash = parts
+        cs_scope = "all" if scope_letter == "a" else "self"
+        try:
+            page = int(page_str)
+        except ValueError:
+            return
+        pager_state = ctx.user_data.get("lspr_query_cache", {}) or {}
+        cached = pager_state.get(qhash)
+        if not cached:
+            await send(
+                update,
+                "🤔 The search context expired (probably a redeploy). "
+                "Please tap 🔎 Find another to start a new search.",
+                _last_kb(cs_scope),
+            )
+            return
+        query = cached.get("query") or ""
+        # Resolve mms_name for self-scope (cache → sheet fallback).
+        mms = ""
+        if cs_scope == "self":
+            mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
+                sheets.get_user_mms_name,
+                update.effective_user.id, update.effective_user.username,
+            )
+            if not mms:
+                await send(
+                    update,
+                    "🛑 I can't see your <b>MMS Name</b> — ask the admin to "
+                    "set it on the <i>Authorized Users</i> tab.",
+                )
+                return
+            ctx.user_data["lastsample_mms_name"] = mms
+        # Reload + filter using the same matcher the original search used.
+        try:
+            if cs_scope == "all":
+                rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
+            else:
+                rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms)
+        except Exception as e:  # noqa: BLE001
+            log.exception("lastsample pagination read failed")
+            await send(
+                update,
+                f"😕 Couldn't read Full Sample Listing: {h(str(e))}",
+                _last_kb(cs_scope),
+            )
+            return
+        candidates = _filter_lastsample_products(rows, query)
+        if not candidates:
+            await send(
+                update,
+                f"🤷 No matches for <b>{h(query)}</b> in the current sample "
+                "list (data may have changed since your search).",
+                _last_kb(cs_scope),
+            )
+            return
+        await _show_lastsample_results(
+            update, ctx, candidates, query=query, scope=cs_scope, page=page,
+        )
         return
 
     # Main menu and /samples browsing work with or without a draft.

@@ -1400,17 +1400,67 @@ async def _run_seasoning_search(
         )
         return
 
-    # Price cap (if user typed 'below $4' or similar). Empty / non-numeric
-    # prices are treated as a hard exclude when a cap is in play — better
-    # than silently surfacing "USD" rows that may be way over budget.
+    # V1.12.12 — price-cap filter rewritten to handle currency-prefixed
+    # values (the actual data has 'USD 5.44', 'SGD 6.60', 'THB 223.5',
+    # 'IDR 59,322'). Previous version did naive float() which failed on
+    # ALL rows and silently returned zero matches for any price-filtered
+    # query.
+    #
+    # Conversion rates are approximate but stable enough for filtering;
+    # the rep is asking "≤ $X USD" as a rough budget filter, not a
+    # quotation. If they need exact pricing they tap /pp.
+    _USD_RATE = {
+        "USD": 1.0,
+        "SGD": 0.74,
+        "THB": 0.029,
+        "IDR": 0.000063,
+        "MYR": 0.21,
+        "IDR.": 0.000063,  # tolerate stray punctuation
+    }
+    _PRICE_PARSE_RE = re.compile(
+        r"^([A-Z]{3,4}|RM|S\$|\$)\s*([\d,]+(?:\.\d+)?)$",
+        re.IGNORECASE,
+    )
+
+    def _row_price_usd(r: dict) -> float | None:
+        """Extract a USD-equivalent price from the R&D Price column.
+        Returns None when the value is empty, malformed, or in a
+        currency we don't recognise."""
+        raw = (r.get("R&D Price") or "").strip()
+        if not raw:
+            return None
+        # Bare number (legacy / Singapore master)
+        try:
+            v = float(raw.replace(",", ""))
+            return v if v > 0 else None
+        except ValueError:
+            pass
+        m = _PRICE_PARSE_RE.match(raw)
+        if not m:
+            return None
+        cur_raw, num_raw = m.group(1).upper(), m.group(2).replace(",", "")
+        cur_norm = {"S$": "SGD", "$": "USD", "RM": "MYR"}.get(cur_raw, cur_raw)
+        try:
+            v = float(num_raw)
+        except ValueError:
+            return None
+        if v <= 0:
+            return None
+        rate = _USD_RATE.get(cur_norm)
+        return v * rate if rate is not None else None
+
+    soft_price_fallback = False
     if max_price is not None:
-        def _row_price(r):
-            try:
-                return float(str(r.get("R&D Price") or "").strip())
-            except (ValueError, TypeError):
-                return None
+        before = list(rows)  # remember pre-filter set for soft fallback
         rows = [r for r in rows
-                if _row_price(r) is not None and 0 < _row_price(r) <= max_price]
+                if _row_price_usd(r) is not None
+                and _row_price_usd(r) <= max_price]
+        if not rows:
+            # Strict filter killed everything → fall back to no-cap so the
+            # rep can see closest-to-budget products. We surface the
+            # trade-off in the header so they know we softened the filter.
+            rows = before
+            soft_price_fallback = True
 
     # V1.12.11 — name-priority matching with taste fallback.
     #
@@ -1580,7 +1630,13 @@ async def _run_seasoning_search(
     # split between name matches and taste-only fallbacks.
     header_bits = [f"🔎 <b>{label} — {len(top)} of {total_unique} products</b>"]
     if max_price is not None:
-        header_bits.append(f"   <i>≤ ${max_price:g} USD</i>")
+        if soft_price_fallback:
+            header_bits.append(
+                f"   ⚠️ <i>No products under <b>${max_price:g} USD</b> — "
+                "showing closest above-budget options.</i>"
+            )
+        else:
+            header_bits.append(f"   <i>≤ ${max_price:g} USD</i>")
     if cleaned:
         header_bits.append(f"   <i>matching “{h(cleaned)}”</i>")
     if n_name == 0 and n_taste > 0:

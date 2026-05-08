@@ -626,6 +626,40 @@ def _filter_lastsample_products(rows: list[dict], query: str) -> list[dict]:
     return matches
 
 
+async def _load_lastsample_rows(scope: str, mms_name: str = "") -> list[dict]:
+    """Load FSL rows for /lastsample + /alllastsample from BOTH the
+    Singapore tab (S- and B-codes) AND the Jakarta tab (J-codes), then
+    return the merged list.
+
+    V1.12.9 fix: was loading only FSL_TAB by default, so any J-code
+    query (e.g. 'J-X4Ua5-01') silently returned 'no match' even though
+    the J-code existed in the Jakarta tab. Now both regions are
+    searched together — the matcher is scope-agnostic anyway, it just
+    needs the union of rows to look at.
+
+    scope='all'  → all reps' samples in both tabs
+    scope='self' → mms_name's samples in both tabs
+
+    When the Bangkok (T-code) tab gets backfilled, add it here.
+    """
+    region_tabs = (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB)
+    rows: list[dict] = []
+    for tab in region_tabs:
+        try:
+            if scope == "all":
+                part = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
+            else:
+                part = await asyncio.to_thread(
+                    sheets.load_fsl_rows_for_sales, mms_name, tab,
+                )
+            rows.extend(part)
+        except Exception as e:  # noqa: BLE001
+            # One tab failing shouldn't kill the whole search — log and
+            # keep going with whatever we got from the other tab(s).
+            log.warning("_load_lastsample_rows: tab %r read failed: %s", tab, e)
+    return rows
+
+
 def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> bool:
     """Match `query` against `target` with progressive tolerance.
 
@@ -1651,13 +1685,12 @@ async def _run_lastsample_search(
         _re_arm(prev)  # leave whatever was there alone
         return
 
-    # Scope-aware FSL load. 'self' filters to this rep; 'all' is admin-only
-    # and reads every row regardless of Sales.
+    # Scope-aware FSL load — V1.12.9: now reads BOTH Singapore and
+    # Jakarta tabs so J-code queries are visible to /alllastsample +
+    # /lastsample. _load_lastsample_rows handles the per-tab read errors
+    # internally (a single tab failing degrades gracefully).
     try:
-        if scope == "all":
-            rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
-        else:
-            rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
+        rows = await _load_lastsample_rows(scope, mms_name)
     except Exception as e:  # noqa: BLE001
         log.exception("lastsample: FSL read failed")
         await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _last_kb(scope))
@@ -2029,10 +2062,7 @@ async def _show_customer_samples(
     ctx.user_data for the active page.
     """
     try:
-        if scope == "all":
-            rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
-        else:
-            rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms_name)
+        rows = await _load_lastsample_rows(scope, mms_name)
     except Exception as e:  # noqa: BLE001
         log.exception("lastsample: FSL read failed for customer view")
         await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _last_kb(scope))
@@ -3195,12 +3225,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             ctx.user_data["lastsample_mms_name"] = mms
         ctx.user_data["lastsample_scope"] = cs_scope
-        # Re-derive the unique customer set in the right scope.
+        # Re-derive the unique customer set in the right scope (both regions).
         try:
-            if cs_scope == "all":
-                rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
-            else:
-                rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms)
+            rows = await _load_lastsample_rows(cs_scope, mms)
         except Exception as e:  # noqa: BLE001
             log.exception("lastsample: FSL read failed during customer-pick callback")
             await send(
@@ -3264,13 +3291,10 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             ctx.user_data["lastsample_mms_name"] = mms
         ctx.user_data["lastsample_scope"] = cs_scope
-        # Re-derive the customer name from its hash by scanning the right
-        # FSL slice for this scope.
+        # Re-derive the customer name from its hash by scanning both regions
+        # in the right scope.
         try:
-            if cs_scope == "all":
-                rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
-            else:
-                rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms)
+            rows = await _load_lastsample_rows(cs_scope, mms)
         except Exception as e:  # noqa: BLE001
             log.exception("lastsample: FSL read failed during paginate callback")
             await send(
@@ -3343,12 +3367,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             ctx.user_data["lastsample_mms_name"] = mms
-        # Reload + filter using the same matcher the original search used.
+        # Reload (both regions) + filter using the same matcher.
         try:
-            if cs_scope == "all":
-                rows = await asyncio.to_thread(sheets.load_fsl_rows_all)
-            else:
-                rows = await asyncio.to_thread(sheets.load_fsl_rows_for_sales, mms)
+            rows = await _load_lastsample_rows(cs_scope, mms)
         except Exception as e:  # noqa: BLE001
             log.exception("lastsample pagination read failed")
             await send(

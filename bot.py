@@ -1238,50 +1238,101 @@ async def _run_seasoning_search(
         )
         return
 
-    # Most recent first, take top N.
+    # Dedupe by product code, keeping the most-recent sample event for
+    # each unique code. Reps want to see "10 distinct products that match"
+    # rather than "10 sample events" (which can be the same product
+    # repeated). Sample frequency is included as a small popularity tag
+    # so reps can still tell "this code has been requested often".
     matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
-    top = matches[:_SEARCH_TOP_N]
-    total = len(matches)
+    by_code: dict[str, dict] = {}
+    code_counts: dict[str, int] = {}
+    for r in matches:
+        code = (r.get("Product Code") or "").strip().upper()
+        if not code:
+            continue
+        code_counts[code] = code_counts.get(code, 0) + 1
+        if code not in by_code:
+            by_code[code] = r  # first occurrence is the most recent (already sorted)
+    unique_matches = list(by_code.values())  # already in date-desc order
+    top = unique_matches[:_SEARCH_TOP_N]
+    total_unique = len(unique_matches)
+    total_events = len(matches)
 
-    lines = [f"🔎 <b>{label} — top {len(top)} of {total} matches</b>"]
+    # Header. Plural-handling for the count.
+    header_bits = [f"🔎 <b>{label} — {len(top)} of {total_unique} products</b>"]
     if max_price is not None:
-        lines.append(f"<i>Filter: ≤ ${max_price:g} USD</i>")
-    lines.append("")
+        header_bits.append(f"   <i>≤ ${max_price:g} USD</i>")
+    if cleaned:
+        header_bits.append(f"   <i>matching “{h(cleaned)}”</i>")
+    lines: list[str] = header_bits + [""]
+
+    def _fmt_price(raw: str) -> str:
+        """USD-prefix bare numeric prices; pass through anything that
+        already has currency text (e.g. 'IDR 76,891', 'THB 162.9').
+        Matches the /lastsample formatter so search and lastsample look
+        consistent."""
+        s = (raw or "").strip()
+        if not s:
+            return ""
+        try:
+            float(s)
+            return f"USD {s}"
+        except ValueError:
+            return s
+
+    def _truncate_at_word(s: str, n: int) -> str:
+        """Truncate to <= n chars at the last word boundary (so we don't
+        chop mid-word like 'savoury he…'). Falls back to a hard cut if no
+        space is found in the head."""
+        if len(s) <= n:
+            return s
+        head = s[: n - 1]
+        cut = head.rfind(" ")
+        if cut > n // 2:  # only word-cut if it doesn't lose too much
+            head = head[:cut]
+        return head.rstrip(",;: ") + "…"
+
     for i, r in enumerate(top, 1):
         d = r.get("_date")
         date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
         name = (r.get("Product Name") or "—").strip()
-        code = (r.get("Product Code") or "—").strip()
-        price = (r.get("R&D Price") or "").strip()
-        price_str = f"USD {price}" if price else "—"
+        code = (r.get("Product Code") or "—").strip().upper()
+        price_str = _fmt_price(r.get("R&D Price") or "")
         taste = (r.get("Taste describe") or "").strip()
         category = (r.get("Category") or "").strip()
-        # First line: number + code + name + price
-        lines.append(
-            f" {i}. <code>{h(code)}</code> · <b>{h(name)}</b> · {h(price_str)}"
-        )
-        # Indented metadata lines (taste, category, last sample date)
-        meta_bits = []
-        if taste:
-            t = taste[:90] + "…" if len(taste) > 90 else taste
-            meta_bits.append(f"taste: {t}")
-        if category:
-            meta_bits.append(f"category: {category}")
-        meta_bits.append(f"last sample: {date_str}")
-        for mb in meta_bits:
-            lines.append(f"     <i>{h(mb)}</i>")
+        n_samples = code_counts.get(code, 1)
 
-    if total > _SEARCH_TOP_N:
+        # Line 1: number + product name (bold).
+        lines.append(f"<b>{i}. {h(name)}</b>")
+        # Line 2: code · price · date · category · sample count — each piece
+        # HTML-escaped at construction so we don't accidentally emit broken
+        # markup if a sheet cell contains < > & chars.
+        meta_parts: list[str] = [f"<code>{h(code)}</code>"]
+        if price_str:
+            meta_parts.append(h(price_str))
+        meta_parts.append(h(date_str))
+        if category:
+            meta_parts.append(h(category))
+        if n_samples > 1:
+            meta_parts.append(f"{n_samples}× sampled")
+        lines.append("   " + " · ".join(meta_parts))
+        # Line 3: italic taste, single short line truncated at a word
+        # boundary so results don't wrap awkwardly on phone screens.
+        if taste:
+            lines.append(f"   <i>{h(_truncate_at_word(taste, 80))}</i>")
+        # Blank line between results for visual breathing room.
         lines.append("")
+
+    # Trailing footer if there are more unique products than we showed.
+    if total_unique > _SEARCH_TOP_N:
         lines.append(
-            f"<i>Showing the {_SEARCH_TOP_N} most recent. "
-            f"{total - _SEARCH_TOP_N} more matches in history — refine your "
-            "search to narrow down.</i>"
+            f"<i>Showing {_SEARCH_TOP_N} of {total_unique} products. "
+            f"({total_events} sample events total — refine to narrow down.)</i>"
         )
 
     await send(
         update,
-        "\n".join(lines),
+        "\n".join(lines).rstrip(),
         kb([[("🔎 Search again", "menu:search"),
              ("🏠 Main menu", "menu:home")]]),
     )

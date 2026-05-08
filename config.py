@@ -28,7 +28,11 @@ CUSTOMER_MASTER_SHEET_ID = os.getenv(
 CUSTOMER_MASTER_WORKSHEET_NAME = os.getenv("CUSTOMER_MASTER_WORKSHEET_NAME", "Sheet1")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+# Haiku is the default — used by ai.rerank_seasonings() for semantic
+# catalog search ranking. Plenty good for picking among 3–10 fuzzy
+# candidates and ~3x cheaper than Sonnet ($1/$5 input/output per Mtok
+# vs Sonnet's $3/$15). Override via env if a future task needs Sonnet.
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")

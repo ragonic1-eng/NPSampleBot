@@ -684,23 +684,60 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         raw_dec = Decimal(str(product.raw_material_cost_usd))
         rounded_up = float(raw_dec.quantize(Decimal("0.1"), rounding=ROUND_CEILING))
         adj_rmc = rounded_up + config.RMC_MARKUP_USD
-        rd = (
-            f"USD {product.rd_price_usd:.2f}"
-            if product.rd_price_usd is not None else "—"
-        )
+
+        # R&D price — V1.12.4: fall back to the FSL/Jakarta tab when MMS
+        # has no R&D price set. Common on J-codes (Indonesia factory's
+        # MMS doesn't always carry R&D pricing for older formulations)
+        # and on legacy B-codes. The sample tab has whatever price was
+        # recorded when the sample was last raised, which is usually
+        # close enough to the current quote — better than showing "—".
+        rd_from_fsl_raw = ""
+        if product.rd_price_usd is None:
+            try:
+                fsl_row = await asyncio.to_thread(
+                    sheets.find_fsl_product_by_code, asked,
+                )
+                rd_from_fsl_raw = (
+                    (fsl_row.get("R&D Price") or "").strip() if fsl_row else ""
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("/pp FSL fallback for %s failed: %s", asked, e)
+
+        if product.rd_price_usd is not None:
+            rd_line = f"USD {product.rd_price_usd:.2f}"
+        elif rd_from_fsl_raw:
+            try:
+                # Bare numeric → assume USD (matches the FSL-only reply path)
+                float(rd_from_fsl_raw)
+                rd_line = f"USD {rd_from_fsl_raw} <i>(last sampled)</i>"
+            except ValueError:
+                # Already has currency text (e.g. 'IDR 59,322')
+                rd_line = f"{h(rd_from_fsl_raw)} <i>(last sampled)</i>"
+        else:
+            rd_line = "—"
+
         body = (
             f"<b>Code:</b> <code>{h(product.code)}</code>\n"
             f"<b>Name:</b> {h(product.name)}\n"
-            f"<b>R&amp;D Price:</b> {h(rd)}\n"
+            f"<b>R&amp;D Price:</b> {rd_line}\n"
             f"<b>Raw Material Cost:</b> USD {adj_rmc:.2f}"
         )
         await _replace(body)
+        # For audit, log the FSL fallback as a numeric only if it parses
+        # cleanly to a float — non-USD currency text isn't comparable, so
+        # leave it None there.
+        rd_for_audit = product.rd_price_usd
+        if rd_for_audit is None and rd_from_fsl_raw:
+            try:
+                rd_for_audit = float(rd_from_fsl_raw)
+            except ValueError:
+                rd_for_audit = None
         _audit(
             query=code,
-            result="Found",
+            result="Found" if product.rd_price_usd is not None else "Found (FSL fallback)",
             matched_code=product.code,
             name=product.name,
-            rd_price_usd=product.rd_price_usd,
+            rd_price_usd=rd_for_audit,
             raw_material_cost_usd=adj_rmc,
         )
 

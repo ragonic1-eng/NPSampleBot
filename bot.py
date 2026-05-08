@@ -2755,8 +2755,24 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Refinement: append the new text to whatever query was active
         # before. A "🔎 Find another" tap wipes the active query, so the
         # next message starts a fresh search.
+        #
+        # V1.12.10 — two corrections to the chain logic:
+        #   (a) Code-shape queries are ALWAYS fresh — never refinements.
+        #       A rep typing 'J-49JS1-03' wants that exact code, not
+        #       'previous_keyword J-49JS1-03'. Reset active before
+        #       combining.
+        #   (b) If the new text is identical to the active query (user
+        #       accidentally double-sent, or tapped Send twice), don't
+        #       stack 'X X' which won't match anything — just re-run
+        #       the same search.
         active = (ctx.user_data.get("lastsample_active_query") or "").strip()
-        combined = (active + " " + text).strip() if active else text.strip()
+        text_stripped = text.strip()
+        if _PP_CODE_RE.search(text_stripped.upper()):
+            active = ""  # (a)
+        if text_stripped == active:
+            combined = active  # (b) — same query, no refinement
+        else:
+            combined = (active + " " + text_stripped).strip() if active else text_stripped
         await _run_lastsample_search(
             update, ctx, mms_name, combined, prev=active, scope=scope,
         )
@@ -3602,6 +3618,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _handle_menu_callback(update, ctx, action: str):
     """Top-level /start menu — pick what the user wants to do."""
     user = update.effective_user
+    # V1.12.10 — clear ALL awaiting-text flags when the rep navigates the
+    # menu, so a stale one from an abandoned earlier flow (e.g. tapped
+    # ✏️ Enter a code, never replied, then tapped 🌐 What everyone Send
+    # ah and typed) can't cross-route the next text to /pp instead of
+    # /alllastsample. The action-specific branch below will re-set the
+    # right flag for whichever flow the rep actually picked. Without
+    # this, on multi-replica deploys the worker that still holds the
+    # stale flag wins the routing race.
+    ctx.user_data.pop("awaiting_code_text", None)
+    ctx.user_data.pop("awaiting_lastsample_query", None)
+    ctx.user_data.pop("awaiting_search_query", None)
     if action == "home":
         await cmd_start(update, ctx)
         return

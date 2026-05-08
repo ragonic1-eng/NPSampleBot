@@ -429,9 +429,16 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     # Don't start a draft yet — wait for the user to pick "new request".
     state.clear(user.id)
+    # V1.12.0:
+    #   • removed the "Paste a multi-seasoning email" button (the /bulk
+    #     command still works if a user types it directly — just decluttered
+    #     the menu for new hires)
+    #   • added "🔎 Search seasonings" — region-aware browse-only search
+    #     that lets reps explore the SG / ID / TH sample history without
+    #     raising a sample request
     menu = [
         [("🌶 Find a seasoning & raise request", "menu:new")],
-        [("📄 Paste a multi-seasoning email", "menu:bulk")],
+        [("🔎 Search seasonings", "menu:search")],
         [("📷 Scan a product photo", "menu:scan")],
         [("✏️ Enter a code (price lookup)", "menu:code")],
         [("🤔 What I send ah?", "menu:lastsample")],
@@ -442,7 +449,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # JobQueue (see main()). No manual Telegram trigger.
     await send(
         update,
-        "👋 <b>Hi there — what can I help with?</b>",
+        "👋 <b>Hi! I help you raise sample requests and look up seasonings.</b>\n\n"
+        "<i>Tap a button below — or type /help anytime to see what each command does.</i>",
         kb(menu),
     )
 
@@ -525,13 +533,17 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Match seasoning codes. History of one-segment-at-a-time fixes:
 #   V1.6.x: one optional '-XX' suffix → broke on S-TXF06-00-03
 #   V1.9.7: up to 3 suffixes        → would break on a 5-segment code
-#   V1.9.8: up to 6 suffixes (this) → covers anything we've seen and
+#   V1.9.8: up to 6 suffixes        → covers anything we've seen and
 #           leaves headroom (e.g. S-T4C83-35-07-11 has 3, but the user
 #           wants margin so we don't chase regex bumps every time R&D
 #           introduces a new naming layer)
-# Anchored on 'S-' + 3+ alphanumerics so we don't grab unrelated tokens.
+#   V1.12.0: extended to also match J- (Indonesia, Jakarta factory) and
+#           T- (Thailand, Bangkok factory). find_fsl_product_by_code in
+#           sheets.py auto-routes by prefix to the matching tab, so /pp
+#           and the new search just need to extract the code.
+# Anchored on [SJT]- + 3+ alphanumerics so we don't grab unrelated tokens.
 _PP_CODE_RE = re.compile(
-    r"\bS-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,6}\b",
+    r"\b[SJT]-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,6}\b",
     re.IGNORECASE,
 )
 
@@ -985,6 +997,290 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             input_field_placeholder="e.g. q land, tom yum, S-668",
         ),
         force_new=True,
+    )
+
+
+# =====================================================================
+# V1.12.0 — Browse-only seasoning search (Search seasonings menu button)
+# =====================================================================
+#
+# Decoupled from the existing 'Find a seasoning & raise request' flow:
+# this search is purely exploratory (no draft, no sample request raised).
+# Asks the rep which factory's catalog to browse — Singapore (S-codes),
+# Indonesia (J-codes), or Thailand (T-codes, when ready) — then accepts
+# free text or a product code. Code-prefix auto-detection bypasses the
+# region picker entirely (a J-49JS1-03 query routes straight to /pp).
+#
+# Data source per region:
+#   SG → 'Full Sample Listing' (FSL_TAB), filtered to last 36 months
+#   ID → 'Full Sample Listing Jakarta' (JAKARTA_FSL_TAB), last 36 months
+#   TH → not yet wired (Bangkok backfill pending)
+#
+# Why sample history (not Seasoning Master): user prefers showing
+# 'what's actually been sampled recently' over 'what's in the curated
+# catalog', because Indonesia/Thailand don't have curated catalogs yet
+# and this gives a uniform UX across regions.
+_SEARCH_TOP_N = 10
+_SEARCH_RECENT_MONTHS = 36
+
+
+_REGION_TAB = {
+    "sg": ("🇸🇬 Singapore", lambda: sheets.FSL_TAB),
+    "id": ("🇮🇩 Indonesia", lambda: sheets.JAKARTA_FSL_TAB),
+}
+
+
+async def _start_seasoning_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point for the 🔎 Search seasonings flow. Shows region picker."""
+    # Wipe any prior search context — picker should always start clean.
+    ctx.user_data.pop("awaiting_search_query", None)
+    ctx.user_data.pop("search_region", None)
+    btns = kb([
+        [("🇸🇬 Singapore (S-codes)", "srch:reg:sg")],
+        [("🇮🇩 Indonesia (J-codes)", "srch:reg:id")],
+        [("🇹🇭 Thailand — coming soon", "srch:reg:th")],
+        [("🏠 Main menu", "menu:home")],
+    ])
+    await send(
+        update,
+        "🔎 <b>Search seasonings</b>\n\n"
+        "Which factory's sample list to search?\n\n"
+        "<i>Tip: if you already know the product code (<code>S-668U1</code>, "
+        "<code>J-49JS1-03</code>, etc.), you can also tap "
+        "<i>✏️ Enter a code</i> on the main menu — I auto-route by prefix.</i>",
+        btns,
+    )
+
+
+async def _handle_search_callback(update, ctx, action: str) -> None:
+    """Dispatch srch:* callbacks. Currently only 'reg:<sg|id|th>'."""
+    if not action.startswith("reg:"):
+        return
+    region = action.split(":", 1)[1].lower()
+    if region == "th":
+        await send(
+            update,
+            "🇹🇭 <b>Thailand catalog isn't ready yet.</b>\n\n"
+            "We'll backfill the Bangkok factory sample list soon. "
+            "For now please pick 🇸🇬 Singapore or 🇮🇩 Indonesia.",
+            kb([[("🔎 Pick another region", "menu:search"),
+                 ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+    if region not in _REGION_TAB:
+        return
+    label, _tab_fn = _REGION_TAB[region]
+    ctx.user_data["awaiting_search_query"] = True
+    ctx.user_data["search_region"] = region
+    # ForceReply so group-chat replies attach correctly even across multi-
+    # replica deploys (same pattern as /lastsample).
+    await send(
+        update,
+        f"🔎 <b>Search {label} seasonings</b>\n\n"
+        "<b>📎 Reply to this message</b> with what you're looking for. You can mix:\n"
+        "  • Keywords / taste — <code>spicy chicken</code>, <code>rendang</code>\n"
+        "  • Price filter — <code>cheese below $4</code>\n"
+        "  • Product code — <code>S-668U1</code> or <code>J-49JS1-03</code> "
+        "(auto-routes by prefix, no region needed)\n\n"
+        f"<i>I'll show up to {_SEARCH_TOP_N} most-recent matches from the "
+        f"last {_SEARCH_RECENT_MONTHS} months.</i>",
+        ForceReply(
+            selective=False,
+            input_field_placeholder="e.g. spicy chicken below $4",
+        ),
+        force_new=True,
+    )
+
+
+async def _run_seasoning_search(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    region: str,
+    query: str,
+) -> None:
+    """Search the region's sample tab for free-text matches, reply top-N."""
+    if region not in _REGION_TAB:
+        await send(update, "🤔 Unknown region — please tap 🔎 Search seasonings to retry.")
+        return
+    label, tab_fn = _REGION_TAB[region]
+    tab = tab_fn()
+
+    # Code-prefix shortcut: if the user typed a recognisable code anywhere
+    # in their query, hand off to /pp directly (auto-routes by prefix
+    # via sheets.find_fsl_product_by_code). Saves them retyping it as
+    # an "Enter a code" lookup.
+    code_hits = _PP_CODE_RE.findall(query)
+    if code_hits:
+        unique = _dedupe_codes(code_hits, cap=5)
+        await _run_pp_for_codes(update, unique)
+        return
+
+    # Strip out price filter (matcher already handles 'under $X', 'below
+    # 4 usd' etc) before keyword matching against the catalog.
+    cleaned, max_price = matcher.parse_seasoning_query(query)
+    cleaned = (cleaned or "").strip()
+
+    if len(cleaned) < 2 and max_price is None:
+        await send(
+            update,
+            "🤏 That's too short — try a keyword (e.g. <code>BBQ</code>), "
+            "a code (<code>S-668</code>), or a price filter "
+            "(<code>cheese below $4</code>).",
+            kb([[("🔎 Search again", "menu:search"),
+                 ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    try:
+        rows = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
+    except Exception as e:  # noqa: BLE001
+        log.exception("seasoning_search: read failed for %s", tab)
+        await send(
+            update,
+            f"😕 Couldn't read {label} sample list: {h(str(e))}",
+            kb([[("🔎 Search again", "menu:search"),
+                 ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    if not rows:
+        await send(
+            update,
+            f"📭 {label} sample list is empty.",
+            kb([[("🔎 Search again", "menu:search"),
+                 ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    # 36-month recency filter. Rows whose date didn't parse get a sentinel
+    # of (1900-01-01) and naturally fall outside the cutoff.
+    from datetime import date as _date, timedelta as _td
+    cutoff = _date.today() - _td(days=int(_SEARCH_RECENT_MONTHS * 30.5))
+    SENTINEL = _date(1900, 1, 1)
+    rows = [r for r in rows if (r.get("_date") or SENTINEL) >= cutoff]
+    if not rows:
+        await send(
+            update,
+            f"📭 No samples in the last {_SEARCH_RECENT_MONTHS} months for {label}.",
+            kb([[("🔎 Search again", "menu:search"),
+                 ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    # Price cap (if user typed 'below $4' or similar). Empty / non-numeric
+    # prices are treated as a hard exclude when a cap is in play — better
+    # than silently surfacing "USD" rows that may be way over budget.
+    if max_price is not None:
+        def _row_price(r):
+            try:
+                return float(str(r.get("R&D Price") or "").strip())
+            except (ValueError, TypeError):
+                return None
+        rows = [r for r in rows
+                if _row_price(r) is not None and 0 < _row_price(r) <= max_price]
+
+    # Strict containment matching — same rules as /lastsample so behaviour
+    # is consistent across both flows.
+    if cleaned:
+        _word_re = re.compile(r"[a-z0-9]+")
+        _STOPWORDS = {"and", "or", "the", "of", "with", "in", "for", "to"}
+
+        def _tokens(s: str) -> list[str]:
+            return [t for t in _word_re.findall((s or "").lower())
+                    if len(t) >= 2 and t not in _STOPWORDS]
+
+        q_lower = cleaned.lower()
+        q_tokens = _tokens(cleaned)
+
+        def _matches(row: dict) -> bool:
+            name = (row.get("Product Name") or "").lower()
+            code = (row.get("Product Code") or "").lower()
+            taste = (row.get("Taste describe") or "").lower()
+            if q_lower in code or q_lower in name or q_lower in taste:
+                return True
+            if not q_tokens:
+                return False
+            # Tokens may appear in name OR taste describe (so 'spicy
+            # chicken' matches a product whose name says 'CHICKEN' and
+            # whose taste describe mentions 'spicy savoury chicken').
+            haystack_tokens = _tokens(name) + _tokens(taste)
+            if not haystack_tokens:
+                return False
+            for qt in q_tokens:
+                if not any(qt in nt for nt in haystack_tokens):
+                    return False
+            return True
+
+        matches = [r for r in rows if _matches(r)]
+    else:
+        # Pure price-filter query — show recent rows matching the cap.
+        matches = rows
+
+    if not matches:
+        bits = [f"🤷 No matches for <b>{h(query)}</b> in {label} "
+                f"sample list (last {_SEARCH_RECENT_MONTHS} months)."]
+        if max_price is not None:
+            bits.append(f"<i>Price filter: ≤ ${max_price:g} USD</i>")
+        bits.append("")
+        bits.append("<i>Tips:</i>")
+        bits.append("<i>  • Try shorter / different keywords</i>")
+        bits.append("<i>  • Drop the price filter if you set one</i>")
+        bits.append("<i>  • If you have a code, paste it directly — "
+                    "auto-routes regardless of region</i>")
+        await send(
+            update,
+            "\n".join(bits),
+            kb([[("🔎 Search again", "menu:search"),
+                 ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    # Most recent first, take top N.
+    matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
+    top = matches[:_SEARCH_TOP_N]
+    total = len(matches)
+
+    lines = [f"🔎 <b>{label} — top {len(top)} of {total} matches</b>"]
+    if max_price is not None:
+        lines.append(f"<i>Filter: ≤ ${max_price:g} USD</i>")
+    lines.append("")
+    for i, r in enumerate(top, 1):
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        name = (r.get("Product Name") or "—").strip()
+        code = (r.get("Product Code") or "—").strip()
+        price = (r.get("R&D Price") or "").strip()
+        price_str = f"USD {price}" if price else "—"
+        taste = (r.get("Taste describe") or "").strip()
+        category = (r.get("Category") or "").strip()
+        # First line: number + code + name + price
+        lines.append(
+            f" {i}. <code>{h(code)}</code> · <b>{h(name)}</b> · {h(price_str)}"
+        )
+        # Indented metadata lines (taste, category, last sample date)
+        meta_bits = []
+        if taste:
+            t = taste[:90] + "…" if len(taste) > 90 else taste
+            meta_bits.append(f"taste: {t}")
+        if category:
+            meta_bits.append(f"category: {category}")
+        meta_bits.append(f"last sample: {date_str}")
+        for mb in meta_bits:
+            lines.append(f"     <i>{h(mb)}</i>")
+
+    if total > _SEARCH_TOP_N:
+        lines.append("")
+        lines.append(
+            f"<i>Showing the {_SEARCH_TOP_N} most recent. "
+            f"{total - _SEARCH_TOP_N} more matches in history — refine your "
+            "search to narrow down.</i>"
+        )
+
+    await send(
+        update,
+        "\n".join(lines),
+        kb([[("🔎 Search again", "menu:search"),
+             ("🏠 Main menu", "menu:home")]]),
     )
 
 
@@ -2129,6 +2425,41 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # V1.12.0 — Browse-only seasoning search reply flow. Same per-process
+    # flag + reply-detection pattern as /lastsample so multi-replica
+    # deploys don't lose the context across workers.
+    has_search_flag = bool(ctx.user_data.pop("awaiting_search_query", None))
+    is_search_reply = bool(
+        replied
+        and getattr(replied, "from_user", None)
+        and getattr(replied.from_user, "is_bot", False)
+        and "Search" in (replied.text or "")
+        and "seasonings" in (replied.text or "")
+    )
+    if has_search_flag or is_search_reply:
+        # Determine region: prefer user_data (most reliable on same worker),
+        # fall back to parsing the prompt text we're replying to.
+        region = (ctx.user_data.get("search_region") or "").lower()
+        if not region and is_search_reply:
+            ptext = replied.text or ""
+            if "Singapore" in ptext:
+                region = "sg"
+            elif "Indonesia" in ptext:
+                region = "id"
+            elif "Thailand" in ptext:
+                region = "th"
+        if region not in _REGION_TAB:
+            await send(
+                update,
+                "🤔 I lost track of which region you picked — please tap "
+                "🔎 <i>Search seasonings</i> again from the main menu.",
+                kb([[("🔎 Search seasonings", "menu:search"),
+                     ("🏠 Main menu", "menu:home")]]),
+            )
+            return
+        await _run_seasoning_search(update, ctx, region, text)
+        return
+
     # Manual code-entry flow ("✏️ Enter a code" on the main menu): accept
     # text either when the per-process flag is set OR when the message is
     # a reply to one of our "Enter a product code" prompts. Reply-detection
@@ -2733,6 +3064,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("samp:"):
         await _handle_samples_callback(update, ctx, data.split(":", 1)[1])
         return
+    # Browse-only seasoning search (V1.12.0). Region picker callbacks land
+    # here. Independent of any draft — search is exploratory, doesn't raise
+    # a sample request.
+    if data.startswith("srch:"):
+        await _handle_search_callback(update, ctx, data.split(":", 1)[1])
+        return
 
     # Bulk-paste session controls (cancel/retry/finish/list). These work with
     # or without an open draft.
@@ -2947,6 +3284,11 @@ async def _handle_menu_callback(update, ctx, action: str):
         return
     if action == "bulk":
         await _start_bulk(update, ctx)
+        return
+    if action == "search":
+        # V1.12.0 — browse-only seasoning search (does NOT raise a sample
+        # request). Asks region first, then takes free text or a code.
+        await _start_seasoning_search(update, ctx)
         return
     if action == "scan":
         ctx.user_data["awaiting_scan_photo"] = True

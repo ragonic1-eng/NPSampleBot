@@ -567,8 +567,12 @@ def _dedupe_codes(codes: list[str], cap: int = 5) -> list[str]:
 async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
     """Fetch /pp for each code, edit-in-place loader, audit-log every result.
 
-    Used by both `/pp <code>` and the photo-scan flow. Caller passes already
-    deduplicated, capped, uppercase codes.
+    Used by `/pp <code>`, the ✏️ Enter a code menu flow, and the photo-
+    scan flow. Caller passes already deduplicated, capped, uppercase
+    codes.
+
+    Always ends with a 'what next' footer (V1.12.5) so the conversation
+    doesn't dead-end — same pattern /lastsample and 🔎 Search use.
     """
     if not codes:
         return
@@ -740,6 +744,23 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             rd_price_usd=rd_for_audit,
             raw_material_cost_usd=adj_rmc,
         )
+
+    # V1.12.5: 'what next' footer. The price reply for each code is an
+    # edited placeholder, not a fresh message, so without this footer the
+    # rep is left staring at a price with no obvious action. Three quick
+    # CTAs cover the common next steps.
+    try:
+        await update.effective_chat.send_message(
+            "Done. What next?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb([
+                [("✏️ Look up another code", "menu:code")],
+                [("📷 Scan a photo", "menu:scan"),
+                 ("🏠 Main menu", "menu:home")],
+            ]),
+        )
+    except Exception as e:  # noqa: BLE001 — chat may have been closed; not worth retrying
+        log.debug("/pp footer send failed: %s", e)
 
 
 async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

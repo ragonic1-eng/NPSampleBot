@@ -712,7 +712,25 @@ def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> boo
     # where typing a J-code returned an unrelated S-code product.
     target_tokens = [t for t in _TOKEN_RE.findall(t_low) if len(t) >= 4]
     target_tokens.append(tn)
+    # V1.13.3: target token must also be at least 60% as long as the
+    # query (alphanumeric form). Without this, a long query like
+    # 'malaysia' (8 chars) gets WRatio≥80 against an unrelated short
+    # token like 'mala' (4 chars) because rapidfuzz's partial_ratio
+    # treats the 4-char overlap as a strong match. The lower bound
+    # only — long target tokens vs short queries (e.g. typo 'rendnag'
+    # vs full 'rendangseasoning') still need to fuzzy-match through
+    # the squished-target path.
+    # Ceil(0.6 * len(qn)) via integer math: for qn=8 gives 5, so 'mala'
+    # (4) is rejected vs 'malaysia' (8); for qn=7 gives 5, so 'rendang'
+    # (7) still passes vs 'rendnag' (7).
+    min_tok_len = max(4, (len(qn) * 6 + 9) // 10)
     for tok in target_tokens:
+        if tok is tn:
+            # Squished full target — length comparison doesn't apply,
+            # the partial_ratio already handles long-vs-short here.
+            pass
+        elif len(tok) < min_tok_len:
+            continue
         if tok and fuzz.WRatio(qn, tok) >= fuzzy_threshold:
             return True
     return False
@@ -1261,6 +1279,87 @@ _REGION_TAB = {
 }
 
 
+# V1.13.3 — country / cuisine awareness in seasoning search. When the rep
+# types a country name (e.g. 'malaysia'), surface samples whose Country
+# column matches AND samples whose Product Name contains that country's
+# signature cuisine keywords. Fixes the long-standing complaint that
+# 'malaysia' returned 'mala chicken' (false fuzzy match) instead of
+# nasi lemak / satay / kaya / super ring etc.
+#
+# Curated keyword lists — kept short and high-signal. Multi-word entries
+# match as a substring of the lowercased product name (so 'nasi lemak'
+# matches 'NASI LEMAK SEASONING' but not 'NASI'-only products).
+# Tags use word-boundary matching so 'thai' doesn't match 'thaitex' or
+# similar incidental substrings.
+_COUNTRY_CUISINE: dict[str, dict] = {
+    "malaysia": {
+        "tags": ("malaysia", "malaysian"),
+        "country_match": ("malaysia",),
+        "cuisine": (
+            "nasi lemak", "satay", "laksa", "rendang", "kaya",
+            "sambal", "kway teow", "char kway", "ondeh", "chendol",
+            "super ring", "mamak", "teh tarik", "ayam masak",
+            "asam pedas", "curry puff", "mee goreng", "mee rebus",
+            "bak kut teh", "rojak", "hainanese",
+        ),
+    },
+    "indonesia": {
+        "tags": ("indonesia", "indonesian"),
+        "country_match": ("indonesia",),
+        "cuisine": (
+            "rendang", "soto", "gado", "sambal", "mie goreng",
+            "kerupuk", "krupuk", "ayam goreng", "bakmi", "nasi goreng",
+            "bakso", "rawon", "gulai", "tempe", "balado",
+        ),
+    },
+    "thailand": {
+        "tags": ("thailand", "thai"),
+        "country_match": ("thailand",),
+        "cuisine": (
+            "tom yum", "pad thai", "tom kha", "som tum",
+            "larb", "kaeng", "massaman", "panang",
+            "khao soi", "phad", "thai basil", "tom yam",
+        ),
+    },
+    "vietnam": {
+        "tags": ("vietnam", "vietnamese"),
+        "country_match": ("vietnam",),
+        "cuisine": (
+            "pho", "banh", "bun bo", "goi cuon", "nem", "vermicelli",
+        ),
+    },
+    "philippines": {
+        "tags": ("philippines", "filipino", "pilipino"),
+        "country_match": ("philippines",),
+        "cuisine": (
+            "adobo", "sinigang", "lechon", "kare kare", "lumpia",
+            "tapa", "longganisa",
+        ),
+    },
+    "singapore": {
+        "tags": ("singapore", "singaporean"),
+        "country_match": ("singapore",),
+        "cuisine": (
+            "chilli crab", "hainanese", "bak kut teh", "kway teow",
+            "char kway", "laksa", "rojak", "kaya",
+        ),
+    },
+}
+
+
+def _detect_country_query(q_lower: str) -> tuple[str, dict] | None:
+    """Return (country_key, info) if `q_lower` mentions a recognised
+    country tag with word-boundary match. Word-boundary is critical so
+    'malaysia' doesn't trigger 'mala' and vice versa."""
+    if not q_lower:
+        return None
+    for country, info in _COUNTRY_CUISINE.items():
+        for tag in info["tags"]:
+            if re.search(rf"\b{re.escape(tag)}\b", q_lower):
+                return (country, info)
+    return None
+
+
 async def _start_seasoning_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Entry point for the 🔎 Search seasonings flow. Shows region picker."""
     # Wipe any prior search context — picker should always start clean.
@@ -1341,7 +1440,26 @@ async def _run_seasoning_search(
     cleaned, max_price = matcher.parse_seasoning_query(query)
     cleaned = (cleaned or "").strip()
 
-    if len(cleaned) < 2 and max_price is None:
+    # V1.13.3 — country / cuisine awareness. Detect the country tag (if
+    # any) BEFORE the short-query check, so a bare 'malaysia' query is
+    # accepted (the country tag itself counts as the search signal).
+    country_match = _detect_country_query(cleaned.lower())
+    country_label = ""
+    if country_match:
+        _ck, _cinfo = country_match
+        country_label = _ck.title()
+        # Strip the country tag from the keyword tokens — we'll use the
+        # leftover text (if any) for the normal name-token scoring, and
+        # the country/cuisine bonus handles the rest. So 'malaysia
+        # spicy' becomes leftover 'spicy' for token scoring + country
+        # boost for Malaysian-Country rows + cuisine boost for sambal /
+        # nasi lemak / etc names.
+        stripped = cleaned.lower()
+        for tag in _cinfo["tags"]:
+            stripped = re.sub(rf"\b{re.escape(tag)}\b", " ", stripped)
+        cleaned = " ".join(stripped.split())
+
+    if len(cleaned) < 2 and max_price is None and not country_match:
         await send(
             update,
             "🤏 That's too short — try a keyword (e.g. <code>BBQ</code>), "
@@ -1493,7 +1611,7 @@ async def _run_seasoning_search(
     matches: list[dict] = []
     matches_taste_only: set[str] = set()  # codes flagged as taste-only
 
-    if cleaned:
+    if cleaned or country_match:
         _word_re = re.compile(r"[a-z0-9]+")
         _STOPWORDS = {"and", "or", "the", "of", "with", "in", "for", "to"}
 
@@ -1530,6 +1648,12 @@ async def _run_seasoning_search(
         # query substring is a clean exact name match.
         CODE_BONUS = 1_000_000
         EXACT_NAME_BONUS = 100_000
+        # V1.13.3 — country/cuisine bonuses. Country match is a stronger
+        # signal than cuisine-keyword match. Both are sized below the
+        # exact-name bonus so a literal name hit (e.g. user types
+        # 'rendang') still outranks a generic country tag.
+        COUNTRY_BONUS = 50_000
+        CUISINE_BONUS = 20_000
 
         def _name_score(row: dict) -> int:
             """Higher = stronger name match. 0 = no name match."""
@@ -1540,8 +1664,11 @@ async def _run_seasoning_search(
             if q_lower and q_lower in name:
                 return EXACT_NAME_BONUS
             if not q_tokens:
-                # No tokens (e.g. very short query) — try smart match only.
-                if _smart_text_match(cleaned, name):
+                # No leftover tokens (e.g. bare-country query like
+                # 'malaysia'). Country/cuisine scoring handles ranking;
+                # don't add a smart-match base hit here or every row
+                # with any vague resemblance would surface.
+                if not country_match and _smart_text_match(cleaned, name):
                     return 1000  # base hit
                 return 0
             name_tokens = _tokens(name)
@@ -1559,6 +1686,26 @@ async def _run_seasoning_search(
                 return 1000
             return int(score)
 
+        def _country_cuisine_score(row: dict) -> int:
+            """Bonus when the row matches the detected country (Country
+            column) or the country's signature cuisine keywords (in the
+            Product Name). Returns 0 if no country was detected."""
+            if not country_match:
+                return 0
+            _ck, info = country_match
+            bonus = 0
+            row_country = (row.get("Country") or "").lower()
+            for c in info["country_match"]:
+                if c in row_country:
+                    bonus += COUNTRY_BONUS
+                    break
+            name = (row.get("Product Name") or "").lower()
+            for kw in info["cuisine"]:
+                if kw in name:
+                    bonus += CUISINE_BONUS
+                    break
+            return bonus
+
         def _taste_match(row: dict) -> bool:
             taste = (row.get("Taste describe") or "").lower()
             if not taste:
@@ -1573,11 +1720,13 @@ async def _run_seasoning_search(
                 )
             return False
 
-        scored: list[tuple[int, bool, dict]] = []  # (name_score, taste_only, row)
+        scored: list[tuple[int, bool, dict]] = []  # (total_score, taste_only, row)
         for r in rows:
             ns = _name_score(r)
-            if ns > 0:
-                scored.append((ns, False, r))
+            cb = _country_cuisine_score(r)
+            total = ns + cb
+            if total > 0:
+                scored.append((total, False, r))
             elif _taste_match(r):
                 scored.append((0, True, r))
 
@@ -1672,6 +1821,13 @@ async def _run_seasoning_search(
             )
     if cleaned:
         header_bits.append(f"   <i>matching “{h(cleaned)}”</i>")
+    if country_match:
+        header_bits.append(
+            f"   🌏 <i>{country_label} samples + signature cuisine "
+            "(nasi lemak, satay, sambal…)</i>"
+            if country_label == "Malaysia"
+            else f"   🌏 <i>{country_label} samples + signature cuisine matches</i>"
+        )
     if n_name == 0 and n_taste > 0:
         header_bits.append(
             "   <i>No matches by product name — showing taste-similar "

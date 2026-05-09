@@ -779,7 +779,7 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
 
     for code in codes:
         placeholder = await chat.send_message(
-            f"⏳ Fetching <code>{h(code)}</code> from MMS…",
+            f"☕ Grab a tea. Loading <code>{h(code)}</code>…",
             parse_mode=ParseMode.HTML,
         )
         try:
@@ -1093,7 +1093,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"\n⚠️ Not in catalog (will still try MMS): "
             + ", ".join(f"<code>{h(c)}</code>" for c in result.unmatched)
         )
-    lines.append("\nFetching prices now…")
+    lines.append("\n☕ Grab a tea. Loading…")
     await send(update, "\n".join(lines))
 
     # Cap at 5 to match the /pp ceiling and avoid spamming MMS.

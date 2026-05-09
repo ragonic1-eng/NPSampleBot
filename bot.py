@@ -1511,6 +1511,41 @@ async def _run_seasoning_search(
         )
         return
 
+    # V1.13.5 — dynamic country detection from col C of the FSL. Augments
+    # the static cuisine-aware detection above. If the static pass didn't
+    # find a curated country (malaysia, indonesia, thailand, vietnam,
+    # philippines, singapore) but the rep typed a country name that
+    # actually appears in the Country column (e.g. Taiwan, India,
+    # Bangladesh, China, Korea, Japan), match it here. The col-C bonus
+    # applies but no cuisine keyword bonus, since we don't have curated
+    # keyword lists for every country yet.
+    if not country_match:
+        data_countries = {
+            (r.get("Country") or "").strip().lower()
+            for r in rows
+            if (r.get("Country") or "").strip()
+        }
+        # Skip very short / numeric / single-letter Country values that
+        # might create false matches (e.g. a country code 'sg' inside an
+        # unrelated word).
+        data_countries = {c for c in data_countries if len(c) >= 4}
+        # Match longest first so 'south korea' beats 'korea' when both
+        # appear in the data.
+        sorted_data_countries = sorted(data_countries, key=len, reverse=True)
+        for c in sorted_data_countries:
+            if re.search(rf"\b{re.escape(c)}\b", cleaned.lower()):
+                country_match = (c, {
+                    "tags": (c,),
+                    "country_match": (c,),
+                    "cuisine": (),  # no curated cuisine for dynamic countries
+                })
+                country_label = c.title()
+                # Strip the country tag from the keyword tokens — same
+                # logic as the static path.
+                stripped_dyn = re.sub(rf"\b{re.escape(c)}\b", " ", cleaned.lower())
+                cleaned = " ".join(stripped_dyn.split())
+                break
+
     # V1.12.12 — price-cap filter rewritten to handle currency-prefixed
     # values (the actual data has 'USD 5.44', 'SGD 6.60', 'THB 223.5',
     # 'IDR 59,322'). Previous version did naive float() which failed on
@@ -1843,12 +1878,24 @@ async def _run_seasoning_search(
     if cleaned:
         header_bits.append(f"   <i>matching “{h(cleaned)}”</i>")
     if country_match:
-        header_bits.append(
-            f"   🌏 <i>{country_label} samples + signature cuisine "
-            "(nasi lemak, satay, sambal…)</i>"
-            if country_label == "Malaysia"
-            else f"   🌏 <i>{country_label} samples + signature cuisine matches</i>"
-        )
+        # Curated countries (with cuisine keyword lists) get the richer
+        # header line. Dynamic-only countries (matched via col C of the
+        # FSL but no curated cuisine) get a simpler line.
+        _ck_info = country_match[1]
+        if _ck_info.get("cuisine"):
+            if country_label == "Malaysia":
+                header_bits.append(
+                    f"   🌏 <i>{country_label} samples + signature cuisine "
+                    "(nasi lemak, satay, sambal…)</i>"
+                )
+            else:
+                header_bits.append(
+                    f"   🌏 <i>{country_label} samples + signature cuisine matches</i>"
+                )
+        else:
+            header_bits.append(
+                f"   🌏 <i>{country_label} samples (Country column match)</i>"
+            )
     if n_name == 0 and n_taste > 0:
         header_bits.append(
             "   <i>No matches by product name — showing taste-similar "

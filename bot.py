@@ -2970,7 +2970,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # V1.12.0 — Browse-only seasoning search reply flow. Same per-process
     # flag + reply-detection pattern as /lastsample so multi-replica
     # deploys don't lose the context across workers.
-    has_search_flag = bool(ctx.user_data.pop("awaiting_search_query", None))
+    # V1.13.2: flag is sticky (get, not pop) so back-to-back searches
+    # work without re-tapping the menu. Cleared by any menu:* nav.
+    has_search_flag = bool(ctx.user_data.get("awaiting_search_query"))
     is_search_reply = bool(
         replied
         and getattr(replied, "from_user", None)

@@ -1363,8 +1363,12 @@ def _detect_country_query(q_lower: str) -> tuple[str, dict] | None:
 async def _start_seasoning_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Entry point for the 🔎 Search seasonings flow. Shows region picker."""
     # Wipe any prior search context — picker should always start clean.
+    # V1.13.7: also clears the refinement chain so 'Search again' truly
+    # starts fresh, not on top of the previous query.
     ctx.user_data.pop("awaiting_search_query", None)
     ctx.user_data.pop("search_region", None)
+    ctx.user_data.pop("last_search_query", None)
+    ctx.user_data.pop("last_search_region", None)
     btns = kb([
         [("🇸🇬 Singapore (S-codes)", "srch:reg:sg")],
         [("🇮🇩 Indonesia (J-codes)", "srch:reg:id")],
@@ -1433,12 +1437,38 @@ async def _run_seasoning_search(
     # Code-prefix shortcut: if the user typed a recognisable code anywhere
     # in their query, hand off to /pp directly (auto-routes by prefix
     # via sheets.find_fsl_product_by_code). Saves them retyping it as
-    # an "Enter a code" lookup.
+    # an "Enter a code" lookup. Code paste does NOT chain with the
+    # previous query — it's an explicit price lookup.
     code_hits = _PP_CODE_RE.findall(query)
     if code_hits:
         unique = _dedupe_codes(code_hits, cap=5)
         await _run_pp_for_codes(update, unique)
         return
+
+    # V1.13.7 — refinement chain. If the rep already ran a search in
+    # this region and the new text doesn't already contain the previous
+    # query, prepend the previous query so 'spicy chicken' followed by
+    # 'below 4 usd' becomes 'spicy chicken below 4 usd'. Pagination
+    # (page > 0) and code lookups don't chain. The chain is cleared
+    # the moment the rep taps any menu:* button or re-enters the
+    # search via the region picker.
+    refine_note: str = ""
+    if page == 0:
+        prev_query = (ctx.user_data.get("last_search_query") or "").strip()
+        prev_region = ctx.user_data.get("last_search_region") or ""
+        new_clean = query.strip()
+        if (
+            prev_query
+            and prev_region == region
+            and prev_query.lower() not in new_clean.lower()
+            and new_clean.lower() not in prev_query.lower()
+        ):
+            combined = f"{prev_query} {new_clean}".strip()
+            refine_note = (
+                f"🔗 <i>Refining: <b>{h(prev_query)}</b> + <b>{h(new_clean)}</b> · "
+                "tap 🔎 Search again to start fresh.</i>"
+            )
+            query = combined
 
     # Strip out price filter (matcher already handles 'under $X', 'below
     # 4 usd' etc) before keyword matching against the catalog.
@@ -1791,7 +1821,18 @@ async def _run_seasoning_search(
         }
     else:
         # Pure price-filter query — show recent rows matching the cap.
-        matches = rows
+        # V1.13.7: sort in-budget rows first (so a strictly-in-budget
+        # row beats an over-budget one) then by date desc — without
+        # this, the dedupe step kept the OLDEST row for each code
+        # because that was the insertion order from the sheet.
+        matches = sorted(
+            rows,
+            key=lambda r: (
+                0 if (r.get("Product Code") or "").strip().upper()
+                not in over_budget_codes else 1,
+                -((r.get("_date") or SENTINEL).toordinal()),
+            ),
+        )
 
     if not matches:
         bits = [f"🤷 No matches for <b>{h(query)}</b> in {label} "
@@ -1862,6 +1903,11 @@ async def _run_seasoning_search(
         header_bits = [
             f"🔎 <b>{label} — {len(top)} of {total_unique} products</b>"
         ]
+    # V1.13.7 — refinement-chain breadcrumb sits right under the title
+    # so the rep can see immediately that the bot combined their input
+    # with the previous query and how to opt out.
+    if refine_note:
+        header_bits.append(f"   {refine_note}")
     if max_price is not None:
         if n_over_budget_shown == 0:
             header_bits.append(f"   <i>≤ ${max_price:g} USD</i>")
@@ -1994,6 +2040,12 @@ async def _run_seasoning_search(
     if len(pager_state) > 8:
         for k in list(pager_state.keys())[:-8]:
             pager_state.pop(k, None)
+
+    # V1.13.7 — remember the (possibly combined) query so the next
+    # text-input refinement can chain on top of it. Cleared by region-
+    # picker entry and any menu:* navigation in _handle_menu_callback.
+    ctx.user_data["last_search_query"] = query
+    ctx.user_data["last_search_region"] = region
 
     nav_row: list[tuple[str, str]] = []
     if page > 0:
@@ -4108,6 +4160,10 @@ async def _handle_menu_callback(update, ctx, action: str):
     ctx.user_data.pop("awaiting_code_text", None)
     ctx.user_data.pop("awaiting_lastsample_query", None)
     ctx.user_data.pop("awaiting_search_query", None)
+    # V1.13.7: clear the search refinement chain on every menu nav so
+    # going home or tapping anything resets to a clean search state.
+    ctx.user_data.pop("last_search_query", None)
+    ctx.user_data.pop("last_search_region", None)
     if action == "home":
         await cmd_start(update, ctx)
         return

@@ -157,8 +157,9 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
 
 # ---------- Full Sample Listing (transactional sample-out log) ----------
 
-FSL_TAB = "Full Sample Listing"               # Singapore / S- codes (default)
+FSL_TAB = "Full Sample Listing"                  # Singapore / S- codes (default)
 JAKARTA_FSL_TAB = "Full Sample Listing Jakarta"  # Indonesia / J- codes (V1.11.0)
+BANGKOK_FSL_TAB = "Full Sample Listing Thailand" # Thailand / B- codes (V1.13.0)
 FSL_HEADER = [
     "Sales", "Customer Name", "Country", "Product Code", "Product Name",
     "Quantity (g)", "Sample Date Out", "Taste describe", "Category",
@@ -168,16 +169,22 @@ FSL_HEADER = [
 # Code-prefix → tab routing. Used by /pp's FSL fallback and by the sync
 # engine to send each MMS row to the right tab. Single source of truth so
 # we don't have to teach every helper the prefix rules.
+#
+# V1.13.0: B-prefix codes were previously assumed to be legacy Singapore
+# (defaulted to FSL_TAB). User clarified that B- = Thailand factory, so
+# the routing now sends them to BANGKOK_FSL_TAB. The 205 stranded B-rows
+# that lived in FSL_TAB before this change were migrated by
+# _thailand_migrate_stranded.py.
 FSL_TAB_BY_PREFIX = {
     "S": FSL_TAB,
     "J": JAKARTA_FSL_TAB,
+    "B": BANGKOK_FSL_TAB,
 }
 
 
 def fsl_tab_for_code(code: str) -> str:
     """Return the FSL tab name a product code belongs to, defaulting to
-    the main FSL_TAB when the prefix is unknown (e.g. legacy B- codes that
-    we currently leave in the main tab)."""
+    the main FSL_TAB when the prefix is unknown."""
     code = (code or "").strip().upper()
     if not code:
         return FSL_TAB
@@ -989,7 +996,46 @@ _SYNC_KEY_LAST_RUN = "sample_master_last_sync_utc"
 _SYNC_KEY_BY_TAB = {
     FSL_TAB: _SYNC_KEY_LAST_RUN,
     JAKARTA_FSL_TAB: "sample_master_last_sync_utc_jakarta",
+    BANGKOK_FSL_TAB: "sample_master_last_sync_utc_thailand",
 }
+
+
+def ensure_bangkok_tab() -> None:
+    """Make sure the Thailand FSL tab exists with the right header.
+
+    V1.13.0 — added when Bangkok factory data was backfilled. Same
+    pattern as ensure_jakarta_tab: rename common typo'd variants in
+    place, otherwise leave alone if already correct, otherwise create
+    fresh. Singapore + Indonesia tabs are NEVER touched.
+    """
+    sh = _open_seasoning_master()
+    existing = {ws.title: ws for ws in sh.worksheets()}
+    if BANGKOK_FSL_TAB in existing:
+        ws = existing[BANGKOK_FSL_TAB]
+        first = ws.row_values(1)
+        if first != FSL_HEADER:
+            if ws.col_count < len(FSL_HEADER):
+                ws.add_cols(len(FSL_HEADER) - ws.col_count)
+            ws.update(values=[FSL_HEADER], range_name="A1")
+        return
+    # Common typo variants to rename in place.
+    for typo in ("Full sample list thailand", "Full Sample List Thailand",
+                 "Full sample listing Thailand", "Full Sample listing thailand",
+                 "Full sample list bangkok", "Full Sample Listing Bangkok"):
+        if typo in existing:
+            existing[typo].update_title(BANGKOK_FSL_TAB)
+            log.info("Renamed tab %r -> %r", typo, BANGKOK_FSL_TAB)
+            ws = sh.worksheet(BANGKOK_FSL_TAB)
+            first = ws.row_values(1)
+            if first != FSL_HEADER:
+                if ws.col_count < len(FSL_HEADER):
+                    ws.add_cols(len(FSL_HEADER) - ws.col_count)
+                ws.update(values=[FSL_HEADER], range_name="A1")
+            return
+    # Fresh create.
+    ws = sh.add_worksheet(title=BANGKOK_FSL_TAB, rows=2000, cols=len(FSL_HEADER))
+    ws.update(values=[FSL_HEADER], range_name="A1")
+    log.info("Created tab %r", BANGKOK_FSL_TAB)
 
 
 def ensure_jakarta_tab() -> None:

@@ -51,9 +51,15 @@ SAMPLE_SYNC_COOLDOWN_HOURS = 24
 # Region routing. Code prefix → (target tab, country mode).
 #   country='derive' — use the existing per-customer resolution
 #   country='Indonesia' — hardcode every row's Country to 'Indonesia'
+#   country='Thailand'  — hardcode every row's Country to 'Thailand'
+# V1.13.0: B- prefix added (Thailand factory). User clarified that B-
+# is Thailand, not legacy Singapore as previously assumed; the 205
+# stranded B-rows that lived in FSL_TAB before this change were
+# migrated to BANGKOK_FSL_TAB by _thailand_migrate_stranded.py.
 _REGIONS = {
     "S": (sheets.FSL_TAB, "derive"),
     "J": (sheets.JAKARTA_FSL_TAB, "Indonesia"),
+    "B": (sheets.BANGKOK_FSL_TAB, "Thailand"),
 }
 
 
@@ -161,11 +167,13 @@ def _process_region(
     country_cache, taste_cache, category_cache = enrich.load_all_caches()
 
     def _resolve_country_tracked(r):
-        """Country resolution with metrics tracking. Indonesia mode skips
-        all the lookup work and hardcodes the value, which means zero
-        Haiku spend per row for the Indonesia sync."""
+        """Country resolution with metrics tracking. Indonesia/Thailand
+        modes skip all the lookup work and hardcode the value, which
+        means zero Haiku spend per row for non-Singapore syncs."""
         if country_mode == "Indonesia":
             return "Indonesia", "free"
+        if country_mode == "Thailand":
+            return "Thailand", "free"
         # Singapore mode = original V1.7.4 cascade.
         if (r.country or "").strip():
             return enrich.normalize_country(r.country), "free"
@@ -192,12 +200,14 @@ def _process_region(
     enriched: list[list[str]] = []
     for r in new_rows:
         if skip_enrichment:
-            # Country still hardcoded for Indonesia mode; for derive mode
-            # we only use the FREE lookups (raw country / customer map /
-            # tokens / suffix) — skip the Haiku fallback. Empty if nothing
-            # cheap matches.
+            # Country still hardcoded for Indonesia/Thailand modes; for
+            # derive mode we only use the FREE lookups (raw country /
+            # customer map / tokens / suffix) — skip the Haiku fallback.
+            # Empty if nothing cheap matches.
             if country_mode == "Indonesia":
                 country = "Indonesia"
+            elif country_mode == "Thailand":
+                country = "Thailand"
             else:
                 country = ""
                 if (r.country or "").strip():

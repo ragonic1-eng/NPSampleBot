@@ -633,16 +633,14 @@ async def _load_lastsample_rows(scope: str, mms_name: str = "") -> list[dict]:
 
     V1.12.9 fix: was loading only FSL_TAB by default, so any J-code
     query (e.g. 'J-X4Ua5-01') silently returned 'no match' even though
-    the J-code existed in the Jakarta tab. Now both regions are
-    searched together — the matcher is scope-agnostic anyway, it just
-    needs the union of rows to look at.
+    the J-code existed in the Jakarta tab. V1.13.0 added Thailand /
+    BANGKOK_FSL_TAB to the union — same fix for B-codes which now
+    have their own region tab instead of being lumped into Singapore.
 
-    scope='all'  → all reps' samples in both tabs
-    scope='self' → mms_name's samples in both tabs
-
-    When the Bangkok (T-code) tab gets backfilled, add it here.
+    scope='all'  → all reps' samples across all three tabs
+    scope='self' → mms_name's samples across all three tabs
     """
-    region_tabs = (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB)
+    region_tabs = (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB)
     rows: list[dict] = []
     for tab in region_tabs:
         try:
@@ -1247,7 +1245,7 @@ async def cmd_alllastsample(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Data source per region:
 #   SG → 'Full Sample Listing' (FSL_TAB), filtered to last 36 months
 #   ID → 'Full Sample Listing Jakarta' (JAKARTA_FSL_TAB), last 36 months
-#   TH → not yet wired (Bangkok backfill pending)
+#   TH → 'Full Sample Listing Thailand' (BANGKOK_FSL_TAB), last 36 months
 #
 # Why sample history (not Seasoning Master): user prefers showing
 # 'what's actually been sampled recently' over 'what's in the curated
@@ -1260,6 +1258,7 @@ _SEARCH_RECENT_MONTHS = 36
 _REGION_TAB = {
     "sg": ("🇸🇬 Singapore", lambda: sheets.FSL_TAB),
     "id": ("🇮🇩 Indonesia", lambda: sheets.JAKARTA_FSL_TAB),
+    "th": ("🇹🇭 Thailand",  lambda: sheets.BANGKOK_FSL_TAB),
 }
 
 
@@ -1271,7 +1270,7 @@ async def _start_seasoning_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     btns = kb([
         [("🇸🇬 Singapore (S-codes)", "srch:reg:sg")],
         [("🇮🇩 Indonesia (J-codes)", "srch:reg:id")],
-        [("🇹🇭 Thailand — coming soon", "srch:reg:th")],
+        [("🇹🇭 Thailand (B-codes)", "srch:reg:th")],
         [("🏠 Main menu", "menu:home")],
     ])
     await send(
@@ -1290,16 +1289,6 @@ async def _handle_search_callback(update, ctx, action: str) -> None:
     if not action.startswith("reg:"):
         return
     region = action.split(":", 1)[1].lower()
-    if region == "th":
-        await send(
-            update,
-            "🇹🇭 <b>Thailand catalog isn't ready yet.</b>\n\n"
-            "We'll backfill the Bangkok factory sample list soon. "
-            "For now please pick 🇸🇬 Singapore or 🇮🇩 Indonesia.",
-            kb([[("🔎 Pick another region", "menu:search"),
-                 ("🏠 Main menu", "menu:home")]]),
-        )
-        return
     if region not in _REGION_TAB:
         return
     label, _tab_fn = _REGION_TAB[region]
@@ -5214,6 +5203,13 @@ def main():
         # Non-fatal — the bot can still serve Singapore queries even if the
         # Jakarta tab bootstrap fails. Log loudly and carry on.
         log.exception("ensure_jakarta_tab failed: %s", e)
+
+    log.info("Ensuring Thailand FSL tab exists…")
+    try:
+        sheets.ensure_bangkok_tab()
+    except Exception as e:  # noqa: BLE001
+        # Non-fatal — same pattern as the Jakarta bootstrap.
+        log.exception("ensure_bangkok_tab failed: %s", e)
 
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 

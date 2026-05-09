@@ -443,7 +443,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [("✏️ Enter a code (price lookup)", "menu:code")],
         [("🤔 What I send ah?", "menu:lastsample")],
         [("🌐 What everyone Send ah?", "menu:alllastsample")],
-        [("📋 My sample requests", "menu:samples")],
     ]
     # MMS → Full Sample Listing sync is now automated weekly via the
     # JobQueue (see main()). No manual Telegram trigger.
@@ -4247,7 +4246,6 @@ async def _submit(update, ctx, d: state.Draft):
     buttons = [
         [("➕ Same customer — add another seasoning", "again:same")],
         [("🆕 Start a fresh request", "again:fresh")],
-        [("📋 My sample requests", "again:samples")],
     ]
     await send(
         update,
@@ -5028,7 +5026,6 @@ async def _handle_bulk_callback(update, ctx, action: str):
             update,
             "🎉 <b>All bulk items submitted.</b>",
             kb([
-                [("📋 My sample requests", "again:samples")],
                 [("🏠 Main menu", "menu:home")],
             ]),
         )

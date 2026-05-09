@@ -3007,7 +3007,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # a reply to one of our "Enter a product code" prompts. Reply-detection
     # makes the flow robust to multi-replica deployments where the click
     # and the typed reply may land on different workers.
-    has_code_flag = bool(ctx.user_data.pop("awaiting_code_text", None))
+    # V1.13.1: flag is sticky (get, not pop) so reps can paste code after
+    # code without re-tapping the menu button. Cleared by any menu:* nav
+    # in _handle_menu_callback.
+    has_code_flag = bool(ctx.user_data.get("awaiting_code_text"))
     is_code_reply = bool(
         replied
         and getattr(replied, "from_user", None)

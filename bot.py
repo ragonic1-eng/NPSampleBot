@@ -1417,8 +1417,13 @@ async def _run_seasoning_search(
     ctx: ContextTypes.DEFAULT_TYPE,
     region: str,
     query: str,
+    page: int = 0,
 ) -> None:
-    """Search the region's sample tab for free-text matches, reply top-N."""
+    """Search the region's sample tab for free-text matches, reply top-N.
+
+    V1.13.4 — added pagination via `page` arg. Page 0 is the initial
+    search; subsequent pages come in through the srpg: callback.
+    """
     if region not in _REGION_TAB:
         await send(update, "🤔 Unknown region — please tap 🔎 Search seasonings to retry.")
         return
@@ -1786,9 +1791,17 @@ async def _run_seasoning_search(
         if code not in by_code:
             by_code[code] = r
     unique_matches = list(by_code.values())
-    top = unique_matches[:_SEARCH_TOP_N]
     total_unique = len(unique_matches)
     total_events = len(matches)
+
+    # V1.13.4 — paginate. Page 0 shows 1-10, page 1 shows 11-20, etc.
+    # Pages are naturally non-overlapping (slice of an already-deduped
+    # list). Clamp to valid range so a stale callback can't blow up.
+    total_pages = max(1, (total_unique + _SEARCH_TOP_N - 1) // _SEARCH_TOP_N)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    page_start = page * _SEARCH_TOP_N
+    page_end = min(page_start + _SEARCH_TOP_N, total_unique)
+    top = unique_matches[page_start:page_end]
 
     # Count name vs taste-only buckets in the displayed top-N.
     n_name = sum(
@@ -1805,7 +1818,15 @@ async def _run_seasoning_search(
 
     # Header. Plural-handling for the count + callouts for taste-only
     # fallback and over-budget items in the visible page.
-    header_bits = [f"🔎 <b>{label} — {len(top)} of {total_unique} products</b>"]
+    if total_unique > _SEARCH_TOP_N:
+        header_bits = [
+            f"🔎 <b>{label} — {page_start + 1}–{page_end} of "
+            f"{total_unique} products</b>"
+        ]
+    else:
+        header_bits = [
+            f"🔎 <b>{label} — {len(top)} of {total_unique} products</b>"
+        ]
     if max_price is not None:
         if n_over_budget_shown == 0:
             header_bits.append(f"   <i>≤ ${max_price:g} USD</i>")
@@ -1866,7 +1887,7 @@ async def _run_seasoning_search(
             head = head[:cut]
         return head.rstrip(",;: ") + "…"
 
-    for i, r in enumerate(top, 1):
+    for i, r in enumerate(top, page_start + 1):
         d = r.get("_date")
         date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
         name = (r.get("Product Name") or "—").strip()
@@ -1907,18 +1928,45 @@ async def _run_seasoning_search(
         # Blank line between results for visual breathing room.
         lines.append("")
 
-    # Trailing footer if there are more unique products than we showed.
-    if total_unique > _SEARCH_TOP_N:
+    # Trailing footer with sample-event total (always — gives the rep a
+    # sense of how many sample events are behind the unique product list).
+    if total_events > total_unique:
         lines.append(
-            f"<i>Showing {_SEARCH_TOP_N} of {total_unique} products. "
-            f"({total_events} sample events total — refine to narrow down.)</i>"
+            f"<i>{total_events} sample events across {total_unique} unique "
+            "products — refine the query to narrow down.</i>"
         )
+
+    # V1.13.4 — pagination buttons (mirrors /lastsample's lspr: pattern).
+    # Encode region + page + 10-char query hash in callback data; cache
+    # the query against the hash in user_data so the page-flip callback
+    # can recover it without storing the (potentially long) query in the
+    # callback bytes (Telegram caps callback_data at 64 bytes).
+    qhash = _query_hash(query)
+    pager_state = ctx.user_data.setdefault("srpg_query_cache", {})
+    pager_state[qhash] = {"query": query, "region": region}
+    if len(pager_state) > 8:
+        for k in list(pager_state.keys())[:-8]:
+            pager_state.pop(k, None)
+
+    nav_row: list[tuple[str, str]] = []
+    if page > 0:
+        if page > 1:
+            nav_row.append(("⏮ First", f"srpg:{region}:0:{qhash}"))
+        nav_row.append(("◀ Prev", f"srpg:{region}:{page - 1}:{qhash}"))
+    if page_end < total_unique:
+        next_count = min(_SEARCH_TOP_N, total_unique - page_end)
+        nav_row.append((f"Next {next_count} ▶", f"srpg:{region}:{page + 1}:{qhash}"))
+
+    btn_rows: list[list[tuple[str, str]]] = []
+    if nav_row:
+        btn_rows.append(nav_row)
+    btn_rows.append([("🔎 Search again", "menu:search"),
+                     ("🏠 Main menu", "menu:home")])
 
     await send(
         update,
         "\n".join(lines).rstrip(),
-        kb([[("🔎 Search again", "menu:search"),
-             ("🏠 Main menu", "menu:home")]]),
+        kb(btn_rows),
     )
 
 
@@ -3755,6 +3803,40 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await _show_lastsample_results(
             update, ctx, candidates, query=query, scope=cs_scope, page=page,
+        )
+        return
+
+    # V1.13.4 — 🔎 Search seasonings pagination. Format:
+    #   srpg:<region>:<page>:<query_hash>
+    # We re-run _run_seasoning_search with the saved query + region; the
+    # function already computes everything from scratch and slices to the
+    # requested page. Multi-replica safe via the user_data cache; cache
+    # miss falls back to a friendly retry prompt.
+    if data.startswith("srpg:"):
+        parts = data.split(":", 3)
+        if len(parts) < 4:
+            return
+        _, sr_region, sr_page_str, sr_qhash = parts
+        try:
+            sr_page = int(sr_page_str)
+        except ValueError:
+            return
+        sr_state = ctx.user_data.get("srpg_query_cache", {}) or {}
+        sr_cached = sr_state.get(sr_qhash)
+        if not sr_cached:
+            await send(
+                update,
+                "🤔 The search context expired (probably a redeploy). "
+                "Please tap 🔎 Search again to start a new search.",
+                kb([[("🔎 Search again", "menu:search"),
+                     ("🏠 Main menu", "menu:home")]]),
+            )
+            return
+        await _run_seasoning_search(
+            update, ctx,
+            region=sr_cached.get("region") or sr_region,
+            query=sr_cached.get("query") or "",
+            page=sr_page,
         )
         return
 

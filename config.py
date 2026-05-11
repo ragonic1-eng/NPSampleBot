@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.13.8"
+BOT_VERSION = "V1.13.9"
 
 # Margin added to MMS raw_material_cost before showing it to the user (and
 # before logging to the Query audit tab). Covers handling / overhead so
@@ -28,6 +28,14 @@ CUSTOMER_MASTER_SHEET_ID = os.getenv(
 CUSTOMER_MASTER_WORKSHEET_NAME = os.getenv("CUSTOMER_MASTER_WORKSHEET_NAME", "Sheet1")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+# Groq Whisper — handsfree voice → /pp code lookup. Voice messages get
+# downloaded, transcribed by Groq's whisper-large-v3-turbo (free tier
+# covers ~7,500 sec/day, paid is ~$0.04/hr), then any product code
+# in the transcription is routed to /pp. No code = friendly "what
+# did you say?" response. Set GROQ_API_KEY in Railway env vars.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 # Haiku is the default — used by ai.rerank_seasonings() for semantic
 # catalog search ranking. Plenty good for picking among 3–10 fuzzy
 # candidates and ~3x cheaper than Sonnet ($1/$5 input/output per Mtok

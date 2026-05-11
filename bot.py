@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import io
 import logging
 import os
 import re
@@ -38,6 +39,7 @@ from telegram.ext import (
 
 import ai
 import config
+import groq_voice
 import matcher
 import mms_product
 import sheets
@@ -1095,6 +1097,156 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Cap at 5 to match the /pp ceiling and avoid spamming MMS.
     unique = _dedupe_codes(result.codes, cap=5)
+    await _run_pp_for_codes(update, unique)
+
+
+# ---------- voice -> /pp (V1.13.8) -----------------------------------------
+#
+# Handsfree code lookup. Rep records a Telegram voice message saying a
+# product code like "S-668U1" or "B 74 CH7 dash 02". The bot:
+#   1) downloads the OGG/Opus voice file from Telegram CDN
+#   2) sends it to Groq Whisper (whisper-large-v3-turbo) for transcription
+#   3) normalises common Whisper artefacts (spelled-out "dash", spaces
+#      between letters/digits, lowercase)
+#   4) regex-matches product codes
+#   5) routes any code hits straight to /pp
+#
+# Why voice → /pp only (not search): per user spec, voice is for fast on-
+# the-fly price lookups when reps are walking the factory floor or driving.
+# Free-text search by voice is a more open UX problem (region picker,
+# refinement) and lives behind the typed keyboard for now.
+
+def _normalise_voice_for_codes(text: str) -> str:
+    """Rewrite Whisper output so existing _PP_CODE_RE catches codes.
+
+    Whisper output for product codes is messy because the model treats
+    them as natural language. Common artefacts we patch:
+      • spelled-out 'dash' instead of the literal '-'
+      • spaces between letters and digits ('S 668 U 1' → 'S-668U1')
+      • lowercase prefix letter
+      • trailing punctuation like '.' or ','
+
+    Doesn't replace _PP_CODE_RE — the regex still runs against the
+    original transcription too, so a clean read still matches.
+    """
+    if not text:
+        return ""
+    t = text
+    # Replace literal 'dash' / 'minus' / 'hyphen' tokens with '-'.
+    t = re.sub(r"\b(dash|minus|hyphen)\b", "-", t, flags=re.IGNORECASE)
+    # Collapse spaces around a hyphen so 'S - 668' becomes 'S-668'.
+    t = re.sub(r"\s*-\s*", "-", t)
+    # Squish single spaces between alphanumeric chars so 'S 668 U 1'
+    # becomes 'S668U1'. Then a follow-up pass inserts a '-' after the
+    # prefix letter if the model dropped the hyphen.
+    t = re.sub(r"(?<=[A-Za-z0-9])\s+(?=[A-Za-z0-9])", "", t)
+    t = re.sub(r"\b([SJTB])(?=[A-Za-z0-9])", r"\1-", t, flags=re.IGNORECASE)
+    # Remove duplicate hyphens that the rewrite can introduce
+    # ('S--668U1' → 'S-668U1').
+    t = re.sub(r"-{2,}", "-", t)
+    return t
+
+
+async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Telegram voice message → Groq STT → product-code regex → /pp."""
+    if not await _authorized(update):
+        return
+    msg = update.effective_message
+    if not msg or not msg.voice:
+        return
+
+    if not config.GROQ_API_KEY:
+        await send(
+            update,
+            "🎤 Voice messages aren't enabled yet — admin needs to set "
+            "<code>GROQ_API_KEY</code> in Railway. For now, please type "
+            "the code.",
+        )
+        return
+
+    # Friendly "I heard you" so the rep knows the bot is working on it.
+    # Whisper turnaround is usually <2s, but Telegram CDN download +
+    # network can add a beat. Match the existing /scan loading vibe.
+    try:
+        await update.effective_chat.send_action("typing")
+    except Exception:  # noqa: BLE001
+        pass
+    placeholder = await update.effective_chat.send_message(
+        "🎤 <i>Listening… ☕ Grab a tea.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Download the OGG voice file straight into memory — no temp file.
+    try:
+        tg_file = await msg.voice.get_file()
+        audio_buf = io.BytesIO()
+        await tg_file.download_to_memory(out=audio_buf)
+        audio_bytes = audio_buf.getvalue()
+    except Exception as e:  # noqa: BLE001
+        log.exception("voice: download failed")
+        await placeholder.edit_text(
+            f"😬 Couldn't download the voice clip: {h(str(e))}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not audio_bytes:
+        await placeholder.edit_text(
+            "🤔 Voice clip looked empty. Try again?",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Send to Groq Whisper.
+    try:
+        text = await groq_voice.transcribe_ogg(audio_bytes)
+    except groq_voice.GroqError as e:
+        log.warning("voice: Groq error: %s", e)
+        await placeholder.edit_text(
+            f"😬 Speech-to-text failed: {h(str(e))}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception as e:  # noqa: BLE001
+        log.exception("voice: unexpected STT error")
+        await placeholder.edit_text(
+            f"😵 Unexpected error during transcription: {h(str(e))}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not text:
+        await placeholder.edit_text(
+            "🤔 I didn't catch anything in the voice clip — try again with "
+            "the code spoken clearly, e.g. 'S dash six six eight U one'.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Two-pass code extraction: raw text first, then normalised. We pick
+    # whichever pass yielded codes — covers both clean Whisper output and
+    # the more typical messy output.
+    codes = _PP_CODE_RE.findall(text)
+    if not codes:
+        normalised = _normalise_voice_for_codes(text)
+        codes = _PP_CODE_RE.findall(normalised)
+
+    if not codes:
+        await placeholder.edit_text(
+            f"🎤 I heard: <b>{h(text)}</b>\n\n"
+            "But I couldn't pull out a product code. Voice lookup is "
+            "code-only for now — try saying something like "
+            "<code>S dash 668 U one</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    unique = _dedupe_codes(codes, cap=5)
+    await placeholder.edit_text(
+        f"🎤 Heard: <b>{h(text)}</b>\n"
+        f"→ Looking up {', '.join(f'<code>{h(c)}</code>' for c in unique)}…",
+        parse_mode=ParseMode.HTML,
+    )
     await _run_pp_for_codes(update, unique)
 
 
@@ -5605,6 +5757,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    # V1.13.8 — voice messages route through Groq Whisper → /pp.
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_error_handler(on_error)
 
     # Warm the caches so the first user of the day doesn't wait on cold

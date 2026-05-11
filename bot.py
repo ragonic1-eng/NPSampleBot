@@ -712,18 +712,15 @@ def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> boo
     # where typing a J-code returned an unrelated S-code product.
     target_tokens = [t for t in _TOKEN_RE.findall(t_low) if len(t) >= 4]
     target_tokens.append(tn)
-    # V1.13.3: target token must also be at least 60% as long as the
-    # query (alphanumeric form). Without this, a long query like
-    # 'malaysia' (8 chars) gets WRatio≥80 against an unrelated short
-    # token like 'mala' (4 chars) because rapidfuzz's partial_ratio
-    # treats the 4-char overlap as a strong match. The lower bound
-    # only — long target tokens vs short queries (e.g. typo 'rendnag'
-    # vs full 'rendangseasoning') still need to fuzzy-match through
-    # the squished-target path.
-    # Ceil(0.6 * len(qn)) via integer math: for qn=8 gives 5, so 'mala'
-    # (4) is rejected vs 'malaysia' (8); for qn=7 gives 5, so 'rendang'
-    # (7) still passes vs 'rendnag' (7).
-    min_tok_len = max(4, (len(qn) * 6 + 9) // 10)
+    # V1.13.8: target token must be at least 80% as long as the query
+    # (alphanumeric form). V1.13.3 used 60%, but for 6-char queries the
+    # ratio collapsed back to the 4-char floor (ceil(0.6*6)=4), letting
+    # 'masala' (6) match the unrelated 4-char token 'mala'. Bumping to
+    # 80% makes the guard kick in at qn=6 (threshold 5) while still
+    # allowing legitimate typo matches at the same length (e.g.
+    # 'rendnag'→'rendang', both 7 chars, threshold 6).
+    # Ceil(0.8 * len(qn)) via integer math.
+    min_tok_len = max(4, (len(qn) * 8 + 9) // 10)
     for tok in target_tokens:
         if tok is tn:
             # Squished full target — length comparison doesn't apply,

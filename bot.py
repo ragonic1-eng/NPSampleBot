@@ -1121,6 +1121,8 @@ def _normalise_voice_for_codes(text: str) -> str:
 
     Whisper output for product codes is messy because the model treats
     them as natural language. Common artefacts we patch:
+      • filler words ('find', 'search', 'look up', 'show me', etc.)
+        stripped so they don't fragment the code pattern
       • spelled-out 'dash' instead of the literal '-'
       • spaces between letters and digits ('S 668 U 1' → 'S-668U1')
       • lowercase prefix letter
@@ -1132,6 +1134,22 @@ def _normalise_voice_for_codes(text: str) -> str:
     if not text:
         return ""
     t = text
+    # V1.13.10 — strip filler words so "Find x-d2t43" → "x-d2t43" and
+    # the loose extractor can phonetically coerce the prefix afterwards.
+    # Kept conservative: only verbs/phrases that wouldn't appear inside
+    # a product name.
+    filler_patterns = [
+        r"\bfind\b", r"\bsearch(?:ing|es)?\b", r"\blook(?:ing)?\s+up\b",
+        r"\blook(?:ing)?\s+for\b", r"\bshow\s+(?:me|us)\b",
+        r"\btell\s+(?:me|us)\b",
+        r"\bwhat'?s?\b", r"\bwhat\s+(?:is|are|was|were)\b",
+        r"\bcheck\b", r"\bpull\b", r"\bfetch\b", r"\bget\s+me\b",
+        r"\bfor\s+me\b", r"\bplease\b", r"\bcan\s+you\b",
+        r"\bthe\s+code\b", r"\bproduct\s+code\b",
+        r"\bis\b", r"\bare\b",  # leftover linking verbs after 'what'
+    ]
+    for f in filler_patterns:
+        t = re.sub(f, " ", t, flags=re.IGNORECASE)
     # Replace literal 'dash' / 'minus' / 'hyphen' tokens with '-'.
     t = re.sub(r"\b(dash|minus|hyphen)\b", "-", t, flags=re.IGNORECASE)
     # Collapse spaces around a hyphen so 'S - 668' becomes 'S-668'.
@@ -1145,6 +1163,94 @@ def _normalise_voice_for_codes(text: str) -> str:
     # ('S--668U1' → 'S-668U1').
     t = re.sub(r"-{2,}", "-", t)
     return t
+
+
+# V1.13.10 — phonetic mapping from misheard first letters back to S/B/J.
+# Codes always start with one of S/B/J/T (T is rare/legacy). Whisper
+# routinely mishears the prefix because it's a single short vowel-y
+# sound, so we coerce the first letter when the loose extractor caught
+# a code-shape with an off-prefix.
+#
+# Grouped by phonetic similarity:
+#   • S group: ess / ex / zee — all sibilant or vowel + 's' sounds
+#   • B group: plosives (B/D/P/V/T/G) which sound alike in noisy audio
+#   • J group: 'jay' / 'kay' / 'gay' / 'yay' — soft consonants
+# Letters not in any group get ALL three prefixes tried.
+_VOICE_PREFIX_MAP: dict[str, tuple[str, ...]] = {
+    # Already-correct prefixes pass through unchanged.
+    "S": ("S",), "J": ("J",), "B": ("B",), "T": ("T",),
+    # S-likely
+    "X": ("S",), "Z": ("S",), "C": ("S",), "F": ("S",),
+    "E": ("S",),  # 'ess' / 'ex'
+    # B-likely
+    "D": ("B",), "P": ("B",), "V": ("B",), "G": ("B",),
+    # J-likely
+    "K": ("J",), "Q": ("J",), "Y": ("J",),
+    # Ambiguous fallback: try all 3
+}
+_VOICE_PREFIXES_FALLBACK = ("S", "B", "J")
+# Loose code-shape regex: any single letter, optional hyphen, then 3+
+# alphanumerics, optionally extended by 0–6 hyphen-separated 1–6 char
+# groups. Mirrors _PP_CODE_RE's structure but lets the first letter be
+# anything (we'll coerce it).
+_VOICE_LOOSE_CODE_RE = re.compile(
+    r"\b([A-Z])-?([A-Z0-9]{3,}(?:-[A-Z0-9]{1,6}){0,6})\b",
+    re.IGNORECASE,
+)
+
+
+def _voice_extract_candidates(text: str) -> list[str]:
+    """Return a list of candidate product codes from voice transcription.
+
+    Strategy:
+      1. Run _PP_CODE_RE against the raw text and the normalised text.
+         If anything matches strictly, use those (high-confidence).
+      2. Otherwise run the loose pattern over the normalised text and
+         phonetically coerce the first letter to S/B/J/T. Each match
+         can yield multiple candidates if the original letter is
+         ambiguous (e.g. unmapped letter → try all three).
+      3. Cap at 5 candidates total, dedupe.
+
+    The on_voice handler will validate candidates against the FSL
+    before showing /pp results, so the false-positive bar here is OK
+    to be loose — non-existent codes get filtered out before MMS calls.
+    """
+    if not text:
+        return []
+    normalised = _normalise_voice_for_codes(text)
+
+    strict = _PP_CODE_RE.findall(text) + _PP_CODE_RE.findall(normalised)
+    if strict:
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in strict:
+            u = c.upper()
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+            if len(out) >= 5:
+                break
+        return out
+
+    candidates: list[str] = []
+    seen = set()
+    for m in _VOICE_LOOSE_CODE_RE.finditer(normalised):
+        first = m.group(1).upper()
+        body = m.group(2).upper()
+        # Real product codes always contain at least one digit in the
+        # body (e.g. S-43EH1, B-74CH7-02). Without this guard, random
+        # alphabetic words ('chatter') become phonetic candidates.
+        if not any(ch.isdigit() for ch in body):
+            continue
+        prefixes = _VOICE_PREFIX_MAP.get(first, _VOICE_PREFIXES_FALLBACK)
+        for p in prefixes:
+            cand = f"{p}-{body}"
+            if cand not in seen:
+                seen.add(cand)
+                candidates.append(cand)
+            if len(candidates) >= 5:
+                return candidates
+    return candidates
 
 
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1223,25 +1329,46 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Two-pass code extraction: raw text first, then normalised. We pick
-    # whichever pass yielded codes — covers both clean Whisper output and
-    # the more typical messy output.
-    codes = _PP_CODE_RE.findall(text)
-    if not codes:
-        normalised = _normalise_voice_for_codes(text)
-        codes = _PP_CODE_RE.findall(normalised)
-
-    if not codes:
+    # V1.13.10 — smart candidate extraction. Fillers stripped, loose
+    # pattern + phonetic prefix coercion. If the extractor returns
+    # multiple candidates (e.g. ambiguous first letter), we validate
+    # each against the FSL and only run /pp on the ones that actually
+    # exist — keeps the reply clean instead of three 'not found' lines.
+    candidates = _voice_extract_candidates(text)
+    if not candidates:
         await placeholder.edit_text(
             f"🎤 I heard: <b>{h(text)}</b>\n\n"
-            "But I couldn't pull out a product code. Voice lookup is "
-            "code-only for now — try saying something like "
-            "<code>S dash 668 U one</code>.",
+            "But I couldn't pull out anything code-shaped. Try again "
+            "with the code spoken clearly — e.g. <code>S 668 U 1</code> "
+            "or <code>B dash 74 CH7 dash 02</code>.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    unique = _dedupe_codes(codes, cap=5)
+    # Filter candidates: keep only those that exist in the FSL.
+    valid: list[str] = []
+    for cand in candidates:
+        try:
+            row = await asyncio.to_thread(sheets.find_fsl_product_by_code, cand)
+            if row:
+                valid.append(cand)
+        except Exception as e:  # noqa: BLE001 — FSL read shouldn't kill voice
+            log.warning("voice: FSL lookup failed for %s: %s", cand, e)
+
+    if not valid:
+        # No candidate found in FSL. Show what we tried so the rep can
+        # eyeball whether Whisper just butchered the code.
+        tried = ", ".join(f"<code>{h(c)}</code>" for c in candidates[:5])
+        await placeholder.edit_text(
+            f"🎤 I heard: <b>{h(text)}</b>\n"
+            f"→ Tried: {tried}\n\n"
+            "None of these match a known product. Try again with the "
+            "code spoken clearly?",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    unique = _dedupe_codes(valid, cap=5)
     await placeholder.edit_text(
         f"🎤 Heard: <b>{h(text)}</b>\n"
         f"→ Looking up {', '.join(f'<code>{h(c)}</code>' for c in unique)}…",

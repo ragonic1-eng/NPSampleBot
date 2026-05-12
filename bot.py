@@ -897,10 +897,18 @@ def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> boo
 # Max product codes per /pp or /scan invocation. Each code triggers an
 # MMS round-trip (product detail + R&D price scrape), so this caps both
 # server load and the time the user waits before seeing results.
-PP_BATCH_CAP = 30
+# Admin (UPDATE_SAMPLE_OWNER) gets a higher cap for bulk price audits;
+# regular reps get the conservative 10 to keep MMS load predictable.
+PP_BATCH_CAP_ADMIN = 30
+PP_BATCH_CAP_USER = 10
 
 
-def _dedupe_codes(codes: list[str], cap: int = PP_BATCH_CAP) -> list[str]:
+def _pp_cap_for(user) -> int:
+    """Per-user batch cap for /pp and /scan."""
+    return PP_BATCH_CAP_ADMIN if _is_update_sample_owner(user) else PP_BATCH_CAP_USER
+
+
+def _dedupe_codes(codes: list[str], cap: int = PP_BATCH_CAP_USER) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for c in codes:
@@ -1152,9 +1160,14 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Send a product code, e.g. <code>/pp S-62RG3-19</code>.",
         )
         return
-    unique = _dedupe_codes(codes, cap=PP_BATCH_CAP)
-    if len(codes) > 5:
-        await send(update, f"🙏 Max 5 codes per /pp — running first 5: {', '.join(unique)}")
+    cap = _pp_cap_for(update.effective_user)
+    unique = _dedupe_codes(codes, cap=cap)
+    if len(codes) > cap:
+        await send(
+            update,
+            f"🙏 Max {cap} codes per /pp — running first {cap}: "
+            f"{', '.join(unique)}",
+        )
     await _run_pp_for_codes(update, unique)
 
 
@@ -1282,7 +1295,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send(update, "\n".join(lines))
 
     # Cap at 5 to match the /pp ceiling and avoid spamming MMS.
-    unique = _dedupe_codes(result.codes, cap=PP_BATCH_CAP)
+    unique = _dedupe_codes(result.codes, cap=_pp_cap_for(update.effective_user))
     await _run_pp_for_codes(update, unique)
 
 
@@ -1554,7 +1567,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    unique = _dedupe_codes(valid, cap=PP_BATCH_CAP)
+    unique = _dedupe_codes(valid, cap=_pp_cap_for(update.effective_user))
     await placeholder.edit_text(
         f"🎤 Heard: <b>{h(text)}</b>\n"
         f"→ Looking up {', '.join(f'<code>{h(c)}</code>' for c in unique)}…",
@@ -1903,7 +1916,7 @@ async def _run_seasoning_search(
     # previous query — it's an explicit price lookup.
     code_hits = _PP_CODE_RE.findall(query)
     if code_hits:
-        unique = _dedupe_codes(code_hits, cap=PP_BATCH_CAP)
+        unique = _dedupe_codes(code_hits, cap=_pp_cap_for(update.effective_user))
         await _run_pp_for_codes(update, unique)
         return
 
@@ -3789,7 +3802,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 kb([[("🏠 Main menu", "menu:home")]]),
             )
             return
-        unique = _dedupe_codes(codes, cap=PP_BATCH_CAP)
+        unique = _dedupe_codes(codes, cap=_pp_cap_for(update.effective_user))
         await _run_pp_for_codes(update, unique)
         return
 

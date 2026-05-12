@@ -18,6 +18,7 @@ import re
 from decimal import ROUND_CEILING, Decimal
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand,
@@ -5731,14 +5732,20 @@ async def _weekly_mms_sync_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _schedule_weekly_mms_sync(application: Application) -> None:
     """Set up the recurring twice-weekly job + catch-up if overdue.
 
-    Schedule (V1.11.0):
-      - Monday + Thursday at 02:00 UTC (gap = 3-4 days each way).
-      - On startup, if last successful sync was >4 days ago (or never),
-        kick off a one-shot run after a 60s delay so the bot has time to
-        finish initialising.
+    Schedule:
+      - Monday + Friday at 00:30 Asia/Singapore (= 16:30 UTC Sun/Thu).
+        Gap = 3 days (Fri→Mon) and 4 days (Mon→Fri). Saturdays and
+        Sundays are intentionally skipped.
+      - On startup, if last successful sync was >24h ago (or never),
+        kick off a one-shot run after a 60s delay so the bot has time
+        to finish initialising. The 24h threshold combined with the
+        24h hard cooldown in sync_engine means redeploys mid-cycle
+        will refresh the list, but back-to-back deploys won't sync
+        twice.
 
-    Each run pulls both Singapore (S- codes → FSL_TAB) and Indonesia
-    (J- codes → JAKARTA_FSL_TAB) in a single MMS round-trip.
+    Each run pulls Singapore (S- codes → FSL_TAB), Indonesia (J- codes
+    → JAKARTA_FSL_TAB), and Thailand (B- codes → BANGKOK_FSL_TAB) in a
+    single MMS round-trip.
     """
     from datetime import time as _time
     job_queue = application.job_queue
@@ -5747,18 +5754,24 @@ async def _schedule_weekly_mms_sync(application: Application) -> None:
                     "Install python-telegram-bot[job-queue] to enable.")
         return
 
-    # Recurring twice-weekly run: Monday + Thursday 02:00 UTC.
+    # Recurring twice-weekly run: Monday + Friday 00:30 SGT.
     # PTB day numbering: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun.
+    # PTB interprets `days` in the timezone of the `time` object, so
+    # both fire at 00:30 local Singapore wall time.
+    sgt = ZoneInfo("Asia/Singapore")
     job_queue.run_daily(
         _weekly_mms_sync_job,
-        time=_time(hour=2, minute=0, tzinfo=timezone.utc),
-        days=(0, 3),
+        time=_time(hour=0, minute=30, tzinfo=sgt),
+        days=(0, 4),
         name="biweekly_mms_sync",
     )
-    log.info("mms_sync scheduled: Monday + Thursday 02:00 UTC")
+    log.info("mms_sync scheduled: Monday + Friday 00:30 SGT (16:30 UTC prev day)")
 
-    # Catch-up: if we're overdue (no run in the last 4 days, given the
-    # 3-4 day cycle), trigger once 60s after startup.
+    # Catch-up: if last sync was >24h ago, trigger once 60s after
+    # startup. Tighter than the prior 4-day threshold so a Railway
+    # redeploy refreshes the list whenever it's stale, while the 24h
+    # cooldown in sync_engine prevents double-syncs from rapid
+    # redeploys.
     try:
         last = await asyncio.to_thread(sheets.get_last_sample_sync)
     except Exception as e:  # noqa: BLE001
@@ -5770,7 +5783,7 @@ async def _schedule_weekly_mms_sync(application: Application) -> None:
     else:
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
-        overdue = (datetime.now(timezone.utc) - last) > timedelta(days=4)
+        overdue = (datetime.now(timezone.utc) - last) > timedelta(hours=24)
         last_str = last.isoformat(timespec="seconds")
     if overdue:
         log.info(

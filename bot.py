@@ -894,7 +894,13 @@ def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> boo
     return False
 
 
-def _dedupe_codes(codes: list[str], cap: int = 5) -> list[str]:
+# Max product codes per /pp or /scan invocation. Each code triggers an
+# MMS round-trip (product detail + R&D price scrape), so this caps both
+# server load and the time the user waits before seeing results.
+PP_BATCH_CAP = 30
+
+
+def _dedupe_codes(codes: list[str], cap: int = PP_BATCH_CAP) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for c in codes:
@@ -1146,7 +1152,7 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Send a product code, e.g. <code>/pp S-62RG3-19</code>.",
         )
         return
-    unique = _dedupe_codes(codes, cap=5)
+    unique = _dedupe_codes(codes, cap=PP_BATCH_CAP)
     if len(codes) > 5:
         await send(update, f"🙏 Max 5 codes per /pp — running first 5: {', '.join(unique)}")
     await _run_pp_for_codes(update, unique)
@@ -1276,7 +1282,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send(update, "\n".join(lines))
 
     # Cap at 5 to match the /pp ceiling and avoid spamming MMS.
-    unique = _dedupe_codes(result.codes, cap=5)
+    unique = _dedupe_codes(result.codes, cap=PP_BATCH_CAP)
     await _run_pp_for_codes(update, unique)
 
 
@@ -1548,7 +1554,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    unique = _dedupe_codes(valid, cap=5)
+    unique = _dedupe_codes(valid, cap=PP_BATCH_CAP)
     await placeholder.edit_text(
         f"🎤 Heard: <b>{h(text)}</b>\n"
         f"→ Looking up {', '.join(f'<code>{h(c)}</code>' for c in unique)}…",
@@ -1897,7 +1903,7 @@ async def _run_seasoning_search(
     # previous query — it's an explicit price lookup.
     code_hits = _PP_CODE_RE.findall(query)
     if code_hits:
-        unique = _dedupe_codes(code_hits, cap=5)
+        unique = _dedupe_codes(code_hits, cap=PP_BATCH_CAP)
         await _run_pp_for_codes(update, unique)
         return
 
@@ -3783,7 +3789,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 kb([[("🏠 Main menu", "menu:home")]]),
             )
             return
-        unique = _dedupe_codes(codes, cap=5)
+        unique = _dedupe_codes(codes, cap=PP_BATCH_CAP)
         await _run_pp_for_codes(update, unique)
         return
 

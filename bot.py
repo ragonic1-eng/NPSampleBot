@@ -553,6 +553,164 @@ _PP_CODE_RE = re.compile(
 )
 
 
+# V1.13.11 — per-rep currency display preference.
+#
+# Sales reps based in Indonesia (William, Leo, Freddy, Heidy) quote
+# customers in IDR. Reps in Thailand (Nu, Jang, Ying) quote in THB.
+# Everyone else sees raw prices as stored on the sheet (USD / SGD /
+# whatever the FSL row holds).
+#
+# Match is by MMS Name (lowercase, first-word fallback) so we don't
+# care about Telegram username casing. Reps not yet added to the
+# Authorized Users tab get the override applied automatically once
+# you add them — no code change needed.
+_USER_CURRENCY_OVERRIDE: dict[str, str] = {
+    # Indonesia reps → IDR
+    "william": "IDR",
+    "leo":     "IDR",
+    "freddy":  "IDR",
+    "heidy":   "IDR",
+    # Thailand reps → THB
+    "nu":      "THB",
+    "jang":    "THB",
+    "ying":    "THB",
+}
+
+# Conversion ratios: 1 unit of currency in USD. To convert local→USD,
+# multiply. To convert USD→local, divide. Rates are approximate but
+# stable enough for sales quoting (sales reps cross-check the
+# customer-facing price separately before committing).
+_CURRENCY_USD_RATE: dict[str, float] = {
+    "USD": 1.0,
+    "SGD": 0.74,    # 1 SGD ≈ 0.74 USD
+    "THB": 0.029,   # 1 THB ≈ 0.029 USD  (1 USD ≈ 34.5 THB)
+    "IDR": 0.000063,  # 1 IDR ≈ 0.000063 USD (1 USD ≈ 15,873 IDR)
+    "MYR": 0.21,
+}
+
+_CURRENCY_PRICE_PARSE_RE = re.compile(
+    r"^([A-Z]{3,4}|RM|S\$|\$)\s*([\d,]+(?:\.\d+)?)$",
+    re.IGNORECASE,
+)
+
+
+def _user_currency_for_mms(mms_name: str | None) -> str | None:
+    """Return user's preferred currency code (IDR / THB) or None."""
+    if not mms_name:
+        return None
+    norm = mms_name.strip().lower()
+    if norm in _USER_CURRENCY_OVERRIDE:
+        return _USER_CURRENCY_OVERRIDE[norm]
+    # Fallback: first token, so 'William Lee' still resolves.
+    parts = norm.split()
+    if parts and parts[0] in _USER_CURRENCY_OVERRIDE:
+        return _USER_CURRENCY_OVERRIDE[parts[0]]
+    return None
+
+
+async def _user_pref_currency(update: "Update") -> str | None:
+    """Look up the rep's preferred currency override for this request.
+
+    Resolves Telegram identity → MMS Name (via get_user_mms_name's
+    5-min cache) → currency override. Returns None when there's no
+    override configured for this rep, which means callers fall back
+    to showing raw prices as stored on the sheet.
+    """
+    user = update.effective_user if update else None
+    if not user:
+        return None
+    try:
+        mms = await asyncio.to_thread(
+            sheets.get_user_mms_name, user.id, user.username,
+        )
+    except Exception:  # noqa: BLE001 — never break price display
+        return None
+    return _user_currency_for_mms(mms or "")
+
+
+def _parse_price_to_usd(raw: str) -> tuple[float | None, str]:
+    """Parse a raw price cell to USD-equivalent + the cleaned original.
+
+    Handles three input shapes the FSL stores:
+      • bare number ('5.44')         → assumes USD
+      • currency prefix ('USD 5.44') → straightforward
+      • exotic currency ('IDR 59,322', 'THB 162.9', 'SGD 6.60', 'RM 12')
+        → converted via _CURRENCY_USD_RATE
+    Returns (None, original) when we can't parse — caller should fall
+    back to showing the original string untouched.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None, s
+    # Bare numeric → USD by convention (matches existing code paths).
+    try:
+        v = float(s.replace(",", ""))
+        return (v, s) if v > 0 else (None, s)
+    except ValueError:
+        pass
+    m = _CURRENCY_PRICE_PARSE_RE.match(s)
+    if not m:
+        return None, s
+    cur_raw, num_raw = m.group(1).upper(), m.group(2).replace(",", "")
+    cur_norm = {"S$": "SGD", "$": "USD", "RM": "MYR"}.get(cur_raw, cur_raw)
+    try:
+        v = float(num_raw)
+    except ValueError:
+        return None, s
+    if v <= 0:
+        return None, s
+    rate = _CURRENCY_USD_RATE.get(cur_norm)
+    if rate is None:
+        return None, s
+    return v * rate, s
+
+
+def _format_price_for_currency(
+    raw: str,
+    target: str | None,
+    *,
+    show_original: bool = False,
+) -> str:
+    """Convert a raw price cell to the target currency for display.
+
+    target=None (no override) → return the raw string unchanged (with
+    a 'USD ' prefix added if the cell was bare numeric, matching the
+    existing _fmt_price behaviour).
+
+    target='IDR' / 'THB' → convert via _CURRENCY_USD_RATE; emit
+    formatted with thousands separators and currency-appropriate
+    decimal places (IDR: 0 dp, others: 2 dp).
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if not target:
+        # No override — preserve existing behaviour (bare → 'USD X').
+        try:
+            float(s.replace(",", ""))
+            return f"USD {s}"
+        except ValueError:
+            return s
+    usd, original = _parse_price_to_usd(s)
+    if usd is None:
+        return original  # unparseable — show as-is rather than guess
+    target_rate = _CURRENCY_USD_RATE.get(target)
+    if not target_rate:
+        return original
+    local = usd / target_rate
+    if target == "IDR":
+        body = f"{local:,.0f}"
+    else:
+        body = f"{local:,.2f}"
+    formatted = f"{target} {body}"
+    if show_original and original.strip().upper() != formatted.upper():
+        # Only annotate when the original was non-empty AND different
+        # from our converted output (avoids redundancy like
+        # 'IDR 59,322 (was IDR 59,322)').
+        formatted += f" <i>(from {h(original)})</i>"
+    return formatted
+
+
 # V1.12.6 — smarter text match used by /lastsample, /alllastsample, and the
 # 🔎 Search seasonings flow. Three-pass: original substring → alphanumeric-
 # stripped substring (handles "Datong"/"Da tong") → token-level WRatio for
@@ -767,6 +925,12 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
     uname = (user.username or user.full_name or "") if user else ""
     uid = user.id if user else ""
 
+    # V1.13.11 — resolve the rep's preferred currency override once per
+    # /pp call (cached at the sheets layer so this is cheap). All price
+    # lines below render through _format_price_for_currency so reps in
+    # IDR-quoting or THB-quoting regions see prices in their currency.
+    pref_currency = await _user_pref_currency(update)
+
     def _audit(**kw):
         asyncio.create_task(
             asyncio.to_thread(
@@ -799,17 +963,20 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         async def _reply_from_fsl(asked_code: str, fsl_row: dict) -> None:
             fsl_name = (fsl_row.get("Product Name") or "—").strip() or "—"
             fsl_price_raw = (fsl_row.get("R&D Price") or "").strip()
+            # V1.13.11 — price rendered in the rep's preferred currency
+            # when override is configured. _format_price_for_currency
+            # handles bare-numeric and currency-prefixed inputs.
+            fsl_price_display = _format_price_for_currency(
+                fsl_price_raw, pref_currency, show_original=bool(pref_currency),
+            ) if fsl_price_raw else "—"
             try:
-                float(fsl_price_raw)
-                fsl_price_display = f"USD {fsl_price_raw}"
                 fsl_price_for_audit = float(fsl_price_raw)
             except ValueError:
-                fsl_price_display = fsl_price_raw or "—"
                 fsl_price_for_audit = None
             body = (
                 f"<b>Code:</b> <code>{h(asked_code)}</code>\n"
                 f"<b>Name:</b> {h(fsl_name)}\n"
-                f"<b>R&amp;D Price:</b> {h(fsl_price_display)}"
+                f"<b>R&amp;D Price:</b> {fsl_price_display}"
             )
             await _replace(body)
             _audit(
@@ -892,24 +1059,36 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             except Exception as e:  # noqa: BLE001
                 log.warning("/pp FSL fallback for %s failed: %s", asked, e)
 
+        # V1.13.11 — both prices honour the rep's currency override.
+        # rd_line: MMS price (when set) is canonical USD; FSL fallback
+        # can be in any currency the sheet stores. Both go through the
+        # same formatter so the conversion behaviour is consistent.
         if product.rd_price_usd is not None:
-            rd_line = f"USD {product.rd_price_usd:.2f}"
+            rd_line = _format_price_for_currency(
+                f"USD {product.rd_price_usd:.2f}", pref_currency,
+                show_original=bool(pref_currency),
+            )
         elif rd_from_fsl_raw:
-            try:
-                # Bare numeric → assume USD (matches the FSL-only reply path)
-                float(rd_from_fsl_raw)
-                rd_line = f"USD {rd_from_fsl_raw} <i>(last sampled)</i>"
-            except ValueError:
-                # Already has currency text (e.g. 'IDR 59,322')
-                rd_line = f"{h(rd_from_fsl_raw)} <i>(last sampled)</i>"
+            rd_line = _format_price_for_currency(
+                rd_from_fsl_raw, pref_currency,
+                show_original=bool(pref_currency),
+            ) + " <i>(last sampled)</i>"
         else:
             rd_line = "—"
+
+        # Raw Material Cost stays in USD when no override; otherwise
+        # gets converted same as R&D Price. RMC is what reps quote to
+        # customers — keeping it in the customer's currency matters.
+        rmc_line = _format_price_for_currency(
+            f"USD {adj_rmc:.2f}", pref_currency,
+            show_original=bool(pref_currency),
+        )
 
         body = (
             f"<b>Code:</b> <code>{h(product.code)}</code>\n"
             f"<b>Name:</b> {h(product.name)}\n"
             f"<b>R&amp;D Price:</b> {rd_line}\n"
-            f"<b>Raw Material Cost:</b> USD {adj_rmc:.2f}"
+            f"<b>Raw Material Cost:</b> {rmc_line}"
         )
         await _replace(body)
         # For audit, log the FSL fallback as a numeric only if it parses
@@ -2231,19 +2410,18 @@ async def _run_seasoning_search(
         )
     lines: list[str] = header_bits + [""]
 
+    # V1.13.11 — per-rep currency override. Resolved once for this page
+    # of results; the inline _fmt_price closure captures it and applies
+    # to every row's price line.
+    search_pref_currency = await _user_pref_currency(update)
+
     def _fmt_price(raw: str) -> str:
         """USD-prefix bare numeric prices; pass through anything that
-        already has currency text (e.g. 'IDR 76,891', 'THB 162.9').
-        Matches the /lastsample formatter so search and lastsample look
-        consistent."""
-        s = (raw or "").strip()
-        if not s:
-            return ""
-        try:
-            float(s)
-            return f"USD {s}"
-        except ValueError:
-            return s
+        already has currency text (e.g. 'IDR 76,891', 'THB 162.9') —
+        unless the rep has a currency override, in which case every
+        price is converted to that currency. Matches the /lastsample
+        formatter so search and lastsample look consistent."""
+        return _format_price_for_currency(raw, search_pref_currency)
 
     def _truncate_at_word(s: str, n: int) -> str:
         """Truncate to <= n chars at the last word boundary (so we don't
@@ -2736,15 +2914,11 @@ async def _show_lastsample_results(
         header_bits.append(f"   <i>(refined query)</i>")
     lines: list[str] = header_bits + [""]
 
+    # V1.13.11 — per-rep currency override for /lastsample rows.
+    lastsample_pref_currency = await _user_pref_currency(update)
+
     def _fmt_price(raw: str) -> str:
-        s = (raw or "").strip()
-        if not s:
-            return ""
-        try:
-            float(s)
-            return f"USD {s}"
-        except ValueError:
-            return s
+        return _format_price_for_currency(raw, lastsample_pref_currency)
 
     for i, r in enumerate(page_rows, start + 1):
         d = r.get("_date")
@@ -2864,15 +3038,14 @@ async def _show_customer_samples(
     end = min(start + _CUST_PAGE_SIZE, total)
     page_rows = matches[start:end]
 
+    # V1.13.11 — per-rep currency override on customer-view list.
+    cust_pref_currency = await _user_pref_currency(update)
+
     def _fmt_price(raw: str) -> str:
         s = (raw or "").strip()
         if not s:
             return "—"
-        try:
-            float(s)
-            return f"USD {s}"
-        except ValueError:
-            return s  # already has currency text baked in
+        return _format_price_for_currency(raw, cust_pref_currency)
 
     title_suffix = " <i>(all reps)</i>" if scope == "all" else ""
     page_marker = (

@@ -2849,6 +2849,13 @@ async def _run_lastsample_search(
             return
 
         # No products AND no customers matched.
+        # V1.13.12 — when self-scope misses, silently peek at all-reps
+        # to see if a colleague has the sample. Most common cause of the
+        # 'no product found' confusion: rep typed a code that another
+        # rep sent (e.g. William typed J-45GR1-06 which Heidy sent in
+        # 2021). The bot is technically right, but reps interpret
+        # 'sample request list' as the whole list, not their own. So
+        # we surface the all-reps count + a one-tap switch button.
         reset_note = (
             "\n\n<i>🔄 Your search has been reset — send a fresh keyword "
             "to start over, or tap 🏠 Main menu.</i>" if prev else ""
@@ -2860,15 +2867,72 @@ async def _run_lastsample_search(
         )
         sync_footer = await _last_sync_footer()
         sync_tail = f"\n\n<i>{sync_footer}</i>" if sync_footer else ""
-        await send(
-            update,
-            f"🙈 <b>No product found in your sample request list.</b>\n\n"
-            f"Nothing {whose} has "
-            f"<b>{h(query)}</b> in the Product Name or Customer Name. "
-            "Double-check the spelling, or try a different keyword."
-            f"{reset_note}{sync_tail}",
-            _last_kb(scope),
-        )
+
+        all_scope_hits: list[dict] = []
+        code_in_query = _PP_CODE_RE.findall(query) if scope == "self" else []
+        if scope == "self":
+            try:
+                all_rows = await _load_lastsample_rows(scope="all")
+                all_scope_hits = _filter_lastsample_products(all_rows, query)
+            except Exception as e:  # noqa: BLE001
+                log.warning("lastsample no-match all-scope peek failed: %s", e)
+
+        body_lines = [
+            "🙈 <b>No product found in your sample request list.</b>",
+            "",
+            f"Nothing {whose} has <b>{h(query)}</b> in the Product Name "
+            "or Customer Name. Double-check the spelling, or try a "
+            "different keyword.",
+        ]
+        extra_btn_rows: list[list[tuple[str, str]]] = []
+
+        if scope == "self" and all_scope_hits:
+            senders = sorted({
+                (r.get("Sales") or "").strip()
+                for r in all_scope_hits
+                if (r.get("Sales") or "").strip()
+            })
+            senders_blurb = ""
+            if senders:
+                shown = ", ".join(h(s) for s in senders[:3])
+                more = (
+                    f" and {len(senders) - 3} more"
+                    if len(senders) > 3
+                    else ""
+                )
+                senders_blurb = f" sent by <b>{shown}</b>{more}"
+            body_lines.append("")
+            body_lines.append(
+                f"💡 But <b>{len(all_scope_hits)}</b> sample"
+                f"{'s' if len(all_scope_hits) != 1 else ''} match"
+                f"{'es' if len(all_scope_hits) == 1 else ''} across "
+                f"<b>all reps' samples</b>{senders_blurb}. Tap below to view."
+            )
+            # Encode query in callback. Telegram caps callback_data at
+            # 64 bytes UTF-8; 'lsall:' prefix is 6 bytes → 58 byte budget.
+            q_bytes = query.encode("utf-8")[:58]
+            q_safe = q_bytes.decode("utf-8", errors="ignore")
+            extra_btn_rows.append([
+                ("🌐 Show all-reps result", f"lsall:{q_safe}"),
+            ])
+
+        if scope == "self" and code_in_query:
+            first_code = code_in_query[0].upper()
+            extra_btn_rows.append([
+                (f"💲 Look up price for {first_code}", f"lspp:{first_code}"),
+            ])
+
+        # Append reset note + sync footer as before
+        body = "\n".join(body_lines) + f"{reset_note}{sync_tail}"
+
+        # Default fallback row: Find another + Main menu
+        again_cb = "lastsample:again_all" if scope == "all" else "lastsample:again"
+        extra_btn_rows.append([
+            ("🔎 Find another", again_cb),
+            ("🏠 Main menu", "menu:home"),
+        ])
+
+        await send(update, body, kb(extra_btn_rows))
         _re_arm("")
         return
 
@@ -4406,6 +4470,26 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             query=sr_cached.get("query") or "",
             page=sr_page,
         )
+        return
+
+    # V1.13.12 — escape hatches shown when self-scope /lastsample
+    # returns no match. Two callbacks, both encode the query/code
+    # directly in callback_data (no user_data dependency — multi-
+    # replica safe).
+    if data.startswith("lsall:"):
+        # Switch to all-reps scope and re-run the search.
+        ls_query = data[len("lsall:"):]
+        ctx.user_data["lastsample_scope"] = "all"
+        ctx.user_data["lastsample_active_query"] = ""
+        await _run_lastsample_search(
+            update, ctx, mms_name="", query=ls_query, prev="", scope="all",
+        )
+        return
+    if data.startswith("lspp:"):
+        # Direct /pp lookup on a code the rep already typed.
+        ls_code = data[len("lspp:"):].strip().upper()
+        if ls_code:
+            await _run_pp_for_codes(update, [ls_code])
         return
 
     # Main menu and /samples browsing work with or without a draft.

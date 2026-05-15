@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.13.12"
+BOT_VERSION = "V1.13.13"
 
 # Margin added to MMS raw_material_cost before showing it to the user (and
 # before logging to the Query audit tab). Covers handling / overhead so
@@ -36,6 +36,12 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 # did you say?" response. Set GROQ_API_KEY in Railway env vars.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
+
+# Daily sample-digest reminder (V1.13.13). Posts a list of every sample
+# logged that day to a specific group chat at 18:00 SGT, weekdays only.
+# Empty value = feature disabled. Get the chat ID by running /whichchat
+# from inside the group, then set this env var on Railway.
+DAILY_DIGEST_CHAT_ID = os.getenv("DAILY_DIGEST_CHAT_ID", "").strip()
 # Haiku is the default — used by ai.rerank_seasonings() for semantic
 # catalog search ranking. Plenty good for picking among 3–10 fuzzy
 # candidates and ~3x cheaper than Sonnet ($1/$5 input/output per Mtok

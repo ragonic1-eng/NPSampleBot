@@ -6005,6 +6005,163 @@ async def _weekly_mms_sync_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("weekly_mms_sync_job failed: %s", e)
 
 
+# --------------------------- V1.13.13: daily sample digest ---------------------------
+#
+# Every weekday at 18:00 Asia/Singapore, post a list of every sample
+# logged that calendar day (SGT date) to the configured group chat.
+# Across all 3 regions (Singapore + Indonesia + Thailand). Zero-sample
+# days still post 'No samples today' so the group knows the bot is
+# alive and the schedule isn't broken.
+
+def _today_sgt() -> "object":
+    """Return today's date in Asia/Singapore."""
+    from datetime import datetime as _dt
+    return _dt.now(ZoneInfo("Asia/Singapore")).date()
+
+
+def _fmt_digest_price(raw: str) -> str:
+    """Compact price formatter for the digest line.
+
+    Bare numeric → 'USD X.XX'. Currency-prefixed pass-through. Empty
+    cell → '—' so the line still parses cleanly even when MMS didn't
+    record an R&D price for that variant.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "—"
+    try:
+        v = float(s.replace(",", ""))
+        return f"USD {v:.2f}"
+    except ValueError:
+        return s
+
+
+async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback — posts today's sample list to the group chat.
+
+    Loads all 3 FSL tabs, filters to rows where the parsed sample date
+    equals today (Singapore date), formats one line per sample per the
+    spec ('Sales: X, Customer: Y, sample sent: NAME CODE, R&D price Z'),
+    and sends to DAILY_DIGEST_CHAT_ID.
+    """
+    if not config.DAILY_DIGEST_CHAT_ID:
+        log.info("daily_digest: DAILY_DIGEST_CHAT_ID not set — skipping")
+        return
+
+    try:
+        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
+    except ValueError:
+        log.warning("daily_digest: DAILY_DIGEST_CHAT_ID is not a valid int: %r",
+                    config.DAILY_DIGEST_CHAT_ID)
+        return
+
+    today = _today_sgt()
+    log.info("daily_digest: building for SGT date %s", today)
+
+    # Gather rows from all 3 tabs dated today.
+    samples: list[dict] = []
+    for tab in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB):
+        try:
+            rows = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
+        except Exception as e:  # noqa: BLE001
+            log.warning("daily_digest: failed to read tab %r: %s", tab, e)
+            continue
+        for r in rows:
+            d = r.get("_date")
+            if d == today:
+                samples.append(r)
+
+    # Sort by Sales then Customer for predictable order.
+    samples.sort(
+        key=lambda r: (
+            (r.get("Sales") or "").lower(),
+            (r.get("Customer Name") or "").lower(),
+        )
+    )
+
+    pretty_date = today.strftime("%a, %d %b %Y")
+    if not samples:
+        body = (
+            f"📋 <b>Daily sample digest — {pretty_date}</b>\n\n"
+            "🪴 <i>No samples logged today.</i>"
+        )
+    else:
+        lines = [
+            f"📋 <b>Daily sample digest — {pretty_date}</b>",
+            f"<i>{len(samples)} sample"
+            f"{'s' if len(samples) != 1 else ''} across all factories.</i>",
+            "",
+        ]
+        for i, r in enumerate(samples, 1):
+            sales = (r.get("Sales") or "—").strip() or "—"
+            customer = (r.get("Customer Name") or "—").strip() or "—"
+            name = (r.get("Product Name") or "—").strip() or "—"
+            code = (r.get("Product Code") or "—").strip() or "—"
+            price = _fmt_digest_price(r.get("R&D Price") or "")
+            lines.append(
+                f"{i}. Sales: <b>{h(sales)}</b>, Customer: {h(customer)}, "
+                f"sample sent: {h(name)} <code>{h(code)}</code>, "
+                f"R&amp;D price {h(price)}"
+            )
+        body = "\n".join(lines)
+
+    try:
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=body,
+            parse_mode=ParseMode.HTML,
+        )
+        log.info("daily_digest: sent (%d samples) to chat %s",
+                 len(samples), chat_id)
+    except Exception as e:  # noqa: BLE001
+        log.exception("daily_digest: send failed: %s", e)
+
+
+async def _schedule_daily_digest(application: Application) -> None:
+    """Schedule the daily digest at 18:00 Asia/Singapore, weekdays only."""
+    from datetime import time as _time
+    job_queue = application.job_queue
+    if job_queue is None:
+        log.warning("JobQueue not available — daily digest NOT scheduled.")
+        return
+    if not config.DAILY_DIGEST_CHAT_ID:
+        log.info("daily_digest: DAILY_DIGEST_CHAT_ID not set — schedule skipped")
+        return
+
+    sgt = ZoneInfo("Asia/Singapore")
+    # days: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri. Skips Saturday + Sunday.
+    job_queue.run_daily(
+        _daily_sample_digest_job,
+        time=_time(hour=18, minute=0, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4),
+        name="daily_sample_digest",
+    )
+    log.info("daily_digest scheduled: 18:00 SGT, Mon-Fri, chat %s",
+             config.DAILY_DIGEST_CHAT_ID)
+
+
+async def cmd_whichchat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/whichchat` — print the current chat's ID. Useful for setting
+    DAILY_DIGEST_CHAT_ID. Authorized users only; non-admins still get
+    the ID but only for the chat they ran it in."""
+    if not await _authorized(update):
+        return
+    chat = update.effective_chat
+    if not chat:
+        return
+    title = getattr(chat, "title", "") or chat.type or "?"
+    await send(
+        update,
+        f"💬 <b>Chat info</b>\n"
+        f"Chat ID: <code>{chat.id}</code>\n"
+        f"Title:   {h(title)}\n"
+        f"Type:    {chat.type}\n\n"
+        "<i>Paste the chat ID into Railway as "
+        "<code>DAILY_DIGEST_CHAT_ID</code> to enable the 18:00 SGT "
+        "weekday sample digest in this chat.</i>",
+    )
+
+
 async def _schedule_weekly_mms_sync(application: Application) -> None:
     """Set up the recurring twice-weekly job + catch-up if overdue.
 
@@ -6129,6 +6286,7 @@ def main():
     app.add_handler(CommandHandler("samples", cmd_samples))
     app.add_handler(CommandHandler("bulk", cmd_bulk))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("whichchat", cmd_whichchat))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("scan", cmd_scan))
@@ -6169,6 +6327,7 @@ def main():
     async def _post_init(application: Application) -> None:
         await _install_commands(application)
         await _schedule_weekly_mms_sync(application)
+        await _schedule_daily_digest(application)
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

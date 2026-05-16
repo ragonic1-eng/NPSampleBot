@@ -6162,6 +6162,40 @@ async def cmd_whichchat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/sampleupdate` — admin-only: trigger the daily sample digest right
+    now to preview exactly what the 18:00 SGT weekday job will post.
+
+    Reuses _daily_sample_digest_job verbatim so what you see here is
+    bit-for-bit what the group will receive at 6pm (modulo any samples
+    logged between now and 6pm).
+    """
+    user = update.effective_user
+    if not _is_update_sample_owner(user):
+        await send(update, "🔒 Admin-only command.")
+        return
+    if not config.DAILY_DIGEST_CHAT_ID:
+        await send(
+            update,
+            "⚠️ <code>DAILY_DIGEST_CHAT_ID</code> is not set in Railway. "
+            "Use /whichchat in the target group, then paste the ID into "
+            "Railway → Variables. After redeploy, /sampleupdate will "
+            "post a preview to that group.",
+        )
+        return
+    await send(update, "📋 Running daily sample digest now…")
+    try:
+        await _daily_sample_digest_job(ctx)
+        await send(
+            update,
+            "✅ Digest posted to "
+            f"<code>{h(config.DAILY_DIGEST_CHAT_ID)}</code>.",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("cmd_sampleupdate failed")
+        await send(update, f"❌ Digest failed: <code>{h(str(e))}</code>")
+
+
 async def _schedule_weekly_mms_sync(application: Application) -> None:
     """Set up the recurring twice-weekly job + catch-up if overdue.
 
@@ -6287,6 +6321,7 @@ def main():
     app.add_handler(CommandHandler("bulk", cmd_bulk))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("whichchat", cmd_whichchat))
+    app.add_handler(CommandHandler("sampleupdate", cmd_sampleupdate))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("scan", cmd_scan))

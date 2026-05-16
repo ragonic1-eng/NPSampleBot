@@ -6097,12 +6097,12 @@ async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     pretty_date = today.strftime("%a, %d %b %Y")
     if total == 0:
         body = (
-            f"📋 <b>Daily sample digest — {pretty_date}</b>\n\n"
+            f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>\n\n"
             "🪴 <i>No samples logged today across all 3 factories.</i>"
         )
     else:
         lines = [
-            f"📋 <b>Daily sample digest — {pretty_date}</b>",
+            f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>",
             f"<i>{total} sample{'s' if total != 1 else ''} across all "
             "3 factories.</i>",
         ]

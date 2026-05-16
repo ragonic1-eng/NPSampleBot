@@ -5995,11 +5995,17 @@ async def _weekly_mms_sync_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     The actual fetch + enrich + append lives in `sync_engine.run_mms_to_fsl_sync`,
     a synchronous function we offload to a thread so the bot's event loop
     isn't blocked by gspread / requests.
+
+    force=True so the scheduled run never gets blocked by the 24h
+    cooldown in sync_engine. The cooldown is meant to stop accidental
+    manual overlap, not block the scheduler itself. Without force,
+    running daily (Mon-Fri 17:40 SGT) hits the cooldown 4 out of 5
+    weekdays and silently no-ops.
     """
     import sync_engine
     log.info("weekly_mms_sync_job: starting")
     try:
-        result = await asyncio.to_thread(sync_engine.run_mms_to_fsl_sync, False)
+        result = await asyncio.to_thread(sync_engine.run_mms_to_fsl_sync, True)
         log.info("weekly_mms_sync_job: result %s", result)
     except Exception as e:  # noqa: BLE001
         log.exception("weekly_mms_sync_job failed: %s", e)
@@ -6225,18 +6231,19 @@ async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _schedule_weekly_mms_sync(application: Application) -> None:
-    """Set up the recurring twice-weekly job + catch-up if overdue.
+    """Set up the recurring weekday sync job + catch-up if overdue.
 
     Schedule:
-      - Monday + Friday at 00:30 Asia/Singapore (= 16:30 UTC Sun/Thu).
-        Gap = 3 days (Fri→Mon) and 4 days (Mon→Fri). Saturdays and
-        Sundays are intentionally skipped.
+      - Monday through Friday at 17:40 Asia/Singapore (= 09:40 UTC).
+        Fires 20 minutes before the 18:00 SGT daily digest so the FSL
+        tabs are guaranteed fresh when the digest reads them. Saturday
+        and Sunday skipped.
       - On startup, if last successful sync was >24h ago (or never),
         kick off a one-shot run after a 60s delay so the bot has time
-        to finish initialising. The 24h threshold combined with the
-        24h hard cooldown in sync_engine means redeploys mid-cycle
-        will refresh the list, but back-to-back deploys won't sync
-        twice.
+        to finish initialising. Fri 17:40 → Mon 17:40 is 72h, so any
+        Mon morning startup will catch-up. force=True on the sync
+        bypasses the 24h cooldown that would otherwise block daily
+        runs (see _weekly_mms_sync_job).
 
     Each run pulls Singapore (S- codes → FSL_TAB), Indonesia (J- codes
     → JAKARTA_FSL_TAB), and Thailand (B- codes → BANGKOK_FSL_TAB) in a
@@ -6249,18 +6256,18 @@ async def _schedule_weekly_mms_sync(application: Application) -> None:
                     "Install python-telegram-bot[job-queue] to enable.")
         return
 
-    # Recurring twice-weekly run: Monday + Friday 00:30 SGT.
+    # Recurring weekday run: Mon-Fri 17:40 SGT.
     # PTB day numbering: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun.
     # PTB interprets `days` in the timezone of the `time` object, so
-    # both fire at 00:30 local Singapore wall time.
+    # all 5 fire at 17:40 local Singapore wall time.
     sgt = ZoneInfo("Asia/Singapore")
     job_queue.run_daily(
         _weekly_mms_sync_job,
-        time=_time(hour=0, minute=30, tzinfo=sgt),
-        days=(0, 4),
-        name="biweekly_mms_sync",
+        time=_time(hour=17, minute=40, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4),
+        name="weekday_mms_sync",
     )
-    log.info("mms_sync scheduled: Monday + Friday 00:30 SGT (16:30 UTC prev day)")
+    log.info("mms_sync scheduled: Mon-Fri 17:40 SGT (20 min before digest)")
 
     # Catch-up: if last sync was >24h ago, trigger once 60s after
     # startup. Tighter than the prior 4-day threshold so a Railway

@@ -6058,51 +6058,79 @@ async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     today = _today_sgt()
     log.info("daily_digest: building for SGT date %s", today)
 
-    # Gather rows from all 3 tabs dated today.
-    samples: list[dict] = []
-    for tab in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB):
+    # Gather rows from all 3 tabs dated today, keyed by region so we can
+    # group + label sections in the message. Region order is fixed
+    # (SG → ID → TH) for predictable scanning.
+    region_specs = (
+        ("Singapore / Intl", "🇸🇬", sheets.FSL_TAB, True),   # show country
+        ("Indonesia",        "🇮🇩", sheets.JAKARTA_FSL_TAB, False),
+        ("Thailand",         "🇹🇭", sheets.BANGKOK_FSL_TAB, False),
+    )
+    by_region: dict[str, list[dict]] = {}
+    total = 0
+    for label, _flag, tab, _show_country in region_specs:
+        bucket: list[dict] = []
         try:
             rows = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
         except Exception as e:  # noqa: BLE001
             log.warning("daily_digest: failed to read tab %r: %s", tab, e)
+            by_region[label] = bucket
             continue
         for r in rows:
-            d = r.get("_date")
-            if d == today:
-                samples.append(r)
-
-    # Sort by Sales then Customer for predictable order.
-    samples.sort(
-        key=lambda r: (
-            (r.get("Sales") or "").lower(),
-            (r.get("Customer Name") or "").lower(),
+            if r.get("_date") == today:
+                bucket.append(r)
+        bucket.sort(
+            key=lambda r: (
+                (r.get("Sales") or "").lower(),
+                (r.get("Customer Name") or "").lower(),
+            )
         )
-    )
+        by_region[label] = bucket
+        total += len(bucket)
 
     pretty_date = today.strftime("%a, %d %b %Y")
-    if not samples:
+    if total == 0:
         body = (
             f"📋 <b>Daily sample digest — {pretty_date}</b>\n\n"
-            "🪴 <i>No samples logged today.</i>"
+            "🪴 <i>No samples logged today across all 3 factories.</i>"
         )
     else:
         lines = [
             f"📋 <b>Daily sample digest — {pretty_date}</b>",
-            f"<i>{len(samples)} sample"
-            f"{'s' if len(samples) != 1 else ''} across all factories.</i>",
-            "",
+            f"<i>{total} sample{'s' if total != 1 else ''} across all "
+            "3 factories.</i>",
         ]
-        for i, r in enumerate(samples, 1):
-            sales = (r.get("Sales") or "—").strip() or "—"
-            customer = (r.get("Customer Name") or "—").strip() or "—"
-            name = (r.get("Product Name") or "—").strip() or "—"
-            code = (r.get("Product Code") or "—").strip() or "—"
-            price = _fmt_digest_price(r.get("R&D Price") or "")
+        for label, flag, _tab, show_country in region_specs:
+            bucket = by_region.get(label, [])
+            n = len(bucket)
+            lines.append("")
             lines.append(
-                f"{i}. Sales: <b>{h(sales)}</b>, Customer: {h(customer)}, "
-                f"sample sent: {h(name)} <code>{h(code)}</code>, "
-                f"R&amp;D price {h(price)}"
+                f"{flag} <b>{h(label)}</b> — "
+                f"{n} sample{'s' if n != 1 else ''}"
             )
+            if not bucket:
+                lines.append("<i>No samples today.</i>")
+                continue
+            for i, r in enumerate(bucket, 1):
+                sales = (r.get("Sales") or "—").strip() or "—"
+                customer = (r.get("Customer Name") or "—").strip() or "—"
+                country = (r.get("Country") or "").strip()
+                name = (r.get("Product Name") or "—").strip() or "—"
+                code = (r.get("Product Code") or "—").strip() or "—"
+                qty_raw = (r.get("Quantity (g)") or "").strip()
+                qty = f"{qty_raw}g" if qty_raw else "—"
+                price = _fmt_digest_price(r.get("R&D Price") or "")
+                cust_line = (
+                    f"{h(customer)} ({h(country)})"
+                    if show_country and country
+                    else h(customer)
+                )
+                lines.extend([
+                    f"{i}. Sales: <b>{h(sales)}</b>",
+                    f"   Customer: {cust_line}",
+                    f"   Sample: {h(name)} · <code>{h(code)}</code>",
+                    f"   {h(qty)} · R&amp;D {h(price)}",
+                ])
         body = "\n".join(lines)
 
     try:

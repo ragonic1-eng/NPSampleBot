@@ -69,13 +69,22 @@ _HAIKU_MODEL = "claude-haiku-4-5"  # cheapest model that supports vision
 # trip OCR up so Haiku slows down on those.
 _VISION_PROMPT = """\
 This image contains one or more **product codes** from an internal manufacturing
-system. Codes ALWAYS look like:
+system. Codes ALWAYS look like one of:
 
-    S-XXXXX        (e.g. S-62RG3, S-BACIT02, S-Y9KY2)
-    S-XXXXX-NN     (e.g. S-62RG3-19, S-51ZB1-11, S-S7CG5-61)
+    S-XXXXX        Singapore / International (e.g. S-62RG3, S-Y9KY2)
+    S-XXXXX-NN     Singapore variant         (e.g. S-62RG3-19, S-S7CG5-61)
+    J-XXXXX        Indonesia / Jakarta       (e.g. J-61TS2, J-B3681)
+    J-XXXXX-NN     Indonesia variant         (e.g. J-61TS2-22-01, J-B3681-04)
+    B-XXXXX        Thailand / Bangkok        (e.g. B-A2K91, B-1UL1)
+    B-XXXXX-NN     Thailand variant          (e.g. B-A2K91-03)
+    T-XXXXX        Thailand (legacy)         (rare)
 
-Every code starts with literal `S-`. The body after the dash is 3-10 alphanumeric
-characters, may contain a SECOND dash followed by a 1-4 char suffix.
+Every code starts with one literal prefix: `S-`, `J-`, `B-`, or `T-`. The body
+after the dash is 3-10 alphanumeric characters and may contain a SECOND dash
+followed by a 1-4 char suffix (and rarely a third).
+
+Do NOT silently rewrite a `J-` to `S-` or a `B-` to `S-` because Singapore codes
+are more common — the prefix is part of the printed material; read what's there.
 
 Read the image and list **every** product code you can see, one per line, in
 UPPERCASE. Do not output anything else — no explanations, no quotes, no preamble.

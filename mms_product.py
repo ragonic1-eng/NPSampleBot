@@ -95,20 +95,27 @@ class MMSProductClient:
         with self._lock:
             self._ensure_logged_in()
             r = self._session.get(url, timeout=20, **kw)
+            # Audit V1.13.14 — MMS responses are UTF-8 but the server
+            # sometimes omits charset, in which case requests guesses
+            # ISO-8859-1 and Chinese product names come out mojibake.
+            r.encoding = "utf-8"
             if self._looks_like_login(r.text):
                 self._logged_in = False
                 self._login_locked()
                 r = self._session.get(url, timeout=20, **kw)
+                r.encoding = "utf-8"
             return r
 
     def _post(self, url: str, data: dict, **kw) -> requests.Response:
         with self._lock:
             self._ensure_logged_in()
             r = self._session.post(url, data=data, timeout=20, **kw)
+            r.encoding = "utf-8"  # see _get comment
             if self._looks_like_login(r.text):
                 self._logged_in = False
                 self._login_locked()
                 r = self._session.post(url, data=data, timeout=20, **kw)
+                r.encoding = "utf-8"
             return r
 
     # ---------- lookup ----------

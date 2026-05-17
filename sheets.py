@@ -8,8 +8,53 @@ from __future__ import annotations
 import json as _json
 import logging
 import os
+import re
 import time
 from typing import Any
+
+
+# Audit V1.13.14 — restore Chinese characters that were mangled by the
+# old MMS scraper (mms_client._parse_js_object_body) before that bug
+# was fixed. The scraper used to strip the leading backslash off
+# `\uXXXX` escapes, leaving raw `uXXXX` ASCII in the sheet. Mojibake
+# in MMS arrives as a CONTIGUOUS run (e.g. `u9C9Cu9999u6D77u82D4u5473`
+# for 鲜香海苔味), so we match the whole run with one regex and decode
+# every 5-char escape inside it. The lookbehind guards against false
+# positives in legitimate text like "Yu1234" type strings; once the
+# run is matched, we don't need to re-check the lookbehind for inner
+# escapes.
+_MANGLED_UNICODE_RUN_RE = re.compile(
+    r"(?<![A-Za-z0-9])((?:u[0-9A-Fa-f]{4})+)"
+)
+
+
+def _decode_mangled_unicode_run(m: "re.Match[str]") -> str:
+    """Decode each `uXXXX` escape inside a contiguous matched run."""
+    raw = m.group(1)
+    chars = []
+    # Each escape is exactly 5 chars: 'u' + 4 hex digits.
+    for i in range(0, len(raw), 5):
+        hex_str = raw[i + 1:i + 5]
+        try:
+            chars.append(chr(int(hex_str, 16)))
+        except (ValueError, OverflowError):
+            # Defensive — should never trip given the regex, but if we
+            # ever encounter an invalid codepoint, keep the original.
+            chars.append(raw[i:i + 5])
+    return "".join(chars)
+
+
+def restore_mangled_unicode(s: str) -> str:
+    """Decode orphaned `uXXXX` fragments back to the original characters.
+
+    Idempotent (a run of legitimate ASCII has no escapes to decode).
+    Used at row-read time so every consumer (digest, search, /pp,
+    /lastsample) sees clean names without needing a one-time backfill
+    of the sheet.
+    """
+    if not s or "u" not in s:
+        return s
+    return _MANGLED_UNICODE_RUN_RE.sub(_decode_mangled_unicode_run, s)
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -796,7 +841,7 @@ def find_fsl_product_by_code(code: str) -> dict | None:
         if row_code != code_upper:
             continue
         padded = r + [""] * (len(FSL_HEADER) - len(r))
-        row = {hdr: padded[i] for i, hdr in enumerate(FSL_HEADER)}
+        row = {hdr: restore_mangled_unicode(padded[i]) for i, hdr in enumerate(FSL_HEADER)}
         row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
         matches.append(row)
     if not matches:
@@ -824,7 +869,7 @@ def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for r in values[1:]:
         padded = r + [""] * (len(FSL_HEADER) - len(r))
-        row = {hdr: padded[i] for i, hdr in enumerate(FSL_HEADER)}
+        row = {hdr: restore_mangled_unicode(padded[i]) for i, hdr in enumerate(FSL_HEADER)}
         row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
         out.append(row)
     return out
@@ -858,7 +903,7 @@ def load_fsl_rows_for_sales(sales_name: str, tab: str = FSL_TAB) -> list[dict[st
             continue
         # Pad to header width for safe column access.
         padded = r + [""] * (len(FSL_HEADER) - len(r))
-        row = {h: padded[i] for i, h in enumerate(FSL_HEADER)}
+        row = {h: restore_mangled_unicode(padded[i]) for i, h in enumerate(FSL_HEADER)}
         row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
         out.append(row)
     return out

@@ -111,6 +111,11 @@ def login(session: requests.Session, user: str, password: str) -> bool:
         timeout=30,
         allow_redirects=True,
     )
+    # Audit V1.13.14 — MMS responses are UTF-8 but server occasionally
+    # omits charset, in which case requests guesses ISO-8859-1 and we
+    # get mojibake on Chinese product names downstream. Force UTF-8 on
+    # every MMS response before any .text/HTML parsing.
+    resp.encoding = "utf-8"
     body = resp.text.lower()
     ok = "logout" in body or "sample submission" in body
     if not ok:
@@ -266,19 +271,41 @@ def _parse_js_object_body(body: str) -> dict:
                     nxt = body[j + 1]
                     if nxt == "n":
                         buf.append("\n")
+                        j += 2
                     elif nxt == "t":
                         buf.append("\t")
+                        j += 2
                     elif nxt == "r":
                         buf.append("\r")
+                        j += 2
                     elif nxt == '"':
                         buf.append('"')
+                        j += 2
                     elif nxt == "\\":
                         buf.append("\\")
+                        j += 2
                     elif nxt == "/":
                         buf.append("/")
+                        j += 2
+                    elif nxt == "u" and j + 5 < n:
+                        # Audit V1.13.14 — \uXXXX (4-hex-digit Unicode
+                        # escape). DWR uses these for non-ASCII chars
+                        # (Chinese product names). Previously fell into
+                        # the catch-all else branch and we kept just
+                        # "u" + the 4 hex chars verbatim, producing the
+                        # "u9C9C" mojibake all over the sheet.
+                        hex_str = body[j + 2:j + 6]
+                        try:
+                            buf.append(chr(int(hex_str, 16)))
+                            j += 6
+                        except ValueError:
+                            # Not a valid hex sequence — fall back to
+                            # the literal char so we don't lose data.
+                            buf.append(nxt)
+                            j += 2
                     else:
                         buf.append(nxt)
-                    j += 2
+                        j += 2
                 elif ch == '"':
                     j += 1
                     break
@@ -401,6 +428,7 @@ def search_samples(
         timeout=180,
     )
     resp.raise_for_status()
+    resp.encoding = "utf-8"  # see comment in `login()` above
 
     dtos = _extract_sample_dtos(resp.text)
     rows = [_dto_to_sample_row(d) for d in dtos]

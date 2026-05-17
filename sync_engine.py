@@ -302,12 +302,17 @@ def _process_region(
 def run_mms_to_fsl_sync(
     force: bool = False,
     start_override: dt.date | None = None,
-    regions: tuple[str, ...] = ("S", "J"),
+    regions: tuple[str, ...] = ("S", "J", "B"),
     skip_enrichment: bool = False,
 ) -> dict:
     """Pull fresh sample submissions from MMS and append new ones to the
-    matching FSL tab. Both Singapore (S-) and Indonesia (J-) are processed
-    by default; pass ``regions=('S',)`` or ``('J',)`` to limit.
+    matching FSL tab. All 3 factories — Singapore (S-), Indonesia (J-),
+    and Thailand/Bangkok (B-) — are processed by default; pass an
+    explicit subset like ``regions=('S',)`` to limit.
+
+    Audit V1.13.14 — Thailand was missing from the default tuple, so
+    the scheduled daily sync (which calls this with the default) had
+    never refreshed Bangkok samples since the B- region was added.
 
     ``start_override`` lets callers (e.g. the Indonesia initial backfill
     script) request a much earlier window than the default

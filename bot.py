@@ -404,8 +404,23 @@ async def _authorized(update: Update) -> bool:
         # first hit.
         ok = await asyncio.to_thread(sheets.is_user_authorized, user.id, user.username)
     except Exception as e:  # noqa: BLE001
+        # Audit V1.13.14 — fail OPEN on Sheets API errors. Previously
+        # returned False, which silently locked out the whole team
+        # whenever Google Sheets had a transient hiccup (quota, 503,
+        # network blip). Caller is told the bot is degraded so they
+        # don't think they were de-authorized, but we still let them
+        # through. Real "not on the list" denials go through the
+        # explicit `not ok` branch below with the normal message.
         log.exception("auth check failed for uid=%s uname=%s: %s", user.id, user.username, e)
-        ok = False
+        await send(
+            update,
+            "⚠️ <b>Auth check is degraded right now.</b>\n\n"
+            "Google Sheets isn't responding cleanly. You're being let "
+            "through this time — please retry the command in a minute "
+            "if anything else fails. (Admin: check Sheets quota / "
+            "service-account permissions.)",
+        )
+        return True
     if not ok:
         log.warning("auth denied: uid=%s uname=%s", user.id, user.username)
         await send(
@@ -6146,7 +6161,7 @@ async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
         )
         log.info("daily_digest: sent (%d samples) to chat %s",
-                 len(samples), chat_id)
+                 total, chat_id)
     except Exception as e:  # noqa: BLE001
         log.exception("daily_digest: send failed: %s", e)
 

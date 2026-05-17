@@ -459,8 +459,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [("🔎 Search seasonings", "menu:search")],
         [("📷 Scan a product photo", "menu:scan")],
         [("✏️ Enter a code (price lookup)", "menu:code")],
-        [("🤔 What I send ah?", "menu:lastsample")],
-        [("🌐 What everyone Send ah?", "menu:alllastsample")],
+        [("👤 My samples (me only)", "menu:lastsample")],
+        [("🌐 All reps' samples", "menu:alllastsample")],
     ]
     # MMS → Full Sample Listing sync is now automated weekly via the
     # JobQueue (see main()). No manual Telegram trigger.
@@ -6057,31 +6057,19 @@ def _fmt_digest_price(raw: str) -> str:
         return s
 
 
-async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue callback — posts today's sample list to the group chat.
+async def _build_daily_digest_body() -> tuple[str, int]:
+    """Read all 3 FSL tabs, filter to today's SGT date, build the
+    formatted digest body. Returns (html_body, total_sample_count).
 
-    Loads all 3 FSL tabs, filters to rows where the parsed sample date
-    equals today (Singapore date), formats one line per sample per the
-    spec ('Sales: X, Customer: Y, sample sent: NAME CODE, R&D price Z'),
-    and sends to DAILY_DIGEST_CHAT_ID.
+    Pure data → string. No Telegram I/O. Extracted from
+    _daily_sample_digest_job so cmd_sampleupdate can echo a preview
+    of the exact same body back to the admin who triggered it
+    (audit V1.13.14, UX D).
     """
-    if not config.DAILY_DIGEST_CHAT_ID:
-        log.info("daily_digest: DAILY_DIGEST_CHAT_ID not set — skipping")
-        return
-
-    try:
-        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
-    except ValueError:
-        log.warning("daily_digest: DAILY_DIGEST_CHAT_ID is not a valid int: %r",
-                    config.DAILY_DIGEST_CHAT_ID)
-        return
-
     today = _today_sgt()
     log.info("daily_digest: building for SGT date %s", today)
 
-    # Gather rows from all 3 tabs dated today, keyed by region so we can
-    # group + label sections in the message. Region order is fixed
-    # (SG → ID → TH) for predictable scanning.
+    # Region order fixed (SG → ID → TH) for predictable scanning.
     region_specs = (
         ("Singapore / Intl", "🇸🇬", sheets.FSL_TAB, True),   # show country
         ("Indonesia",        "🇮🇩", sheets.JAKARTA_FSL_TAB, False),
@@ -6115,44 +6103,65 @@ async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>\n\n"
             "🪴 <i>No samples logged today across all 3 factories.</i>"
         )
-    else:
-        lines = [
-            f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>",
-            f"<i>{total} sample{'s' if total != 1 else ''} across all "
-            "3 factories.</i>",
-        ]
-        for label, flag, _tab, show_country in region_specs:
-            bucket = by_region.get(label, [])
-            n = len(bucket)
-            lines.append("")
-            lines.append(
-                f"{flag} <b>{h(label)}</b> — "
-                f"{n} sample{'s' if n != 1 else ''}"
+        return body, 0
+
+    lines = [
+        f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>",
+        f"<i>{total} sample{'s' if total != 1 else ''} across all "
+        "3 factories.</i>",
+    ]
+    for label, flag, _tab, show_country in region_specs:
+        bucket = by_region.get(label, [])
+        n = len(bucket)
+        lines.append("")
+        lines.append(
+            f"{flag} <b>{h(label)}</b> — "
+            f"{n} sample{'s' if n != 1 else ''}"
+        )
+        if not bucket:
+            lines.append("<i>No samples today.</i>")
+            continue
+        for i, r in enumerate(bucket, 1):
+            sales = (r.get("Sales") or "—").strip() or "—"
+            customer = (r.get("Customer Name") or "—").strip() or "—"
+            country = (r.get("Country") or "").strip()
+            name = (r.get("Product Name") or "—").strip() or "—"
+            code = (r.get("Product Code") or "—").strip() or "—"
+            qty_raw = (r.get("Quantity (g)") or "").strip()
+            qty = f"{qty_raw}g" if qty_raw else "—"
+            price = _fmt_digest_price(r.get("R&D Price") or "")
+            cust_line = (
+                f"{h(customer)} ({h(country)})"
+                if show_country and country
+                else h(customer)
             )
-            if not bucket:
-                lines.append("<i>No samples today.</i>")
-                continue
-            for i, r in enumerate(bucket, 1):
-                sales = (r.get("Sales") or "—").strip() or "—"
-                customer = (r.get("Customer Name") or "—").strip() or "—"
-                country = (r.get("Country") or "").strip()
-                name = (r.get("Product Name") or "—").strip() or "—"
-                code = (r.get("Product Code") or "—").strip() or "—"
-                qty_raw = (r.get("Quantity (g)") or "").strip()
-                qty = f"{qty_raw}g" if qty_raw else "—"
-                price = _fmt_digest_price(r.get("R&D Price") or "")
-                cust_line = (
-                    f"{h(customer)} ({h(country)})"
-                    if show_country and country
-                    else h(customer)
-                )
-                lines.extend([
-                    f"{i}. Sales: <b>{h(sales)}</b>",
-                    f"   Customer: {cust_line}",
-                    f"   Sample: {h(name)} · <code>{h(code)}</code>",
-                    f"   {h(qty)} · R&amp;D {h(price)}",
-                ])
-        body = "\n".join(lines)
+            lines.extend([
+                f"{i}. Sales: <b>{h(sales)}</b>",
+                f"   Customer: {cust_line}",
+                f"   Sample: {h(name)} · <code>{h(code)}</code>",
+                f"   {h(qty)} · R&amp;D {h(price)}",
+            ])
+    return "\n".join(lines), total
+
+
+async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback — posts today's sample list to the group chat.
+
+    Thin wrapper around _build_daily_digest_body — see that for the
+    formatting and aggregation logic.
+    """
+    if not config.DAILY_DIGEST_CHAT_ID:
+        log.info("daily_digest: DAILY_DIGEST_CHAT_ID not set — skipping")
+        return
+
+    try:
+        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
+    except ValueError:
+        log.warning("daily_digest: DAILY_DIGEST_CHAT_ID is not a valid int: %r",
+                    config.DAILY_DIGEST_CHAT_ID)
+        return
+
+    body, total = await _build_daily_digest_body()
 
     try:
         await ctx.bot.send_message(
@@ -6213,36 +6222,56 @@ async def cmd_whichchat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """`/sampleupdate` — admin-only: trigger the daily sample digest right
-    now to preview exactly what the 18:00 SGT weekday job will post.
+    now AND echo the exact body back to the caller in DM so the admin
+    can review without alt-tabbing to the group chat.
 
-    Reuses _daily_sample_digest_job verbatim so what you see here is
-    bit-for-bit what the group will receive at 6pm (modulo any samples
-    logged between now and 6pm).
+    Audit V1.13.14 (UX D) — previously only confirmed "posted to
+    chat_id"; admin had to switch to the group to see the actual
+    content. Now the same HTML body lands here too.
     """
     user = update.effective_user
     if not _is_update_sample_owner(user):
         await send(update, "🔒 Admin-only command.")
         return
+    await send(update, "📋 Building today's digest…")
+    try:
+        body, total = await _build_daily_digest_body()
+    except Exception as e:  # noqa: BLE001
+        log.exception("cmd_sampleupdate: build failed")
+        await send(update, f"❌ Build failed: <code>{h(str(e))}</code>")
+        return
+
+    # Always show the preview to the caller, even if the group isn't
+    # configured. That way the admin can sanity-check formatting
+    # before wiring DAILY_DIGEST_CHAT_ID.
+    await send(update, "👇 <b>Preview (what the group will see):</b>")
+    await send(update, body)
+
     if not config.DAILY_DIGEST_CHAT_ID:
         await send(
             update,
-            "⚠️ <code>DAILY_DIGEST_CHAT_ID</code> is not set in Railway. "
-            "Use /whichchat in the target group, then paste the ID into "
-            "Railway → Variables. After redeploy, /sampleupdate will "
-            "post a preview to that group.",
+            "⚠️ <code>DAILY_DIGEST_CHAT_ID</code> is not set in Railway, "
+            "so this preview was NOT posted to any group. "
+            "Use /whichchat in the target group, paste the ID into "
+            "Railway → Variables, redeploy, then re-run /sampleupdate.",
         )
         return
-    await send(update, "📋 Running daily sample digest now…")
+
     try:
-        await _daily_sample_digest_job(ctx)
+        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
+        await ctx.bot.send_message(
+            chat_id=chat_id, text=body, parse_mode=ParseMode.HTML,
+        )
+        log.info("cmd_sampleupdate: sent (%d samples) to chat %s",
+                 total, chat_id)
         await send(
             update,
-            "✅ Digest posted to "
-            f"<code>{h(config.DAILY_DIGEST_CHAT_ID)}</code>.",
+            f"✅ Posted to <code>{h(config.DAILY_DIGEST_CHAT_ID)}</code> "
+            f"({total} sample{'s' if total != 1 else ''}).",
         )
     except Exception as e:  # noqa: BLE001
-        log.exception("cmd_sampleupdate failed")
-        await send(update, f"❌ Digest failed: <code>{h(str(e))}</code>")
+        log.exception("cmd_sampleupdate: send failed")
+        await send(update, f"❌ Post to group failed: <code>{h(str(e))}</code>")
 
 
 async def _schedule_weekly_mms_sync(application: Application) -> None:
@@ -6385,6 +6414,12 @@ def main():
     # the default list (it's restricted), but we'll add it for @ragonic below
     # via post_init once the bot is running.
     async def _install_commands(application: Application) -> None:
+        # Audit V1.13.14 (UX F) — /whichchat and /sampleupdate were
+        # registered as handlers but missing from the Telegram command
+        # menu, so admins discovering them via "/" autocomplete had no
+        # way to know they existed. Added to the default menu; the
+        # execution-time admin gate in cmd_sampleupdate still rejects
+        # non-admins with a "Admin-only command" reply.
         default_cmds = [
             BotCommand("start", "Main menu — new request / bulk / samples"),
             BotCommand("bulk", "Paste a multi-seasoning email, I split it"),
@@ -6393,10 +6428,12 @@ def main():
             BotCommand("cancel", "Discard the current draft"),
             BotCommand("reload", "Refresh seasoning / customer lists"),
             BotCommand("whoami", "Show your Telegram ID & username"),
+            BotCommand("whichchat", "Show this chat's ID (for setup)"),
             BotCommand("pp", "💲 Product price — e.g. /pp S-62RG3-19"),
             BotCommand("scan", "📷 Scan a photo for product code(s)"),
             BotCommand("lastsample", "🔎 Find your last sample — /lastsample <keyword>"),
             BotCommand("alllastsample", "🌐 Search any rep's samples — /alllastsample <keyword>"),
+            BotCommand("sampleupdate", "🧪 Admin: preview today's 6pm digest now"),
             BotCommand("diag", "Diagnostics"),
             BotCommand("help", "Show all commands"),
         ]

@@ -4921,10 +4921,31 @@ async def _handle_nav(update, ctx, d: state.Draft, action: str):
         )
         return
     if action == "cancel_yes":
+        # Audit fix #13 — also clear any in-flight bulk session state.
+        # Without this, a rep mid-bulk who cancels the per-item draft
+        # leaves bulk_parsed / bulk_stage / bulk_customer_carry in
+        # user_data; a later /start or unrelated message can trip the
+        # bulk-state branch in on_message with stale data. The /bulk
+        # entry point does re-clear, but reps don't know that's the
+        # only escape hatch.
+        was_in_bulk = "_bulk_idx" in d.data
         state.clear(d.user_id)
+        # Mirrors the keys cmd_bulk re-initialises on entry — verified
+        # against `user_data["bulk_*"]` call sites in this file.
+        for key in (
+            "bulk_parsed", "bulk_stage", "bulk_raw", "bulk_shared",
+            "bulk_customer_carry", "bulk_crossfill",
+            "bulk_tokens_in", "bulk_tokens_out",
+        ):
+            ctx.user_data.pop(key, None)
+        msg = (
+            "✖ Bulk session and draft both discarded."
+            if was_in_bulk
+            else "✖ Draft discarded."
+        )
         await send(
             update,
-            "✖ Draft discarded.",
+            msg,
             kb([[("🏠 Main menu", "menu:home")]]),
         )
         return
@@ -4998,23 +5019,54 @@ async def _handle_seasoning_pick(update, ctx, d: state.Draft, payload: str):
         await q_seasoning(update, ctx, d)
         return
     else:
+        # Audit fix #14 — surface stale legacy payloads instead of
+        # silently returning. Old menu messages still tagged with
+        # callback formats from before V1.12.3 would otherwise look
+        # like dead buttons.
         try:
             idx = int(payload)
         except ValueError:
+            await send(
+                update,
+                "🤔 That button is from an older version of the menu — "
+                "it doesn't apply to your current draft. Type the "
+                "seasoning code again to refresh the options.",
+            )
             return
         cands = ctx.user_data.get("seasoning_candidates") or []
-        if 0 <= idx < len(cands):
-            c = cands[idx]
-            d.data["seasoning"] = c["name"]
-            d.matched_code = c.get("code", "")
-            d.matched_price = c.get("price", "")
-            d.matched_category = c.get("category", "")
-            # Prefill the comment with the picked product + code so R&D sees
-            # exactly what sales chose. User can still edit later.
-            if c.get("code"):
-                d.data["comment"] = f"Use code {c['code']} — {c['name']}"
-            else:
-                d.data["comment"] = f"Use {c['name']}"
+        # Audit fix #5 — if the candidates cache is empty (worker
+        # switch / redeploy between rendering the menu and the click),
+        # we MUST NOT silently advance the draft with the seasoning
+        # field blank. That used to produce sheet rows with empty
+        # Matched Code / Matched Price after a deploy. Tell the user
+        # to retype the code so we can rebuild the candidate list.
+        if not cands:
+            await send(
+                update,
+                "🤔 I lost the seasoning options list (probably a bot "
+                "redeploy between you seeing the buttons and tapping). "
+                "Please <b>type the seasoning code again</b> so I can "
+                "rebuild the picker.",
+            )
+            return
+        if not (0 <= idx < len(cands)):
+            await send(
+                update,
+                "🤔 That option isn't in the current list anymore — "
+                "type the seasoning code again to refresh the options.",
+            )
+            return
+        c = cands[idx]
+        d.data["seasoning"] = c["name"]
+        d.matched_code = c.get("code", "")
+        d.matched_price = c.get("price", "")
+        d.matched_category = c.get("category", "")
+        # Prefill the comment with the picked product + code so R&D sees
+        # exactly what sales chose. User can still edit later.
+        if c.get("code"):
+            d.data["comment"] = f"Use code {c['code']} — {c['name']}"
+        else:
+            d.data["comment"] = f"Use {c['name']}"
     # Search resolved — drop the running query history so the next draft
     # (or next edit pass) starts clean.
     ctx.user_data.pop("seasoning_queries", None)
@@ -5022,6 +5074,21 @@ async def _handle_seasoning_pick(update, ctx, d: state.Draft, payload: str):
 
 
 async def _handle_company_pick(update, ctx, d: state.Draft, payload: str):
+    # Audit fix #3 — refuse the click when the draft has already moved
+    # past the company_name stage. Otherwise a stale `co:N` button (from
+    # scrolling up to an earlier suggestion list) silently overwrites
+    # the customer mid-draft and jumps d.sub to "confirm_address" while
+    # d.stage still points at e.g. "deadline" — the next ca:yes/no then
+    # runs _advance from a corrupted state.
+    if d.stage != "company_name":
+        await send(
+            update,
+            "🤔 That customer button is from an earlier point in this "
+            "draft — you've moved past picking the customer. If you "
+            "want to change the customer, go to <b>Review</b> and tap "
+            "✏️ Edit on the Customer Company Name field.",
+        )
+        return
     if payload == "new":
         d.sub = "new_name"
         await send(
@@ -5364,7 +5431,12 @@ async def show_customer_samples(update, ctx, cust_idx: int, page: int = 0):
         f"<b>Sample {page + 1} of {total}</b> · {h(ts)}\n\n"
         "📝 <b>Draft summary</b>\n"
     )
-    rows_btns = [_page_nav_row(page, total, "samp:custpage")]
+    # Audit fix #4 — encode customer idx in the callback prefix so the
+    # next-page click can rebuild the same view even if it lands on a
+    # different Railway worker (whose ctx.user_data is empty). Before:
+    # the click would default to idx=0 and silently show customer #1's
+    # samples labelled as if they were customer #N's.
+    rows_btns = [_page_nav_row(page, total, f"samp:custpage:{cust_idx}")]
     rows_btns.append([("◀ Back to customers", "samp:month"), ("✖ Close", "samp:close")])
     await send(update, header + "\n" + _fmt_sample_summary(r), kb(rows_btns))
 
@@ -5415,12 +5487,24 @@ async def _handle_samples_callback(update, ctx, action: str):
             return
         await show_customer_samples(update, ctx, idx, page=0)
         return
-    if action.startswith("custpage:page:"):
+    if action.startswith("custpage:"):
+        # Two formats accepted:
+        #   custpage:<idx>:page:<p>  — new, worker-safe (audit fix #4)
+        #   custpage:page:<p>        — legacy, falls back to user_data
+        parts = action.split(":")
         try:
-            p = int(action.split(":")[-1])
+            if len(parts) >= 4 and parts[2] == "page":
+                # custpage : <idx> : page : <p>
+                idx = int(parts[1])
+                p = int(parts[3])
+            elif len(parts) >= 3 and parts[1] == "page":
+                # legacy custpage:page:<p>
+                p = int(parts[2])
+                idx = ctx.user_data.get("samp_current_cust_idx", 0)
+            else:
+                return
         except ValueError:
             return
-        idx = ctx.user_data.get("samp_current_cust_idx", 0)
         await show_customer_samples(update, ctx, idx, page=p)
         return
 

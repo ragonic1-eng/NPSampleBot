@@ -2527,6 +2527,13 @@ async def _run_seasoning_search(
     # the query against the hash in user_data so the page-flip callback
     # can recover it without storing the (potentially long) query in the
     # callback bytes (Telegram caps callback_data at 64 bytes).
+    #
+    # Audit fix #6 — also embed the query in the callback when it fits.
+    # Telegram callback_data is 64 bytes, "srpg:sg:99:abcdef0123:" is
+    # ~22 bytes, leaving ~42 bytes for the query. Most queries fit, so
+    # the per-worker user_data cache is no longer the only path back —
+    # which fixes the "context expired" spuriously firing on every
+    # multi-replica Railway load-balancer hop.
     qhash = _query_hash(query)
     pager_state = ctx.user_data.setdefault("srpg_query_cache", {})
     pager_state[qhash] = {"query": query, "region": region}
@@ -2540,14 +2547,17 @@ async def _run_seasoning_search(
     ctx.user_data["last_search_query"] = query
     ctx.user_data["last_search_region"] = region
 
+    def _srpg_cb(p: int) -> str:
+        return _build_pager_cb(["srpg", region, str(p)], qhash, query)
+
     nav_row: list[tuple[str, str]] = []
     if page > 0:
         if page > 1:
-            nav_row.append(("⏮ First", f"srpg:{region}:0:{qhash}"))
-        nav_row.append(("◀ Prev", f"srpg:{region}:{page - 1}:{qhash}"))
+            nav_row.append(("⏮ First", _srpg_cb(0)))
+        nav_row.append(("◀ Prev", _srpg_cb(page - 1)))
     if page_end < total_unique:
         next_count = min(_SEARCH_TOP_N, total_unique - page_end)
-        nav_row.append((f"Next {next_count} ▶", f"srpg:{region}:{page + 1}:{qhash}"))
+        nav_row.append((f"Next {next_count} ▶", _srpg_cb(page + 1)))
 
     btn_rows: list[list[tuple[str, str]]] = []
     if nav_row:
@@ -2979,6 +2989,36 @@ def _query_hash(q: str) -> str:
     return hashlib.md5((q or "").encode("utf-8")).hexdigest()[:10]
 
 
+def _build_pager_cb(
+    prefix_parts: list[str], qhash: str, query: str, max_total: int = 64
+) -> str:
+    """Build a pagination callback_data string, embedding the query when
+    it fits within Telegram's 64-byte callback limit.
+
+    Format: '<prefix_parts joined by ":">:<qhash>[:<query>]'.
+    When the query doesn't fit (long refined queries, multi-byte UTF-8),
+    we drop it and the handler will fall back to its user_data cache.
+
+    Audit fix #6: previously the renderers always built '<head>:<qhash>'
+    only and relied 100% on the per-worker ctx.user_data cache to map
+    qhash → query. On Railway's multi-replica setup the click could
+    land on a worker that never saw the original search, so paging
+    bailed with "context expired" — even though the qhash is
+    deterministic and the search could be re-run if we just had the
+    query. This helper preserves the cache-based fast-path AND adds
+    the in-callback fallback for cross-replica recovery."""
+    head = ":".join(prefix_parts + [qhash])
+    remaining = max_total - len(head) - 1  # -1 for the ':' separator
+    if remaining <= 0:
+        return head
+    q_bytes = (query or "").encode("utf-8")[:remaining]
+    # safe-decode in case we sliced mid-multibyte
+    q_safe = q_bytes.decode("utf-8", errors="ignore").strip()
+    if not q_safe:
+        return head
+    return f"{head}:{q_safe}"
+
+
 async def _show_lastsample_results(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -3051,10 +3091,12 @@ async def _show_lastsample_results(
     if sync_footer:
         lines.append(f"<i>{sync_footer}</i>")
 
-    # Pagination buttons. Encoded as lspr:<s|a>:<page>:<query_hash>.
-    # Stash the query against the hash in user_data so the page-flip
-    # callback can recover it; on multi-replica deploys we fall back to
-    # re-deriving from sheet on whichever worker handles the click.
+    # Pagination buttons. Encoded as lspr:<s|a>:<page>:<query_hash>[:<query>].
+    # The trailing query is included whenever it fits in the 64-byte
+    # callback_data budget — that way pagination keeps working even
+    # when the click lands on a Railway replica whose ctx.user_data
+    # cache is empty (audit fix #6). user_data cache is still
+    # populated as a fast-path for the common same-worker case.
     qhash = _query_hash(query)
     s_letter = "a" if scope == "all" else "s"
     pager_state = ctx.user_data.setdefault("lspr_query_cache", {})
@@ -3064,14 +3106,17 @@ async def _show_lastsample_results(
         for k in list(pager_state.keys())[:-8]:
             pager_state.pop(k, None)
 
+    def _lspr_cb(p: int) -> str:
+        return _build_pager_cb(["lspr", s_letter, str(p)], qhash, query)
+
     nav_row: list[tuple[str, str]] = []
     if page > 0:
         if page > 1:
-            nav_row.append(("⏮ First", f"lspr:{s_letter}:0:{qhash}"))
-        nav_row.append(("◀ Prev", f"lspr:{s_letter}:{page - 1}:{qhash}"))
+            nav_row.append(("⏮ First", _lspr_cb(0)))
+        nav_row.append(("◀ Prev", _lspr_cb(page - 1)))
     if end < total:
         next_count = min(_LASTSAMPLE_PAGE_SIZE, total - end)
-        nav_row.append((f"Next {next_count} ▶", f"lspr:{s_letter}:{page + 1}:{qhash}"))
+        nav_row.append((f"Next {next_count} ▶", _lspr_cb(page + 1)))
 
     again_cb = "lastsample:again_all" if scope == "all" else "lastsample:again"
     btn_rows: list[list[tuple[str, str]]] = []
@@ -4401,18 +4446,29 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # be long (refined multi-word) and Telegram caps callback_data at
     # 64 bytes — the cache approach is simpler.
     if data.startswith("lspr:"):
-        parts = data.split(":", 3)
+        # Format: lspr:<s|a>:<page>:<qhash>[:<query>] — the trailing
+        # query is present when it fit in 64 bytes (audit fix #6).
+        # Use maxsplit=4 so a query that itself contains ':' stays
+        # intact in the final group.
+        parts = data.split(":", 4)
         if len(parts) < 4:
             return
-        _, scope_letter, page_str, qhash = parts
+        _, scope_letter, page_str, qhash = parts[:4]
+        embedded_query = parts[4] if len(parts) > 4 else None
         cs_scope = "all" if scope_letter == "a" else "self"
         try:
             page = int(page_str)
         except ValueError:
             return
-        pager_state = ctx.user_data.get("lspr_query_cache", {}) or {}
-        cached = pager_state.get(qhash)
-        if not cached:
+        # Prefer the embedded query (works across workers); fall back
+        # to the per-worker user_data cache.
+        query: str | None = embedded_query
+        if not query:
+            pager_state = ctx.user_data.get("lspr_query_cache", {}) or {}
+            cached = pager_state.get(qhash)
+            if cached:
+                query = cached.get("query")
+        if not query:
             await send(
                 update,
                 "🤔 The search context expired (probably a redeploy). "
@@ -4420,7 +4476,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 _last_kb(cs_scope),
             )
             return
-        query = cached.get("query") or ""
         # Resolve mms_name for self-scope (cache → sheet fallback).
         mms = ""
         if cs_scope == "self":
@@ -4468,17 +4523,27 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # requested page. Multi-replica safe via the user_data cache; cache
     # miss falls back to a friendly retry prompt.
     if data.startswith("srpg:"):
-        parts = data.split(":", 3)
+        # Format: srpg:<region>:<page>:<qhash>[:<query>] — see lspr
+        # handler for the embedded-query rationale (audit fix #6).
+        parts = data.split(":", 4)
         if len(parts) < 4:
             return
-        _, sr_region, sr_page_str, sr_qhash = parts
+        _, sr_region, sr_page_str, sr_qhash = parts[:4]
+        sr_embedded_query = parts[4] if len(parts) > 4 else None
         try:
             sr_page = int(sr_page_str)
         except ValueError:
             return
-        sr_state = ctx.user_data.get("srpg_query_cache", {}) or {}
-        sr_cached = sr_state.get(sr_qhash)
-        if not sr_cached:
+        # Prefer embedded query (cross-worker safe); fall back to cache.
+        sr_query: str | None = sr_embedded_query
+        sr_resolved_region = sr_region
+        if not sr_query:
+            sr_state = ctx.user_data.get("srpg_query_cache", {}) or {}
+            sr_cached = sr_state.get(sr_qhash)
+            if sr_cached:
+                sr_query = sr_cached.get("query")
+                sr_resolved_region = sr_cached.get("region") or sr_region
+        if not sr_query:
             await send(
                 update,
                 "🤔 The search context expired (probably a redeploy). "
@@ -4489,8 +4554,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await _run_seasoning_search(
             update, ctx,
-            region=sr_cached.get("region") or sr_region,
-            query=sr_cached.get("query") or "",
+            region=sr_resolved_region,
+            query=sr_query,
             page=sr_page,
         )
         return
@@ -6182,9 +6247,15 @@ async def _build_daily_digest_body() -> tuple[str, int]:
 
     # Footer summary — at-a-glance "who did the most today."
     if sales_totals:
-        top_sender = max(
+        # Sort by descending count, then alphabetical ASC for tie-break.
+        # The naive max(..., key=(count, name.lower())) picked the
+        # alphabetically LATEST name on ties (max prefers the larger
+        # tuple, and 'eric' > 'alex'), which felt random to readers.
+        # min with the negated-count key gives "highest count, earliest
+        # name" deterministically.
+        top_sender = min(
             sales_totals,
-            key=lambda k: (sales_totals[k], k.lower()),
+            key=lambda k: (-sales_totals[k], k.lower()),
         )
         lines.append("")
         lines.append("━━━━━━━━━━━━━━")
@@ -6197,11 +6268,71 @@ async def _build_daily_digest_body() -> tuple[str, int]:
     return "\n".join(lines), total
 
 
+def _split_digest_body(body: str, max_chars: int = 3900) -> list[str]:
+    """Split a long digest body into Telegram-safe chunks.
+
+    Telegram's API caps `send_message` at 4096 chars; we use 3900 to
+    leave a bit of headroom for HTML entities counting as multiple
+    bytes server-side. Splits on double-newlines first (preserves
+    the region/salesperson group boundaries the digest is built
+    around), and only falls back to mid-line splits if a single
+    paragraph is itself too long (shouldn't happen with the current
+    one-line-per-sample format, but defends against pathological
+    customer names).
+    """
+    if len(body) <= max_chars:
+        return [body]
+    blocks = body.split("\n\n")
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        candidate = (current + "\n\n" + block) if current else block
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        # Block itself fits — start a new chunk with it.
+        if len(block) <= max_chars:
+            current = block
+            continue
+        # Pathological case: a single paragraph > max_chars. Slice it
+        # at the last newline that fits so we don't break inside a
+        # sample line and corrupt HTML tags.
+        remaining = block
+        while len(remaining) > max_chars:
+            cut = remaining.rfind("\n", 0, max_chars)
+            if cut <= 0:
+                cut = max_chars
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:].lstrip("\n")
+        current = remaining
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _send_digest_to_chat(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, body: str
+) -> None:
+    """Send the digest body to a chat, splitting into multiple messages
+    if it would exceed Telegram's 4096-char limit. Each chunk gets the
+    same HTML parse mode so formatting stays consistent."""
+    for chunk in _split_digest_body(body):
+        await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=chunk,
+            parse_mode=ParseMode.HTML,
+        )
+
+
 async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """JobQueue callback — posts today's sample list to the group chat.
 
     Thin wrapper around _build_daily_digest_body — see that for the
-    formatting and aggregation logic.
+    formatting and aggregation logic. Uses _send_digest_to_chat so
+    busy-day digests that exceed Telegram's 4096-char cap get split
+    into multiple messages instead of failing silently.
     """
     if not config.DAILY_DIGEST_CHAT_ID:
         log.info("daily_digest: DAILY_DIGEST_CHAT_ID not set — skipping")
@@ -6217,13 +6348,9 @@ async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     body, total = await _build_daily_digest_body()
 
     try:
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=body,
-            parse_mode=ParseMode.HTML,
-        )
-        log.info("daily_digest: sent (%d samples) to chat %s",
-                 total, chat_id)
+        await _send_digest_to_chat(ctx, chat_id, body)
+        log.info("daily_digest: sent (%d samples, %d chars) to chat %s",
+                 total, len(body), chat_id)
     except Exception as e:  # noqa: BLE001
         log.exception("daily_digest: send failed: %s", e)
 
@@ -6296,9 +6423,11 @@ async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     # Always show the preview to the caller, even if the group isn't
     # configured. That way the admin can sanity-check formatting
-    # before wiring DAILY_DIGEST_CHAT_ID.
+    # before wiring DAILY_DIGEST_CHAT_ID. Split on the 4096-char limit
+    # so busy days don't crash the preview either.
     await send(update, "👇 <b>Preview (what the group will see):</b>")
-    await send(update, body)
+    for chunk in _split_digest_body(body):
+        await send(update, chunk)
 
     if not config.DAILY_DIGEST_CHAT_ID:
         await send(
@@ -6312,11 +6441,9 @@ async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         chat_id = int(config.DAILY_DIGEST_CHAT_ID)
-        await ctx.bot.send_message(
-            chat_id=chat_id, text=body, parse_mode=ParseMode.HTML,
-        )
-        log.info("cmd_sampleupdate: sent (%d samples) to chat %s",
-                 total, chat_id)
+        await _send_digest_to_chat(ctx, chat_id, body)
+        log.info("cmd_sampleupdate: sent (%d samples, %d chars) to chat %s",
+                 total, len(body), chat_id)
         await send(
             update,
             f"✅ Posted to <code>{h(config.DAILY_DIGEST_CHAT_ID)}</code> "

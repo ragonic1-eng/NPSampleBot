@@ -120,24 +120,60 @@ class MMSProductClient:
 
     # ---------- lookup ----------
     def find_sid(self, code: str) -> str:
-        """doFind → doList, return prod_id (SID) for the given code."""
+        """doFind → doList, return prod_id (SID) for the given code.
+
+        Retries the whole sequence once if the doFind response is missing
+        the "Found <b>N</b>" marker entirely — that signals the server's
+        search state was wiped between requests (typically session
+        expiry mid-flow) which would otherwise make a perfectly-valid
+        code look "not found." The retry forces a clean re-login so
+        doFind and doList run against the same fresh session.
+        """
         payload_base = {"code": code, "codeOptions": ["d-code", "p-code"]}
-        r = self._post(
-            f"{BASE_URL}/master/productSearch.do",
-            data={"command": "doFind", **payload_base},
-        )
-        m = re.search(r"Found\s*<b>(\d+)</b>", r.text)
-        found_n = int(m.group(1)) if m else 0
-        if found_n == 0:
-            raise ProductNotFound(f"No product found for code {code!r}")
-        r = self._post(
-            f"{BASE_URL}/master/productSearch.do",
-            data={"command": "doList", **payload_base},
-        )
-        ids = re.findall(r"sampleRequestCreate\.do\?prod_id=(\d+)", r.text)
-        if not ids:
-            raise ProductNotFound(f"Product list had no prod_id link for {code!r}")
-        return ids[0]
+
+        def _attempt() -> tuple[Optional[str], bool]:
+            """Returns (sid_or_None, search_page_reached)."""
+            r = self._post(
+                f"{BASE_URL}/master/productSearch.do",
+                data={"command": "doFind", **payload_base},
+            )
+            m = re.search(r"Found\s*<b>(\d+)</b>", r.text)
+            search_page_reached = m is not None
+            if not search_page_reached:
+                # doFind didn't land on the search-results page at all —
+                # likely session-state mismatch. Signal the caller to retry.
+                return None, False
+            if int(m.group(1)) == 0:
+                # Real "no such product" — the page rendered cleanly with
+                # a zero count. Don't waste a retry.
+                return None, True
+            r = self._post(
+                f"{BASE_URL}/master/productSearch.do",
+                data={"command": "doList", **payload_base},
+            )
+            ids = re.findall(r"sampleRequestCreate\.do\?prod_id=(\d+)", r.text)
+            if not ids:
+                # doList came back empty even though doFind reported hits.
+                # Strong signal that the server-side search session was
+                # invalidated between the two POSTs. Retry with a fresh
+                # login so both POSTs share a session.
+                return None, False
+            return ids[0], True
+
+        sid, search_page_reached = _attempt()
+        if sid:
+            return sid
+        if not search_page_reached:
+            log.info(
+                "find_sid: search state lost mid-flow for %s — forcing re-login and retrying",
+                code,
+            )
+            with self._lock:
+                self._logged_in = False
+            sid, _ = _attempt()
+            if sid:
+                return sid
+        raise ProductNotFound(f"No product found for code {code!r}")
 
     def fetch_detail(self, sid: str) -> Product:
         """Pull the productDetail page; only extract code, name, priceTotal."""
@@ -206,9 +242,26 @@ class MMSProductClient:
         if self._rates_to_usd is not None:
             return self._rates_to_usd
         r = self._get(f"{BASE_URL}/master/exchangeRates.do")
-        self._rates_to_usd = _parse_rates_to_usd(r.text)
-        log.info("Loaded MMS exchange rates → USD: %s", self._rates_to_usd)
-        return self._rates_to_usd
+        rates = _parse_rates_to_usd(r.text)
+        # If parsing only produced the {"USD": 1.0} fallback, the MMS
+        # exchange-rates page layout has changed and every non-USD R&D
+        # price will silently come back as "n/a" until someone notices.
+        # Log loudly so this shows up in Railway error logs, AND don't
+        # cache the broken result — retry parsing on the next /pp call
+        # so a transient bad response doesn't poison the rest of the
+        # bot's uptime.
+        if len(rates) <= 1:
+            log.error(
+                "MMS exchange-rate page parse FAILED — only %d rate(s) extracted: %s. "
+                "Non-USD R&D prices will show as 'n/a'. Response length: %d chars. "
+                "Check whether the exchangeRates.do page layout has changed.",
+                len(rates), rates, len(r.text),
+            )
+            # Don't cache — next call retries.
+            return rates
+        self._rates_to_usd = rates
+        log.info("Loaded MMS exchange rates → USD: %s", rates)
+        return rates
 
     def _to_usd(self, value: float, currency: str) -> Optional[float]:
         cur = (currency or "").upper()

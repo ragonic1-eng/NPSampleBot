@@ -6088,10 +6088,14 @@ async def _build_daily_digest_body() -> tuple[str, int]:
         for r in rows:
             if r.get("_date") == today:
                 bucket.append(r)
+        # Sort so customer rows cluster together under each salesperson —
+        # this is what lets the "▸ Customer — N samples" collapse work
+        # without us having to re-bucket after the fact.
         bucket.sort(
             key=lambda r: (
                 (r.get("Sales") or "").lower(),
                 (r.get("Customer Name") or "").lower(),
+                (r.get("Product Name") or "").lower(),
             )
         )
         by_region[label] = bucket
@@ -6104,6 +6108,10 @@ async def _build_daily_digest_body() -> tuple[str, int]:
             "🪴 <i>No samples logged today across all 3 factories.</i>"
         )
         return body, 0
+
+    # Footer aggregates — tallied as we walk the regions below.
+    sales_totals: dict[str, int] = {}
+    customer_keys: set[str] = set()
 
     lines = [
         f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>",
@@ -6121,26 +6129,63 @@ async def _build_daily_digest_body() -> tuple[str, int]:
         if not bucket:
             lines.append("<i>No samples today.</i>")
             continue
-        for i, r in enumerate(bucket, 1):
+
+        # Group: salesperson → customer (with country if shown) → samples.
+        # Dict insertion order preserved from the sorted bucket above.
+        by_sales: dict[str, dict[str, list[dict]]] = {}
+        for r in bucket:
             sales = (r.get("Sales") or "—").strip() or "—"
             customer = (r.get("Customer Name") or "—").strip() or "—"
             country = (r.get("Country") or "").strip()
-            name = (r.get("Product Name") or "—").strip() or "—"
-            code = (r.get("Product Code") or "—").strip() or "—"
-            qty_raw = (r.get("Quantity (g)") or "").strip()
-            qty = f"{qty_raw}g" if qty_raw else "—"
-            price = _fmt_digest_price(r.get("R&D Price") or "")
-            cust_line = (
-                f"{h(customer)} ({h(country)})"
+            cust_key = (
+                f"{customer} ({country})"
                 if show_country and country
-                else h(customer)
+                else customer
             )
-            lines.extend([
-                f"{i}. Sales: <b>{h(sales)}</b>",
-                f"   Customer: {cust_line}",
-                f"   Sample: {h(name)} · <code>{h(code)}</code>",
-                f"   {h(qty)} · R&amp;D {h(price)}",
-            ])
+            by_sales.setdefault(sales, {}).setdefault(cust_key, []).append(r)
+
+        # Region-level chip: "👥 Alex (10) · Eric (2) · Jay (1) · Melissa (2)"
+        chips = []
+        for s in sorted(by_sales, key=str.lower):
+            cnt = sum(len(v) for v in by_sales[s].values())
+            chips.append(f"<b>{h(s)}</b> ({cnt})")
+            sales_totals[s] = sales_totals.get(s, 0) + cnt
+        lines.append("👥 " + " · ".join(chips))
+
+        for sales in sorted(by_sales, key=str.lower):
+            customers = by_sales[sales]
+            lines.append("")
+            lines.append(f"👤 <b>{h(sales)}</b>")
+            for cust_label, samples in customers.items():
+                customer_keys.add(f"{label}::{cust_label}")
+                cnt = len(samples)
+                suffix = f" — {cnt} samples" if cnt > 1 else ""
+                lines.append(f"   ▸ {h(cust_label)}{suffix}")
+                for s in samples:
+                    name = (s.get("Product Name") or "—").strip() or "—"
+                    code = (s.get("Product Code") or "—").strip() or "—"
+                    qty_raw = (s.get("Quantity (g)") or "").strip()
+                    qty = f"{qty_raw}g" if qty_raw else "—"
+                    price = _fmt_digest_price(s.get("R&D Price") or "")
+                    lines.append(
+                        f"       • {h(name)} · <code>{h(code)}</code> · "
+                        f"{h(qty)} · R&amp;D {h(price)}"
+                    )
+
+    # Footer summary — at-a-glance "who did the most today."
+    if sales_totals:
+        top_sender = max(
+            sales_totals,
+            key=lambda k: (sales_totals[k], k.lower()),
+        )
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append(
+            f"📊 Top sender: <b>{h(top_sender)}</b> "
+            f"({sales_totals[top_sender]}) · "
+            f"Customers: {len(customer_keys)}"
+        )
+
     return "\n".join(lines), total
 
 

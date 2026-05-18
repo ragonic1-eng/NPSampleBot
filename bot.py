@@ -511,7 +511,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/cancel — discard the current draft",
         "",
         "<b>Product lookup</b>",
-        "/pp <code> — fetch price (Code · Name · R&amp;D Price · Raw Material Cost)",
+        # NB: the placeholder is shown as &lt;code&gt; (HTML entities) NOT a literal
+        # <code> tag, because Telegram's HTML parser would otherwise try to
+        # interpret it as an unclosed <code> monospace span and reject the
+        # whole message (which dropped /help into the generic error fallback).
+        "/pp &lt;code&gt; — fetch price (Code · Name · R&amp;D Price · Raw Material Cost)",
         "/scan — send a photo, I OCR codes and run /pp on each",
         "/lastsample [keyword] — most recent sample <b>you</b> sent (e.g. <code>/lastsample asian thai</code>)",
         "/alllastsample [keyword] — most recent sample <b>any rep</b> sent — shared visibility across the team",

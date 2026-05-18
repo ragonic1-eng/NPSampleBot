@@ -3188,11 +3188,15 @@ async def _show_customer_samples(
     s_letter = "a" if scope == "all" else "s"
     nav_row: list[tuple[str, str]] = []
     if page > 0:
-        # 'First' jumps straight back to page 0 so deep paginators don't
-        # have to tap Prev many times.
-        nav_row.append(("⏮ First", f"lspg:{s_letter}:0:{cust_hash}"))
+        # 'Prev' steps back one page — ALWAYS shown when there's a page
+        # behind us. Earlier versions hid Prev on page 1 (because First
+        # already jumps to 0), but users read the missing ◀ button as
+        # 'the bot died' and didn't realise First was the back nav.
+        # 'First' is the extra skip-to-start shortcut, only useful from
+        # page 2+. Mirrors _show_lastsample_results' nav row.
         if page > 1:
-            nav_row.append(("◀ Prev", f"lspg:{s_letter}:{page - 1}:{cust_hash}"))
+            nav_row.append(("⏮ First", f"lspg:{s_letter}:0:{cust_hash}"))
+        nav_row.append(("◀ Prev", f"lspg:{s_letter}:{page - 1}:{cust_hash}"))
     if end < total:
         next_count = min(_CUST_PAGE_SIZE, total - end)
         nav_row.append(

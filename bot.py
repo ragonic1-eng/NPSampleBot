@@ -3805,6 +3805,27 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await _handle_bulk_text(update, ctx, text):
         return
 
+    # V1.13.14 — fast path for pure code-shape input. If the message is
+    # nothing but product codes (one or many, separated by whitespace /
+    # commas), route straight to /pp regardless of any flag or draft
+    # state. Kills the V1.13.x 'no active draft' dead-end for reps who
+    # just paste a code into the chat without tapping a menu button.
+    #
+    # 'Pure' check: every non-code character must be whitespace or one
+    # of a small set of separators. So 'S-668U1' → /pp. So is
+    # 'S-668U1, J-49JS1-03' and 'S-668U1 B-74CH7-02 J-49JS1-03'.
+    # But 'find spicy chicken S-668U1' keeps falling through to the
+    # existing search / draft handlers — there are meaningful words
+    # around the code, so user intent isn't purely a price lookup.
+    code_hits_fast = _PP_CODE_RE.findall(text)
+    if code_hits_fast:
+        remainder = _PP_CODE_RE.sub(" ", text)
+        remainder_clean = re.sub(r"[\s,;./\\|\-]+", "", remainder)
+        if not remainder_clean:
+            unique_fast = _dedupe_codes(code_hits_fast, cap=5)
+            await _run_pp_for_codes(update, unique_fast)
+            return
+
     # /lastsample reply flow: same per-process flag + reply-detection pattern
     # as the manual code entry below. Whichever signal fires first wins, and
     # we read+clear the cached MMS name so a stale flag from a prior session

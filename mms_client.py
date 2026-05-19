@@ -475,11 +475,48 @@ def monthly_chunks(
 def fetch_all_samples(
     session: requests.Session, date_from: dt.date, date_to: dt.date
 ) -> list[SampleRow]:
-    """Chunked fetch to stay under the 1000-row MMS cap."""
+    """Chunked fetch to stay under the 1000-row MMS cap.
+
+    Audit fix #9 — chunk failures are now per-chunk fatal-soft: a single
+    bad chunk (502, timeout, malformed reply) is logged but does NOT
+    poison the whole run. Earlier behaviour propagated the exception
+    out of search_samples and threw away every row from prior chunks
+    that had already succeeded. With a per-chunk try/except, we
+    preserve good chunks and report the failure count so the caller
+    can decide whether to retry (most callers run again the next day
+    anyway, and the dedupe step covers the chunk that gets re-fetched).
+
+    A chunk is retried ONCE before giving up — handles the case where
+    the MMS session expired mid-loop. We re-acquire any state by
+    re-issuing the search (search_samples is stateless from the
+    caller's perspective).
+    """
     out: list[SampleRow] = []
     seen: set[tuple[str, str]] = set()  # (sample_request_code, product_code)
+    failed_chunks: list[tuple[dt.date, dt.date, str]] = []
     for a, b in monthly_chunks(date_from, date_to, months_per_chunk=3):
-        chunk = search_samples(session, a, b)
+        chunk: list[SampleRow] | None = None
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                chunk = search_samples(session, a, b)
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt == 0:
+                    log.warning(
+                        "Chunk %s..%s attempt 1 failed: %s — retrying once",
+                        _fmt_date(a), _fmt_date(b), e,
+                    )
+                    continue
+        if chunk is None:
+            log.error(
+                "Chunk %s..%s permanently failed after retry: %s — "
+                "preserving %d rows from earlier chunks and continuing",
+                _fmt_date(a), _fmt_date(b), last_err, len(out),
+            )
+            failed_chunks.append((a, b, str(last_err)))
+            continue
         if len(chunk) >= 995:
             log.warning(
                 "Chunk %s..%s returned %d rows (near 1000 cap) — consider "
@@ -492,4 +529,13 @@ def fetch_all_samples(
                 continue
             seen.add(key)
             out.append(r)
+    if failed_chunks:
+        log.warning(
+            "fetch_all_samples: %d/%d chunks failed — recovered %d rows "
+            "from surviving chunks. Failed windows: %s",
+            len(failed_chunks),
+            sum(1 for _ in monthly_chunks(date_from, date_to, months_per_chunk=3)),
+            len(out),
+            [(f"{_fmt_date(a)}..{_fmt_date(b)}", err[:80]) for a, b, err in failed_chunks],
+        )
     return out

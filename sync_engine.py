@@ -335,25 +335,53 @@ def run_mms_to_fsl_sync(
             "elapsed_secs": 0.0,
         }
 
-    # 24h cooldown (Singapore's clock).
+    # 24h cooldown — checked per-region rather than only on Singapore.
+    # Audit fix #7: previously this read only sheets.FSL_TAB's
+    # timestamp, which meant a region-only call (e.g. regions=("J",))
+    # could be blocked by a stale SG cooldown it never updated, and a
+    # successful Jakarta-only run wouldn't bump the SG timestamp the
+    # next gate reads. Now we proceed if ANY requested region is past
+    # cooldown — the single fetch+dedupe pass below catches them all
+    # up regardless of which one tripped the gate.
     if not force:
-        last = sheets.get_last_sample_sync(tab=sheets.FSL_TAB)
-        if last is not None:
+        region_ages: list[tuple[str, dt.timedelta | None]] = []
+        for region in regions:
+            spec = _REGIONS.get(region)
+            if not spec:
+                continue
+            tab = spec[0]
+            last = sheets.get_last_sample_sync(tab=tab)
+            if last is None:
+                region_ages.append((region, None))
+                continue
             if last.tzinfo is None:
                 last = last.replace(tzinfo=dt.timezone.utc)
-            age = t0 - last
-            if age < dt.timedelta(hours=SAMPLE_SYNC_COOLDOWN_HOURS):
-                log.info(
-                    "sync_engine: skipped (cooldown). Last sync %s, age %s",
-                    last.isoformat(timespec="seconds"), age,
-                )
-                return {
-                    "status": "cooldown",
-                    "mms_pulled": 0,
-                    "rows_added": 0,
-                    "elapsed_secs": 0.0,
-                    "last_sync": last.isoformat(timespec="seconds"),
-                }
+            region_ages.append((region, t0 - last))
+        cooldown_td = dt.timedelta(hours=SAMPLE_SYNC_COOLDOWN_HOURS)
+        stale_regions = [
+            r for r, age in region_ages
+            if age is None or age >= cooldown_td
+        ]
+        if region_ages and not stale_regions:
+            ages_str = ", ".join(
+                f"{r}={age}" for r, age in region_ages
+            )
+            log.info(
+                "sync_engine: skipped (cooldown). All requested regions fresh: %s",
+                ages_str,
+            )
+            return {
+                "status": "cooldown",
+                "mms_pulled": 0,
+                "rows_added": 0,
+                "elapsed_secs": 0.0,
+                "region_ages": {r: (str(a) if a else None) for r, a in region_ages},
+            }
+        if stale_regions:
+            log.info(
+                "sync_engine: cooldown allows run — stale regions: %s",
+                stale_regions,
+            )
 
     # Date window.
     if start_override is not None:

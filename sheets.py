@@ -23,8 +23,16 @@ from typing import Any
 # positives in legitimate text like "Yu1234" type strings; once the
 # run is matched, we don't need to re-check the lookbehind for inner
 # escapes.
+#
+# Audit fix #12 — require AT LEAST TWO consecutive escapes ({2,}).
+# Previously {1,} matched single tokens like "u2024" inside legitimate
+# product/customer names (e.g. a description that happens to mention
+# year "u2024" or a unit code "u3000") and silently mojibake'd them
+# into bizarre Unicode characters. All real MMS mojibake we've seen
+# is multi-char Chinese (鲜香海苔味 etc.), so requiring ≥2 escapes
+# kills the false-positive surface without losing any known case.
 _MANGLED_UNICODE_RUN_RE = re.compile(
-    r"(?<![A-Za-z0-9])((?:u[0-9A-Fa-f]{4})+)"
+    r"(?<![A-Za-z0-9])((?:u[0-9A-Fa-f]{4}){2,})"
 )
 
 

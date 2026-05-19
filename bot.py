@@ -1181,7 +1181,13 @@ async def cmd_pp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     cap = _pp_cap_for(update.effective_user)
     unique = _dedupe_codes(codes, cap=cap)
-    if len(codes) > cap:
+    # Audit fix #11 — only flash the "max N codes" warning when the cap
+    # actually trimmed the run. Before: typing /pp S-1 S-1 S-1 S-1 S-1 S-1
+    # (six duplicates of the same code) triggered the warning even though
+    # _dedupe_codes already collapsed it to 1 unique code, producing the
+    # misleading "running first 5: S-1". Now we compare the deduped count
+    # to the cap, not the raw token count.
+    if len(unique) >= cap and len(codes) > cap:
         await send(
             update,
             f"🙏 Max {cap} codes per /pp — running first {cap}: "

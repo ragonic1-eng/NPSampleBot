@@ -454,11 +454,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     #   • added "🔎 Search seasonings" — region-aware browse-only search
     #     that lets reps explore the SG / ID / TH sample history without
     #     raising a sample request
+    # V1.13.15 — simplified menu. 'Raise a sample request' hidden (still
+    # accessible via /new for power users) and Scan + Enter-a-code merged
+    # into one 'Look up product code' button that accepts either typed
+    # codes or a product photo. Reps overwhelmingly use this bot to look
+    # things up, so the menu now leads with that.
     menu = [
-        [("🌶 Raise a sample request", "menu:new")],
         [("🔎 Search seasonings", "menu:search")],
-        [("📷 Scan a product photo", "menu:scan")],
-        [("✏️ Enter a code (price lookup)", "menu:code")],
+        [("💲 Look up product code", "menu:lookup")],
         [("👤 My samples (me only)", "menu:lastsample")],
         [("🌐 All reps' samples", "menu:alllastsample")],
     ]
@@ -466,7 +469,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # JobQueue (see main()). No manual Telegram trigger.
     await send(
         update,
-        "👋 <b>Hi! I help you raise sample requests and look up seasonings.</b>\n\n"
+        "👋 <b>Hi! I help you look up product prices and search seasonings.</b>\n\n"
         "<i>Tap a button below — or type /help anytime to see what each command does.</i>",
         kb(menu),
     )
@@ -4882,6 +4885,26 @@ async def _handle_menu_callback(update, ctx, action: str):
             "and I'll pull the price for each. You can paste a base code "
             "like <code>S-668U1</code> and I'll list all its variants — or "
             "paste up to 5 full codes separated by spaces.",
+        )
+        return
+    if action == "lookup":
+        # V1.13.15 — combined code-entry + photo-scan. Arm BOTH flags so
+        # the rep can send either a typed code, a photo of a label, or
+        # a voice message (voice always works). The existing handlers
+        # for text / photo / voice each pick up the right flag.
+        ctx.user_data["awaiting_code_text"] = True
+        ctx.user_data["awaiting_scan_photo"] = True
+        await send(
+            update,
+            "💲 <b>Look up product code</b>\n\n"
+            "<b>📎 Reply to this message</b> with any of:\n"
+            "  • <b>Typed code(s)</b> — e.g. <code>S-668U1</code>, or up "
+            "to 5 codes separated by spaces\n"
+            "  • <b>Photo</b> of a product label (I'll OCR the codes)\n"
+            "  • <b>Voice message</b> saying the code (e.g. "
+            "<i>'S dash 668 U 1'</i>)\n\n"
+            "<i>Codes are auto-routed by prefix — S- for Singapore, "
+            "B- for Thailand, J- for Indonesia.</i>",
         )
         return
     if action == "lastsample":

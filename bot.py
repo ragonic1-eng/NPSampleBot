@@ -525,13 +525,19 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/help — this message",
     ]
     if is_admin:
+        # These commands stay registered as handlers but are hidden from
+        # the / autocomplete menu (housekeeping audit) so regular reps
+        # don't see admin tools cluttering their picker. /help is the
+        # single place admins can rediscover them.
         lines += [
             "",
-            "<b>🔧 Admin</b>",
+            "<b>🔧 Admin (hidden from / autocomplete; still work if typed)</b>",
             "/reload — refresh seasoning &amp; customer lists from Sheets",
             "/diag — diagnostics (auth / sheet visibility)",
-            "<i>(MMS → Full Sample Listing sync runs automatically weekly — "
-            "see Railway logs for run history.)</i>",
+            "/whichchat — show this chat's ID (for DAILY_DIGEST_CHAT_ID setup)",
+            "/sampleupdate — preview &amp; post today's 6pm digest now",
+            "<i>(MMS → Full Sample Listing sync runs automatically weekday "
+            "evenings — see Railway logs for run history.)</i>",
         ]
     await send(update, "\n".join(lines))
 
@@ -6684,27 +6690,23 @@ def main():
     # the default list (it's restricted), but we'll add it for @ragonic below
     # via post_init once the bot is running.
     async def _install_commands(application: Application) -> None:
-        # Audit V1.13.14 (UX F) — /whichchat and /sampleupdate were
-        # registered as handlers but missing from the Telegram command
-        # menu, so admins discovering them via "/" autocomplete had no
-        # way to know they existed. Added to the default menu; the
-        # execution-time admin gate in cmd_sampleupdate still rejects
-        # non-admins with a "Admin-only command" reply.
+        # Housekeeping audit — the / autocomplete menu now lists only the
+        # commands a regular sales rep actually uses day-to-day.
+        # /whoami, /whichchat, /reload, /diag, /sampleupdate are still
+        # registered as CommandHandlers (above) and respond when typed,
+        # but no longer clutter the autocomplete list for new hires who
+        # would never need them. Admins type them from memory or look
+        # them up in /help, which keeps the full inventory.
         default_cmds = [
             BotCommand("start", "Main menu — new request / bulk / samples"),
             BotCommand("bulk", "Paste a multi-seasoning email, I split it"),
             BotCommand("samples", "List samples you've raised"),
             BotCommand("edit", "Jump to the draft review to change a field"),
             BotCommand("cancel", "Discard the current draft"),
-            BotCommand("reload", "Refresh seasoning / customer lists"),
-            BotCommand("whoami", "Show your Telegram ID & username"),
-            BotCommand("whichchat", "Show this chat's ID (for setup)"),
             BotCommand("pp", "💲 Product price — e.g. /pp S-62RG3-19"),
             BotCommand("scan", "📷 Scan a photo for product code(s)"),
             BotCommand("lastsample", "🔎 Find your last sample — /lastsample <keyword>"),
             BotCommand("alllastsample", "🌐 Search any rep's samples — /alllastsample <keyword>"),
-            BotCommand("sampleupdate", "🧪 Admin: preview today's 6pm digest now"),
-            BotCommand("diag", "Diagnostics"),
             BotCommand("help", "Show all commands"),
         ]
         try:

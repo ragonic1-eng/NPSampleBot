@@ -65,6 +65,10 @@ _TODAY_FALLBACK_WARN = "DHL shipment date unparseable, falling back to today"
 
 _TEST_MODE = os.getenv("AWB_TEST_MODE", "0").strip() == "1"
 _DEBUG = os.getenv("DHL_DEBUG", "0").strip() == "1"
+# DHL_HEADED=1 → launch chromium with a visible window so you can watch
+# the automation drive the page. Useful for diagnosing 'why didn't it
+# redirect?' issues. Default is headless (Railway can't show a UI).
+_HEADED = os.getenv("DHL_HEADED", "0").strip() == "1"
 
 
 # --------------------------- public entrypoint ---------------------------
@@ -107,7 +111,8 @@ async def fetch_recent_shipments(*, days_back: int = 14) -> list[Shipment]:
     log.info("DHL scrape starting · cutoff=%s · debug=%s", cutoff, _DEBUG)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        log.info("DHL: launching chromium (headless=%s)", not _HEADED)
+        browser = await p.chromium.launch(headless=not _HEADED)
         ctx = await browser.new_context(
             user_agent=(
                 # Match a real desktop Chrome so DHL doesn't show a
@@ -170,13 +175,32 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     login_btn = page.get_by_role("button", name=re.compile(r"^\s*login\s*$", re.I)).first
     await login_btn.click(timeout=8_000)
 
+    # Snapshot what's on screen the moment after the click — invaluable
+    # if step 5 then times out, because we can SEE whether DHL bounced
+    # us to an error page, a captcha, an MFA prompt, or the redirect
+    # silently ate the click.
+    await asyncio.sleep(1.5)  # let DHL's JS show whatever happens next
+    log.info("DHL: post-click URL = %s", page.url)
+    await _dump(page, "02_just_after_login_click")
+
     # Wait for the OIDC redirect chain to land on the MyDHL+ home page.
     log.info("DHL step 5/6: waiting for post-login redirect…")
-    await page.wait_for_url(
-        re.compile(r"mydhl\.express\.dhl/.*login=successful", re.I),
-        timeout=45_000,
-    )
-    await _dump(page, "02_post_login_home")
+    try:
+        await page.wait_for_url(
+            re.compile(r"mydhl\.express\.dhl/.*login=successful", re.I),
+            timeout=45_000,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("DHL: redirect timed out. Current URL: %s", page.url)
+        # Read any visible error/banner text so the user sees it in the log.
+        try:
+            visible_text = await page.evaluate("() => document.body.innerText.slice(0, 600)")
+            log.error("DHL: visible page text snippet:\n%s", visible_text)
+        except Exception:  # noqa: BLE001
+            pass
+        await _dump(page, "02b_redirect_timeout")
+        raise
+    await _dump(page, "02c_post_login_home")
 
     # Cookie consent banner sometimes appears AFTER login too.
     await _maybe_accept_cookies(page)

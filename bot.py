@@ -6781,16 +6781,20 @@ async def _awb_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _schedule_awb_sync(application: Application) -> None:
     """Set up the twice-daily AWB sync.
 
-    Schedule:
-      • 07:00 SGT daily — catches anything shipped overnight so reps see
-        AWBs first thing in the morning.
-      • 17:50 SGT Mon-Fri — runs 10 min after the MMS → FSL sync (which
-        fires at 17:40) and 10 min before the daily digest (18:00),
-        guaranteeing the FSL has fresh sample rows AND fresh AWBs by
-        the time the digest reads them.
+    Schedule (user-specified):
+      • 17:30 SGT daily — first pass, aligned with the 5:30 PM FSL
+        update window. Catches AWBs that became available during the
+        day for FSL rows already on the sheet.
+      • 00:00 SGT daily — overnight catch-up. Picks up AWBs for FSL
+        rows that arrived after the 17:30 pass (e.g. samples added to
+        MMS in the late afternoon, then MMS-synced into the FSL at
+        17:40 — after our 17:30 AWB pass missed them).
 
+    The matcher's skip-if-non-empty rule means re-runs only fill empty
+    AWB cells, so neither time can clobber a previously-written value
+    (real AWB, HAND CARRY marker, anything else manually entered).
     The 14-day overlap window in the fetchers means a missed run isn't
-    fatal — the next one re-checks the same period and fills any gaps.
+    fatal either — the next pass re-checks the same period.
     """
     from datetime import time as _time
     job_queue = application.job_queue
@@ -6798,23 +6802,22 @@ async def _schedule_awb_sync(application: Application) -> None:
         log.warning("JobQueue not available — AWB sync NOT scheduled.")
         return
     sgt = ZoneInfo("Asia/Singapore")
-    # PTB day numbering: 0=Mon … 6=Sun.
+    # Both runs fire every day (0=Mon … 6=Sun) — DHL/FedEx still
+    # record AWBs on weekends if a rep ships then, and we want the
+    # FSL to be current even when the Mon-Fri digest is off.
     job_queue.run_daily(
         _awb_sync_job,
-        time=_time(hour=7, minute=0, tzinfo=sgt),
+        time=_time(hour=17, minute=30, tzinfo=sgt),
         days=(0, 1, 2, 3, 4, 5, 6),
-        name="awb_sync_morning",
+        name="awb_sync_evening",
     )
     job_queue.run_daily(
         _awb_sync_job,
-        time=_time(hour=17, minute=50, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4),
-        name="awb_sync_pre_digest",
+        time=_time(hour=0, minute=0, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="awb_sync_overnight",
     )
-    log.info(
-        "awb_sync scheduled: 07:00 SGT daily + 17:50 SGT Mon-Fri "
-        "(10 min before digest)"
-    )
+    log.info("awb_sync scheduled: 17:30 + 00:00 SGT, daily")
 
 
 async def _schedule_weekly_mms_sync(application: Application) -> None:

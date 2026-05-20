@@ -98,7 +98,17 @@ async def fetch_recent_shipments(*, days_back: int = 14) -> list[Shipment]:
 
     async with async_playwright() as p:
         log.info("FedEx: launching chromium (headless=%s)", not _HEADED)
-        browser = await p.chromium.launch(headless=not _HEADED)
+        # Stealth flags. FedEx's WAF / Akamai bot-defense fingerprints
+        # headless Chromium aggressively — without these, the login
+        # page either never renders the form or serves a captcha.
+        browser = await p.chromium.launch(
+            headless=not _HEADED,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+            ],
+        )
         ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -110,6 +120,29 @@ async def fetch_recent_shipments(*, days_back: int = 14) -> list[Shipment]:
             timezone_id="Asia/Singapore",
             permissions=[],
             geolocation=None,
+        )
+        # Patch the navigator properties the bot-detector reads. Has
+        # to fire BEFORE any page script runs, so we register it as
+        # an init script on the context (applies to every new page).
+        await ctx.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [
+                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                { name: 'Native Client', filename: 'internal-nacl-plugin' },
+            ] });
+            // Chrome runtime object the detector checks for
+            window.chrome = window.chrome || { runtime: {} };
+            // permissions API consistency check
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters)
+            );
+            """
         )
         page = await ctx.new_page()
         try:

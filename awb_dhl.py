@@ -112,12 +112,16 @@ async def fetch_recent_shipments(*, days_back: int = 14) -> list[Shipment]:
 
     async with async_playwright() as p:
         log.info("DHL: launching chromium (headless=%s)", not _HEADED)
-        browser = await p.chromium.launch(headless=not _HEADED)
+        browser = await p.chromium.launch(
+            headless=not _HEADED,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+            ],
+        )
         ctx = await browser.new_context(
             user_agent=(
-                # Match a real desktop Chrome so DHL doesn't show a
-                # "your browser is too old" warning and the responsive
-                # layout matches what the user sees in the screenshots.
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/127.0.0.0 Safari/537.36"
@@ -125,11 +129,25 @@ async def fetch_recent_shipments(*, days_back: int = 14) -> list[Shipment]:
             viewport={"width": 1440, "height": 900},
             locale="en-SG",
             timezone_id="Asia/Singapore",
-            # Suppress the "wants to know your location" Chrome prompt
-            # that pops in the headed window — DHL asks for geo on the
-            # login page but it's not required to log in.
             permissions=[],
             geolocation=None,
+        )
+        # Patch automation-detection signals (navigator.webdriver,
+        # plugins list, window.chrome, languages). Matches awb_fedex.py
+        # — DHL doesn't currently demand this, but adding it now keeps
+        # the two scrapers consistent and pre-empts the next time a
+        # carrier turns up the bot-detection dial.
+        await ctx.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [
+                { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                { name: 'Native Client', filename: 'internal-nacl-plugin' },
+            ] });
+            window.chrome = window.chrome || { runtime: {} };
+            """
         )
         page = await ctx.new_page()
         try:

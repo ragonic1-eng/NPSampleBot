@@ -1,7 +1,6 @@
 "use client";
 
 import { Suspense, useEffect, useMemo, useState } from "react";
-import dynamic from "next/dynamic";
 import { useSearchParams } from "next/navigation";
 
 import {
@@ -18,18 +17,16 @@ import {
   suggestedFilename,
 } from "@/lib/constants";
 
-// @react-pdf/renderer touches the DOM at import time. Keep it off the
-// server bundle to avoid SSR errors during Vercel build.
-const PDFDownloadLink = dynamic(
-  () => import("@react-pdf/renderer").then((m) => m.PDFDownloadLink),
-  { ssr: false, loading: () => <ButtonShell>Loading PDF…</ButtonShell> },
-);
-
-// Lazy-loaded too — keeps the heavy PDF renderer out of the first paint.
-const QuotePDFLazy = dynamic(
-  () => import("@/lib/pdf").then((m) => ({ default: m.QuotePDF })),
-  { ssr: false },
-);
+// IMPORTANT: do NOT use PDFDownloadLink here. It re-renders the entire
+// PDF document on every prop change — typing one letter in a field
+// would trigger a full @react-pdf/renderer pass, and any transient bad
+// input state (mid-edit empty price, half-typed code, etc.) could
+// throw and blank the page with no error boundary to catch it.
+//
+// Instead we keep all PDF work inside an on-click handler:
+//   - imports @react-pdf/renderer ONLY when the user clicks Generate
+//   - renders the document to a Blob, triggers a download anchor click
+//   - any error surfaces in setError() state instead of crashing render
 
 
 /** Wrapper so a non-button placeholder shares the action-button styles. */
@@ -145,8 +142,47 @@ function QuoteBuilder() {
   }
 
   const filename = suggestedFilename(data);
-
   const canGenerate = data.products.some((p) => p.name && p.price);
+
+  // On-click PDF generation. Imports the heavy modules lazily so the
+  // initial page load stays small. Any failure (broken input, OOM,
+  // network issue fetching logos) lands in `error` state and shows
+  // an inline message — the page itself can't crash from this path.
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleGenerate() {
+    if (!canGenerate || busy) return;
+    setError(null);
+    setBusy(true);
+    try {
+      const [{ pdf }, { QuotePDF }] = await Promise.all([
+        import("@react-pdf/renderer"),
+        import("@/lib/pdf"),
+      ]);
+      const origin =
+        typeof window !== "undefined" ? window.location.origin : "";
+      const blob = await pdf(
+        <QuotePDF data={data} origin={origin} />
+      ).toBlob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Revoke a tick later so Safari has time to actually trigger
+      // the download before the URL goes invalid.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to generate PDF"
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <main className="max-w-3xl mx-auto p-4 sm:p-8">
@@ -406,26 +442,28 @@ function QuoteBuilder() {
       </section>
 
       {/* ---- Action buttons ---- */}
-      <div className="flex flex-wrap items-center gap-3 mb-10">
-        {canGenerate ? (
-          <PDFDownloadLink
-            document={
-              <QuotePDFLazy
-                data={data}
-                origin={typeof window !== "undefined" ? window.location.origin : ""}
-              />
-            }
-            fileName={filename}
-            className="inline-block px-5 py-2.5 rounded-md bg-npOrange text-white text-sm font-semibold hover:opacity-90"
-          >
-            {({ loading }) => (loading ? "Building PDF…" : "⬇ Generate & download PDF")}
-          </PDFDownloadLink>
-        ) : (
-          <ButtonShell>Add a product with a name and price to enable</ButtonShell>
-        )}
-
+      <div className="flex flex-wrap items-center gap-3 mb-3">
+        <button
+          type="button"
+          onClick={handleGenerate}
+          disabled={!canGenerate || busy}
+          className="inline-block px-5 py-2.5 rounded-md bg-npOrange text-white text-sm font-semibold hover:opacity-90 disabled:bg-gray-300 disabled:cursor-not-allowed"
+        >
+          {busy
+            ? "Building PDF…"
+            : canGenerate
+              ? "⬇ Generate & download PDF"
+              : "Add a product with a name and price to enable"}
+        </button>
         <span className="text-xs text-gray-500">{filename}</span>
       </div>
+      {error ? (
+        <div className="mb-10 p-3 rounded-md bg-red-50 border border-red-200 text-sm text-red-800">
+          <b>Couldn&apos;t generate PDF:</b> {error}
+        </div>
+      ) : (
+        <div className="mb-10" />
+      )}
     </main>
   );
 }

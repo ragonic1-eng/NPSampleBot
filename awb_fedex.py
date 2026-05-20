@@ -281,8 +281,9 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     await _wait_for_shipments_table(page)
     await _dump(page, "05_shipments_table")
 
-    # ---- 6. Extract rows ----
-    log.info("FedEx step 7/7: extracting rows…")
+    # ---- 6. Trigger lazy-load + extract rows ----
+    log.info("FedEx step 7/7: extracting rows (lazy-loading older shipments)…")
+    await _scroll_load_all_rows(page)
     rows = await page.evaluate(_EXTRACT_JS)
     log.info("FedEx: extracted %d raw row(s)", len(rows))
 
@@ -443,6 +444,62 @@ async def _dismiss_usercentrics(page) -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+async def _scroll_load_all_rows(page, max_scrolls: int = 40) -> None:
+    """Scroll the shipments grid to trigger FedEx's lazy-load.
+
+    The all-shipments view shows 100/N at first; older rows arrive via
+    XHR as the user scrolls. We repeatedly scroll to the bottom and
+    measure the row count. When it stops growing across 3 consecutive
+    scrolls (data is exhausted or paginated out), we stop. Capped at
+    max_scrolls so a runaway list (or a missing 'no more rows' signal)
+    can't loop forever.
+    """
+    last_count = -1
+    stable_streak = 0
+    for i in range(max_scrolls):
+        # Scroll BOTH the window AND the inner grid container — FedEx
+        # nests the rows inside a scrollable div, so window.scrollTo
+        # alone may not trigger the lazy fetch.
+        await page.evaluate(
+            """
+            () => {
+                window.scrollTo(0, document.body.scrollHeight);
+                document.querySelectorAll(
+                    'table, [role="grid"], [class*="scroll"], [class*="grid"]'
+                ).forEach(el => {
+                    if (el.scrollHeight > el.clientHeight) {
+                        el.scrollTop = el.scrollHeight;
+                    }
+                });
+            }
+            """
+        )
+        await asyncio.sleep(1.5)
+        # Count rows that look like shipments (contain a 10-14 digit
+        # tracking number text node).
+        cnt = await page.evaluate(
+            r"""
+            () => {
+                let n = 0;
+                document.querySelectorAll("*").forEach(el => {
+                    if (el.children.length) return;
+                    if (/^\s*\d{10,14}\s*$/.test(el.textContent || "")) n++;
+                });
+                return n;
+            }
+            """
+        )
+        log.info("FedEx: scroll %d → %d tracking-id node(s) seen", i + 1, cnt)
+        if cnt == last_count:
+            stable_streak += 1
+            if stable_streak >= 3:
+                log.info("FedEx: row count stable, lazy-load done")
+                return
+        else:
+            stable_streak = 0
+            last_count = cnt
 
 
 async def _wait_for_shipments_table(page) -> None:

@@ -231,12 +231,9 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     await _wait_for_shipments_loaded(page)
     await _dump(page, "03_manage_shipments")
 
-    # ---- 3. Extract structured shipment data via JS evaluation ----
-    # We do the DOM walk inside the browser (one round trip) because
-    # the page is a heavy SPA with nested wrappers — pulling each
-    # field via separate locator calls would be 100x slower.
-    rows = await page.evaluate(_EXTRACT_JS)
-    log.info("DHL: extracted %d raw row(s) from the page", len(rows))
+    # ---- 3. Extract structured shipment data, walking pagination ----
+    rows = await _extract_all_pages(page)
+    log.info("DHL: extracted %d raw row(s) across all pages", len(rows))
 
     shipments: list[Shipment] = []
     for r in rows:
@@ -322,6 +319,69 @@ def _build_locator(page, kind: str, target):
     if kind == "css":
         return page.locator(target).first
     raise ValueError(f"unknown locator kind: {kind}")
+
+
+async def _extract_all_pages(page, max_pages: int = 20) -> list[dict]:
+    """Extract shipments from every page of the Manage Shipments list.
+
+    DHL paginates the list (typically 100 rows per page). We extract
+    page 1, then look for the next-page control — either a numbered
+    button ("2", "3", …) or an arrow (">"). Click it, wait for the
+    table to re-render, extract again, repeat until exhausted or we
+    hit max_pages (defensive cap so a misbehaving DOM doesn't loop
+    forever). All rows from all pages get accumulated into one list.
+    """
+    all_rows: list[dict] = []
+    page_num = 1
+    while page_num <= max_pages:
+        rows = await page.evaluate(_EXTRACT_JS)
+        log.info("DHL: page %d → %d row(s) (running total: %d)",
+                 page_num, len(rows), len(all_rows) + len(rows))
+        all_rows.extend(rows)
+        # Look for the link/button that goes to the NEXT page.
+        # Try numbered first ("2", "3" …), then a generic arrow.
+        next_num = page_num + 1
+        candidates = [
+            f'button[aria-label="Page {next_num}"]',
+            f'a[aria-label="Page {next_num}"]',
+            f'button:has-text("{next_num}")',
+            f'a:has-text("{next_num}")',
+            'button[aria-label="Next"]',
+            'a[aria-label="Next"]',
+            'button:has-text("›")',
+            'button:has-text(">")',
+        ]
+        clicked = False
+        for css in candidates:
+            try:
+                btn = page.locator(css).first
+                # Visible-and-enabled check via a brief wait — the
+                # disabled-state on the "Next" arrow at the last page
+                # will fail this and we'll break out cleanly.
+                await btn.wait_for(state="visible", timeout=1_500)
+                is_enabled = await btn.is_enabled()
+                if not is_enabled:
+                    continue
+                await btn.click(timeout=3_000)
+                clicked = True
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if not clicked:
+            log.info("DHL: no more pages after %d (no next button visible)",
+                     page_num)
+            break
+        # Wait for the table to refresh. DHL's pagination is an XHR;
+        # the existing row nodes get reused so we can't simply wait
+        # for a 'detached' state. Sleep + re-wait for shipments-loaded
+        # is the most reliable path.
+        await asyncio.sleep(2.5)
+        try:
+            await _wait_for_shipments_loaded(page)
+        except Exception:  # noqa: BLE001
+            pass
+        page_num += 1
+    return all_rows
 
 
 async def _wait_for_shipments_loaded(page) -> None:

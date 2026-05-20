@@ -87,6 +87,12 @@ class SyncResult:
     # separately so the chat message isn't drowned in default writes —
     # they're useful as a tally line, not as individual blocks.
     hand_carry_defaults: int = 0
+    # Carrier shipments that didn't semantically match ANY FSL row on
+    # ANY tab (customer + date). These are the AWBs that need human
+    # attention — either the sample was never logged in MMS/FSL or
+    # the customer name needs an alias. The 18:00 digest reads this
+    # and lists them in an 'AWBs not in FSL' footer section.
+    unmatched_shipments: list[Shipment] = field(default_factory=list)
 
     @property
     def total_matched(self) -> int:
@@ -207,30 +213,41 @@ def build_updates_for_tab(
     tab: str,
     fsl_rows: list[dict],
     shipments: Iterable[Shipment],
+    semantic_match_awbs: set | None = None,
 ) -> list[MatchUpdate]:
     """Match each shipment against every FSL row on `tab`.
 
     Returns one MatchUpdate per FSL row that should receive an AWB.
-    Rows whose AWB cell is already filled are SKIPPED (so a re-run
-    doesn't overwrite the existing value). When multiple FSL rows match
-    one shipment, each row gets the same AWB — matches how a single DHL
-    box contains multiple sample bags in practice.
+    Rows whose AWB cell is already filled are SKIPPED for the WRITE
+    (so a re-run doesn't overwrite manually-typed values). When
+    multiple FSL rows match one shipment, each row gets the same AWB.
+
+    If `semantic_match_awbs` is provided, it's populated with the AWBs
+    of shipments that had ≥1 semantic (date+customer) match on this
+    tab, REGARDLESS of whether the matching row's AWB cell was already
+    filled. The caller uses this to identify 'truly unmatched'
+    shipments — AWBs we have but couldn't link anywhere — for the
+    digest's 'AWBs not in FSL' section.
     """
     out: list[MatchUpdate] = []
     seen_rows: set[int] = set()  # avoid double-updating the same FSL row
 
-    # Iterate shipments first → for each, find all matching FSL rows.
     for s in shipments:
         for fsl in fsl_rows:
             row_num = fsl.get("_row")
             if not row_num or row_num in seen_rows:
                 continue
-            # Re-runs shouldn't trample manually-filled AWBs.
-            if (fsl.get("AWB") or "").strip():
-                continue
+            # Semantic check BEFORE the skip-if-non-empty filter so we
+            # can track 'this shipment matched somewhere' independently
+            # of whether the cell write was blocked.
             if not _date_matches(s.ship_date, fsl.get("_date")):
                 continue
             if not _customer_matches(s.recipient_name, fsl.get("Customer Name", "")):
+                continue
+            if semantic_match_awbs is not None:
+                semantic_match_awbs.add(s.awb)
+            # Re-runs shouldn't trample manually-filled AWBs.
+            if (fsl.get("AWB") or "").strip():
                 continue
             out.append(MatchUpdate(
                 tab=tab,
@@ -364,10 +381,11 @@ async def run_awb_sync(
         log.info("AWB sync: applying %d customer alias(es)", len(aliases_normalized))
     shipments = [_apply_alias(s, aliases_normalized) for s in shipments]
 
-    # Track which carrier shipments matched against ANY tab so we can
-    # log the un-matched ones at the end. Useful for spotting customer-
-    # name variations that need a new alias row in the OPS sheet.
-    matched_shipment_awbs: set[str] = set()
+    # Track shipments that had a semantic (customer+date) match on
+    # ANY tab, even if the write was blocked by an existing AWB cell.
+    # Used to compute result.unmatched_shipments at the end — the list
+    # the 18:00 digest surfaces so no AWB stays silently orphaned.
+    semantic_matched_awbs: set[str] = set()
 
     # For each region tab, load → match → write.
     tabs = [sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB]
@@ -383,9 +401,10 @@ async def run_awb_sync(
             result.by_tab[tab] = {"matched": 0, "written": 0}
             continue
 
-        carrier_updates = build_updates_for_tab(tab, fsl_rows, shipments)
-        for u in carrier_updates:
-            matched_shipment_awbs.add(u.awb)
+        carrier_updates = build_updates_for_tab(
+            tab, fsl_rows, shipments,
+            semantic_match_awbs=semantic_matched_awbs,
+        )
         hc_updates = build_hand_carry_sg_updates(tab, fsl_rows)
         # De-dupe: carrier match wins if a row is queued by both paths
         # (this shouldn't happen — SG rows almost never appear on
@@ -422,25 +441,44 @@ async def run_awb_sync(
             "written": written,
         }
 
-    # Diagnostic: log shipments that didn't land on any FSL tab. These
-    # are usually candidates for a new alias row in 'AWB Customer
-    # Aliases' (carrier label name doesn't fuzz-match any FSL customer
-    # name). Logging carrier+awb+recipient+date so the admin can find
-    # them quickly in the carrier portal.
-    unmatched = [s for s in shipments if s.awb not in matched_shipment_awbs]
-    if unmatched:
+    # Compute truly-unmatched shipments — carrier records whose
+    # customer+date didn't link to ANY FSL row (filled or not). Saved
+    # on the result so the 18:00 digest's footer can surface them and
+    # also cached at module level so the digest in another async
+    # context (build_daily_digest_body) can read the latest run.
+    result.unmatched_shipments = [
+        s for s in shipments if s.awb not in semantic_matched_awbs
+    ]
+    if result.unmatched_shipments:
         log.info(
-            "AWB sync: %d shipment(s) had no FSL match. Likely candidates "
-            "for an alias row in 'AWB Customer Aliases':",
-            len(unmatched),
+            "AWB sync: %d shipment(s) had no FSL match — surfacing in digest:",
+            len(result.unmatched_shipments),
         )
-        for s in unmatched:
+        for s in result.unmatched_shipments:
             log.info(
                 "  unmatched · %s · %s · ship_date=%s · recipient=%r",
                 s.carrier, s.awb, s.ship_date, s.recipient_name,
             )
+    global _LAST_RESULT
+    _LAST_RESULT = result
 
     return result
+
+
+# Module-level cache of the most recent SyncResult. Read by the
+# 18:00 digest job so it can append unmatched-AWB info without
+# having to re-fetch from DHL+FedEx itself. Survives between async
+# contexts in the same Python process; resets on bot restart.
+_LAST_RESULT: SyncResult | None = None
+
+
+def get_last_unmatched_shipments() -> list[Shipment]:
+    """Return shipments from the most recent sync that didn't land on
+    any FSL row (i.e. no customer+date semantic match anywhere).
+    Empty list if no sync has run yet or all shipments matched."""
+    if _LAST_RESULT is None:
+        return []
+    return list(_LAST_RESULT.unmatched_shipments)
 
 
 async def _empty_coro() -> list[Shipment]:

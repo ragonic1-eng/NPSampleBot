@@ -6661,6 +6661,33 @@ async def _build_daily_digest_body() -> tuple[str, int]:
             f"Customers: {len(customer_keys)}"
         )
 
+    # Unmatched AWBs — carrier records (DHL/FedEx) we have that
+    # didn't link to any FSL row in this run. User wants these
+    # surfaced so no AWB stays silently orphaned. Sourced from the
+    # most recent awb_sync run (cached at module level — set by the
+    # 17:30 sync ~30 min before this digest).
+    unmatched = awb_sync.get_last_unmatched_shipments()
+    if unmatched:
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append(
+            f"⚠️ <b>AWBs not in FSL</b> ({len(unmatched)}) — "
+            "add the customer to the FSL, type HAND CARRY, "
+            "or set an alias in <i>AWB Customer Aliases</i>:"
+        )
+        # Sort by date descending so the most recent shipments are
+        # first — reps usually act on the latest gaps first.
+        unmatched_sorted = sorted(
+            unmatched, key=lambda s: s.ship_date, reverse=True,
+        )
+        for s in unmatched_sorted:
+            d = s.ship_date.strftime("%d %b") if s.ship_date else "?"
+            lines.append(
+                f"   • {h(s.recipient_name)} — "
+                f"<code>{h(s.awb)}</code> "
+                f"<i>({h(s.carrier)} · {h(d)})</i>"
+            )
+
     return "\n".join(lines), total
 
 

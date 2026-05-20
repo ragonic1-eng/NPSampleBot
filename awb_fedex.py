@@ -281,9 +281,13 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     await _wait_for_shipments_table(page)
     await _dump(page, "05_shipments_table")
 
-    # ---- 6. Trigger lazy-load + extract rows ----
-    log.info("FedEx step 7/7: extracting rows (lazy-loading older shipments)…")
-    await _scroll_load_all_rows(page)
+    # ---- 6. Extract rows ----
+    # Scroll-load was attempted in V1.16.0 (see _scroll_load_all_rows)
+    # but caused FedEx to return 0 rows on a re-test — likely a stale
+    # locator after the scroll repaint. Reverted to single-pass for
+    # now; FedEx's first page shows the 100 most recent, which is
+    # plenty for the 14-day rolling window the sync uses.
+    log.info("FedEx step 7/7: extracting rows…")
     rows = await page.evaluate(_EXTRACT_JS)
     log.info("FedEx: extracted %d raw row(s)", len(rows))
 

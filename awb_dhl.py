@@ -231,9 +231,17 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     await _wait_for_shipments_loaded(page)
     await _dump(page, "03_manage_shipments")
 
-    # ---- 3. Extract structured shipment data, walking pagination ----
-    rows = await _extract_all_pages(page)
-    log.info("DHL: extracted %d raw row(s) across all pages", len(rows))
+    # ---- 3. Extract structured shipment data ----
+    # Pagination was attempted in V1.16.0 (see _extract_all_pages) but
+    # produced ghost rows on later pages — the JS extractor found
+    # 10-digit AWB anchors that didn't belong to real shipment cards,
+    # so every paginated AWB got skipped with "no customer name".
+    # Reverted to first-page-only until we have proper diagnostics
+    # from the live DOM. The 14-day rolling window + twice-daily sync
+    # still catches everything because each run re-checks the same
+    # period; older AWBs get backfilled gradually.
+    rows = await page.evaluate(_EXTRACT_JS)
+    log.info("DHL: extracted %d raw row(s) (page 1 only)", len(rows))
 
     shipments: list[Shipment] = []
     for r in rows:
@@ -443,13 +451,14 @@ _EXTRACT_JS = r"""
     const ship_date_text = dateMatch ? dateMatch[1] : "";
 
     // 5. The Ship To block — three lines (company, contact, city/country)
-    //    following the literal "Ship To" label. The old generic "stop on
-    //    Xxxx Xx" rule was too eager — it matched the company name on
-    //    line 1 and aborted, giving us only one line. New stop list is
-    //    the explicit DHL action-row labels that always follow the
-    //    ship-to block on the card.
+    //    following the literal "Ship To" label. Lenient stop pattern
+    //    so we don't drop the whole capture on headless renders where
+    //    DHL's action-row labels (Quick View / Print Labels) aren't
+    //    visible. We accept ANY of: double-newline paragraph break,
+    //    explicit DHL action labels, a "Title Case Title Case" line
+    //    (likely the next labelled section), or end-of-string.
     const shipToMatch = text.match(
-      /Ship To\s*\n([\s\S]*?)\n\s*(?:Quick View|Print Labels|Create Return Label|Copy|Track|Edit|$)/i
+      /Ship To\s*\n([\s\S]*?)(?:\n\s*\n|\n\s*(?:Quick View|Print Labels|Create Return|Copy|Track|Edit)\b|\n[A-Z][a-z]+ [A-Z][a-z]|$)/i
     );
     const ship_to_text = shipToMatch ? shipToMatch[1].trim() : "";
 

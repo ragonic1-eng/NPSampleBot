@@ -136,6 +136,22 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
     await _dump(page, "01_login_page")
 
+    # Block: wait for the Angular spinner overlay (wlgn-spinner) to
+    # disappear, otherwise it intercepts every click. Generous 15s —
+    # the FedEx login bundle is heavy on first paint.
+    log.info("FedEx: waiting for spinner overlay to clear…")
+    try:
+        await page.locator(".loading-overlay, wlgn-spinner").first.wait_for(
+            state="hidden", timeout=15_000
+        )
+    except Exception:  # noqa: BLE001
+        log.info("FedEx: no spinner overlay (or already gone)")
+
+    # Block: dismiss the Usercentrics cookie consent banner — it
+    # renders as <aside id="usercentrics-cmp-ui"> on top of the form
+    # and absorbs every click into a void. See _dismiss_usercentrics.
+    await _dismiss_usercentrics(page)
+
     # ---- 2. Fill credentials and click LOG IN ----
     log.info("FedEx step 2/7: filling credentials…")
     user_field = (
@@ -234,6 +250,57 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
         len(shipments), (date.today() - cutoff).days, cutoff,
     )
     return shipments
+
+
+async def _dismiss_usercentrics(page) -> None:
+    """Get the FedEx cookie consent banner out of the way.
+
+    FedEx uses Usercentrics CMP. The banner is an <aside id=
+    'usercentrics-cmp-ui'> with the controls rendered inside a Shadow
+    DOM. Strategy:
+      1. Try clicking 'Accept All' / 'Allow All' via role+name (Playwright
+         pierces the shadow DOM automatically for role-based queries).
+      2. If the click doesn't land in 2s, just remove the <aside> from
+         the page so it stops intercepting pointer events on the
+         login form. Cookies aren't persisted between automation runs
+         anyway — the banner re-appears next session and we re-nuke it.
+    """
+    # Strategy 1: click an accept button if Playwright can find one.
+    try:
+        accept_btn = (
+            page.get_by_role("button", name=re.compile(r"accept all", re.I))
+            .or_(page.get_by_role("button", name=re.compile(r"allow all", re.I)))
+            .or_(page.get_by_role("button", name=re.compile(r"^accept$", re.I)))
+        ).first
+        await accept_btn.click(timeout=2_000)
+        log.info("FedEx: cookie consent dismissed via Accept button")
+        # Tiny pause so the aside's exit animation completes before we
+        # try to click anything underneath.
+        await asyncio.sleep(0.4)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Strategy 2: nuke the element. Removes the aside entirely so its
+    # pointer-events: auto subtree stops blocking the username input.
+    try:
+        removed = await page.evaluate("""
+            () => {
+                const ids = ["usercentrics-cmp-ui", "usercentrics-root"];
+                let removed = 0;
+                for (const id of ids) {
+                    const el = document.getElementById(id);
+                    if (el) { el.remove(); removed++; }
+                }
+                return removed;
+            }
+        """)
+        if removed:
+            log.info("FedEx: removed %d Usercentrics element(s) from DOM", removed)
+        else:
+            log.info("FedEx: no Usercentrics banner found (already accepted?)")
+    except Exception as e:  # noqa: BLE001
+        log.warning("FedEx: couldn't remove Usercentrics banner: %s", e)
 
 
 async def _wait_for_shipments_table(page) -> None:

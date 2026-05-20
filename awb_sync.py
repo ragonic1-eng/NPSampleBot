@@ -101,23 +101,37 @@ class SyncResult:
 
 _COMPANY_NOISE_RE = re.compile(
     # Common company-form suffixes that vary between carrier labels and
-    # the FSL customer master. Stripped before fuzzy-matching.
+    # the FSL customer master. Stripped before fuzzy-matching. Kept
+    # conservative — words like 'trading', 'foods', 'industries' are
+    # NOT stripped because they're often part of the brand name proper
+    # ('PT NP Foods' vs 'PT Foods' would otherwise wrongly collapse).
     r"\b(co\.?,?\s*ltd\.?|pte\.?\s*ltd\.?|sdn\.?\s*bhd\.?|inc\.?|llc|"
     r"corp(?:oration)?|limited|company|factory|gmbh|pvt|private)\b",
     re.IGNORECASE,
 )
 
-
 def _normalize_name(name: str) -> str:
-    """Lowercase + strip punctuation + drop common company-form suffixes.
+    """Aggressive normalisation so the fuzzy matcher can compare apples
+    to apples between carrier labels and the FSL customer master.
 
-    Both the carrier label and the FSL "Customer Name" cell run through
-    this before fuzz comparison. Avoids the WRatio noise where one side
-    has "CO., LTD" and the other doesn't.
+    Pipeline:
+      1. Strip parens CHARACTERS but keep what's inside
+         ('Acme (HK)' → 'Acme HK', '(Food Excellence )' → 'Food Excellence ')
+      2. Lowercase
+      3. Replace '&' with ' and '              (PG&E ↔ PG and E)
+      4. Replace dots, commas, dashes          ('CO., LTD' → 'CO LTD')
+      5. Strip company-form suffixes           ('Sdn Bhd', 'Pte Ltd', …)
+      6. Collapse all non-alphanum to spaces, collapse whitespace
     """
     if not name:
         return ""
-    s = name.lower()
+    # Strip parens characters only — keep inner content. Earlier
+    # iteration deleted everything inside parens, which broke FSL
+    # names that are ENTIRELY parenthesised like '(Food Excellence )'.
+    s = name.replace("(", " ").replace(")", " ")
+    s = s.lower()
+    s = s.replace("&", " and ")
+    s = re.sub(r"[.,\-]+", " ", s)
     s = _COMPANY_NOISE_RE.sub(" ", s)
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
     s = " ".join(s.split())
@@ -125,15 +139,34 @@ def _normalize_name(name: str) -> str:
 
 
 def _customer_matches(carrier_name: str, fsl_name: str) -> bool:
-    """Fuzzy compare two customer names. Tolerant of company-form suffixes."""
+    """Multi-strategy fuzzy compare.
+
+    Runs both token_set_ratio AND token_sort_ratio and takes the max:
+      • token_set_ratio: tolerant of extra/missing tokens — wins when
+        the carrier label has 'SPECIALIST' / 'GENERAL TRADING' tokens
+        that aren't in the FSL name
+      • token_sort_ratio: tolerant of reordering — wins when 'AL
+        WAZZAN JASSIM SONS' label = 'JASSIM AL WAZZAN SONS' in FSL
+
+    Deliberately NOT using partial_ratio: it returns 100 whenever the
+    shorter string is a substring of the longer, which produces too
+    many false positives.
+
+    Limitation accepted: when the FSL legitimately contains two
+    very-similar customer names (e.g. 'PT FOODS' and 'PT NP FOODS'),
+    a carrier shipment to one may also match the other by fuzzy
+    score alone. The disambiguation is the date-window filter (same-
+    customer-same-day is the realistic ambiguity surface) plus the
+    'AWB Customer Aliases' override sheet for hard cases.
+    """
     a = _normalize_name(carrier_name)
     b = _normalize_name(fsl_name)
     if not a or not b:
         return False
-    # token_set_ratio handles "HURNG FUR FOODS" vs "FOODS HURNG FUR" and
-    # is the most lenient of rapidfuzz's WRatio family — appropriate here
-    # because carrier labels often abbreviate words.
-    return fuzz.token_set_ratio(a, b) >= NAME_FUZZ_THRESHOLD
+    return max(
+        fuzz.token_set_ratio(a, b),
+        fuzz.token_sort_ratio(a, b),
+    ) >= NAME_FUZZ_THRESHOLD
 
 
 def _apply_alias(s: Shipment, aliases_normalized: dict[str, str]) -> Shipment:
@@ -331,6 +364,11 @@ async def run_awb_sync(
         log.info("AWB sync: applying %d customer alias(es)", len(aliases_normalized))
     shipments = [_apply_alias(s, aliases_normalized) for s in shipments]
 
+    # Track which carrier shipments matched against ANY tab so we can
+    # log the un-matched ones at the end. Useful for spotting customer-
+    # name variations that need a new alias row in the OPS sheet.
+    matched_shipment_awbs: set[str] = set()
+
     # For each region tab, load → match → write.
     tabs = [sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB]
     for tab in tabs:
@@ -346,6 +384,8 @@ async def run_awb_sync(
             continue
 
         carrier_updates = build_updates_for_tab(tab, fsl_rows, shipments)
+        for u in carrier_updates:
+            matched_shipment_awbs.add(u.awb)
         hc_updates = build_hand_carry_sg_updates(tab, fsl_rows)
         # De-dupe: carrier match wins if a row is queued by both paths
         # (this shouldn't happen — SG rows almost never appear on
@@ -381,6 +421,24 @@ async def run_awb_sync(
             "hand_carry": len(hc_updates),
             "written": written,
         }
+
+    # Diagnostic: log shipments that didn't land on any FSL tab. These
+    # are usually candidates for a new alias row in 'AWB Customer
+    # Aliases' (carrier label name doesn't fuzz-match any FSL customer
+    # name). Logging carrier+awb+recipient+date so the admin can find
+    # them quickly in the carrier portal.
+    unmatched = [s for s in shipments if s.awb not in matched_shipment_awbs]
+    if unmatched:
+        log.info(
+            "AWB sync: %d shipment(s) had no FSL match. Likely candidates "
+            "for an alias row in 'AWB Customer Aliases':",
+            len(unmatched),
+        )
+        for s in unmatched:
+            log.info(
+                "  unmatched · %s · %s · ship_date=%s · recipient=%r",
+                s.carrier, s.awb, s.ship_date, s.recipient_name,
+            )
 
     return result
 

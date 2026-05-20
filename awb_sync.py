@@ -127,6 +127,32 @@ def _customer_matches(carrier_name: str, fsl_name: str) -> bool:
     return fuzz.token_set_ratio(a, b) >= NAME_FUZZ_THRESHOLD
 
 
+def _apply_alias(s: Shipment, aliases_normalized: dict[str, str]) -> Shipment:
+    """Replace s.recipient_name with the FSL-side alias if one exists.
+
+    Lookup is by normalised carrier name (lowercase, no company-form
+    suffixes) so the rep doesn't have to worry about capitalisation or
+    'CO LTD' / 'CO., LTD' variants in the alias sheet.
+    """
+    if not aliases_normalized:
+        return s
+    key = _normalize_name(s.recipient_name)
+    if key in aliases_normalized:
+        replacement = aliases_normalized[key]
+        log.info(
+            "alias: '%s' → '%s' (awb=%s)",
+            s.recipient_name, replacement, s.awb,
+        )
+        return Shipment(
+            carrier=s.carrier,
+            awb=s.awb,
+            recipient_name=replacement,
+            recipient_country=s.recipient_country,
+            ship_date=s.ship_date,
+        )
+    return s
+
+
 def _date_matches(carrier_date: date, fsl_date: date | None) -> bool:
     if fsl_date is None:
         return False
@@ -226,6 +252,26 @@ async def run_awb_sync(
     result.dhl_count = len(dhl_list)
     result.fedex_count = len(fedex_list)
     shipments = list(dhl_list) + list(fedex_list)
+
+    # Apply customer-name aliases BEFORE matching. Carriers often print
+    # the distributor / importer's name on the label while the FSL
+    # records the end-customer brand (e.g. 'SARL HYGIENIX MANUFACTURE
+    # COMPANY' on DHL → 'Daiya Food' in the FSL). Reps maintain the
+    # mapping in the OPS sheet's 'AWB Customer Aliases' tab; we apply
+    # it here so the matcher sees the FSL-side name and the fuzzy
+    # compare actually has a chance to land. Lookup is normalized so
+    # capitalisation differences don't matter.
+    try:
+        raw_aliases = await asyncio.to_thread(sheets.load_customer_aliases)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not load customer aliases: %s", e)
+        raw_aliases = {}
+    aliases_normalized = {
+        _normalize_name(k): v for k, v in raw_aliases.items() if k and v
+    }
+    if aliases_normalized:
+        log.info("AWB sync: applying %d customer alias(es)", len(aliases_normalized))
+    shipments = [_apply_alias(s, aliases_normalized) for s in shipments]
 
     # For each region tab, load → match → write.
     tabs = [sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB]

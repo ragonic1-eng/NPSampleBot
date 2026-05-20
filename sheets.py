@@ -480,6 +480,75 @@ def _col_letter(col_1_indexed: int) -> str:
     return result
 
 
+# ---------- AWB customer-name aliases (V1.16.0) ----------
+
+# Tab name on OPS_SHEET_ID. Reps maintain it manually whenever a
+# carrier label name doesn't match the FSL Customer Name (e.g. the
+# DHL waybill says "SARL HYGIENIX MANUFACTURE COMPANY" but in your
+# FSL the customer is "Daiya Food" — same shipment, different
+# label conventions). One row per alias.
+TAB_AWB_ALIASES = "AWB Customer Aliases"
+AWB_ALIAS_HEADER = ["Carrier Name", "FSL Customer Name", "Notes"]
+
+# 10-min TTL cache so the twice-daily sync hits Sheets at most once.
+_AWB_ALIASES_CACHE: dict = {}
+
+
+def load_customer_aliases() -> dict[str, str]:
+    """Return a {carrier_name: fsl_customer_name} mapping from the
+    'AWB Customer Aliases' tab in OPS_SHEET_ID.
+
+    Auto-creates the tab (with the header row + a one-line example
+    comment) the first time it's called against a workbook that
+    doesn't have it yet. Empty mapping returned when the tab exists
+    but contains only the header.
+
+    awb_sync calls this once per sync run and uses it to rewrite each
+    inbound shipment's recipient_name BEFORE the fuzzy matcher runs.
+    Keys are case-preserved here; awb_sync normalises both sides
+    before comparing, so capitalisation in the sheet doesn't matter.
+    """
+    import time as _time
+    now = _time.time()
+    cached = _AWB_ALIASES_CACHE.get("data")
+    if cached and now - cached["ts"] < 600:
+        return cached["map"]
+
+    sh = _open_ops()
+    try:
+        ws = sh.worksheet(TAB_AWB_ALIASES)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TAB_AWB_ALIASES, rows=200, cols=3)
+        ws.update(values=[AWB_ALIAS_HEADER], range_name="A1")
+        # Add a single illustrative example row that's clearly a
+        # placeholder. Reps can delete or overwrite it.
+        ws.update(
+            values=[[
+                "SARL HYGIENIX MANUFACTURE COMPANY",
+                "Daiya Food",
+                "Example — distributor → end customer brand",
+            ]],
+            range_name="A2",
+        )
+        _AWB_ALIASES_CACHE["data"] = {
+            "ts": now,
+            "map": {"SARL HYGIENIX MANUFACTURE COMPANY": "Daiya Food"},
+        }
+        return _AWB_ALIASES_CACHE["data"]["map"]
+
+    rows = ws.get_all_values()
+    result: dict[str, str] = {}
+    for r in rows[1:]:
+        if len(r) < 2:
+            continue
+        carrier = (r[0] or "").strip()
+        fsl = (r[1] or "").strip()
+        if carrier and fsl:
+            result[carrier] = fsl
+    _AWB_ALIASES_CACHE["data"] = {"ts": now, "map": result}
+    return result
+
+
 # ---------- AWB column updates (V1.16.0 — driven by awb_sync.py) ----------
 
 def ensure_awb_column(tab: str = FSL_TAB) -> bool:

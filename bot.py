@@ -6492,7 +6492,25 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                 customer_keys.add(f"{label}::{cust_label}")
                 cnt = len(samples)
                 suffix = f" — {cnt} samples" if cnt > 1 else ""
-                lines.append(f"   ▸ {h(cust_label)}{suffix}")
+                # AWB display. The matcher fills every row in the same
+                # customer/date block with the same AWB (one DHL box →
+                # many sample bags), so usually there's one distinct
+                # value. Multiple distinct AWBs would only happen if a
+                # customer got two separate shipments on the same day —
+                # then we join them with "/" so the digest doesn't hide
+                # one. Missing AWBs show as "—" so the reader knows the
+                # data is just unmapped, not that we forgot to fetch.
+                awbs = sorted({
+                    (s.get("AWB") or "").strip()
+                    for s in samples
+                    if (s.get("AWB") or "").strip()
+                })
+                if awbs:
+                    awb_str = "/".join(awbs)
+                    awb_html = f" · AWB <code>{h(awb_str)}</code>"
+                else:
+                    awb_html = " · AWB —"
+                lines.append(f"   ▸ {h(cust_label)}{awb_html}{suffix}")
                 for s in samples:
                     name = (s.get("Product Name") or "—").strip() or "—"
                     code = (s.get("Product Code") or "—").strip() or "—"
@@ -6739,12 +6757,18 @@ async def _awb_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _schedule_awb_sync(application: Application) -> None:
-    """Set up the twice-daily AWB sync (07:00 + 20:00 SGT, every day).
+    """Set up the twice-daily AWB sync.
 
-    The 7am run catches anything shipped overnight; the 8pm run sweeps
-    up what reps shipped during the day. 14-day overlap window in the
-    fetchers means a missed run isn't fatal — the next one re-checks
-    the same period and fills any gaps.
+    Schedule:
+      • 07:00 SGT daily — catches anything shipped overnight so reps see
+        AWBs first thing in the morning.
+      • 17:50 SGT Mon-Fri — runs 10 min after the MMS → FSL sync (which
+        fires at 17:40) and 10 min before the daily digest (18:00),
+        guaranteeing the FSL has fresh sample rows AND fresh AWBs by
+        the time the digest reads them.
+
+    The 14-day overlap window in the fetchers means a missed run isn't
+    fatal — the next one re-checks the same period and fills any gaps.
     """
     from datetime import time as _time
     job_queue = application.job_queue
@@ -6752,7 +6776,7 @@ async def _schedule_awb_sync(application: Application) -> None:
         log.warning("JobQueue not available — AWB sync NOT scheduled.")
         return
     sgt = ZoneInfo("Asia/Singapore")
-    # PTB day numbering: 0=Mon … 6=Sun. Empty tuple means all 7 days.
+    # PTB day numbering: 0=Mon … 6=Sun.
     job_queue.run_daily(
         _awb_sync_job,
         time=_time(hour=7, minute=0, tzinfo=sgt),
@@ -6761,11 +6785,14 @@ async def _schedule_awb_sync(application: Application) -> None:
     )
     job_queue.run_daily(
         _awb_sync_job,
-        time=_time(hour=20, minute=0, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4, 5, 6),
-        name="awb_sync_evening",
+        time=_time(hour=17, minute=50, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4),
+        name="awb_sync_pre_digest",
     )
-    log.info("awb_sync scheduled: 07:00 + 20:00 SGT, daily")
+    log.info(
+        "awb_sync scheduled: 07:00 SGT daily + 17:50 SGT Mon-Fri "
+        "(10 min before digest)"
+    )
 
 
 async def _schedule_weekly_mms_sync(application: Application) -> None:

@@ -80,9 +80,13 @@ class SyncResult:
     by_tab: dict[str, dict[str, int]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     dry_run: bool = False
-    # Updates that were actually written to the sheet this run. Used to
-    # build the post-sync chat message. Stays empty on dry_run.
+    # Carrier-matched updates that were written this run. Used to build
+    # the post-sync chat message. Stays empty on dry_run.
     applied_updates: list[MatchUpdate] = field(default_factory=list)
+    # SG-local rows we defaulted to HAND CARRY this run. Tracked
+    # separately so the chat message isn't drowned in default writes —
+    # they're useful as a tally line, not as individual blocks.
+    hand_carry_defaults: int = 0
 
     @property
     def total_matched(self) -> int:
@@ -211,6 +215,53 @@ def build_updates_for_tab(
 
 # --------------------------- orchestrator ---------------------------
 
+def build_hand_carry_sg_updates(
+    tab: str, fsl_rows: list[dict]
+) -> list[MatchUpdate]:
+    """Default 'HAND CARRY' for SG-country rows on the main FSL tab.
+
+    Rationale: NP Foods Singapore's main FSL ('Full Sample Listing')
+    contains SG-produced samples shipped to customers. Rows whose
+    Country == 'Singapore' are local Singapore deliveries — couriered
+    by hand or by local pickup, never via DHL/FedEx — so they should
+    default to 'HAND CARRY' without waiting for a courier match that
+    will never come.
+
+    Only applied to FSL_TAB (the Singapore production tab). On
+    Jakarta / Thailand tabs, Country='Singapore' means 'shipped TO
+    Singapore from that factory' — which IS couriered, so we leave
+    those alone for the carrier scrape to fill.
+
+    Skip rows whose AWB cell already has SOMETHING (a real AWB, a
+    manually-typed override, etc.) — the same skip-if-non-empty
+    rule the matcher uses.
+    """
+    if tab != sheets.FSL_TAB:
+        return []
+    out: list[MatchUpdate] = []
+    for fsl in fsl_rows:
+        row_num = fsl.get("_row")
+        if not row_num:
+            continue
+        if (fsl.get("AWB") or "").strip():
+            continue
+        country = (fsl.get("Country") or "").strip().lower()
+        if country != "singapore":
+            continue
+        out.append(MatchUpdate(
+            tab=tab,
+            row_number=row_num,
+            awb="HAND CARRY",
+            # Marker that excludes the row from the chat update post.
+            carrier="(local SG default)",
+            customer=fsl.get("Customer Name", ""),
+            fsl_date_iso=fsl.get("Sample Date Out", ""),
+            sales=fsl.get("Sales", ""),
+            country="Singapore",
+        ))
+    return out
+
+
 async def run_awb_sync(
     *,
     days_back: int = 14,
@@ -294,26 +345,42 @@ async def run_awb_sync(
             result.by_tab[tab] = {"matched": 0, "written": 0}
             continue
 
-        updates = build_updates_for_tab(tab, fsl_rows, shipments)
-        log.info("%s: %d FSL row(s), %d match(es)", tab, len(fsl_rows), len(updates))
+        carrier_updates = build_updates_for_tab(tab, fsl_rows, shipments)
+        hc_updates = build_hand_carry_sg_updates(tab, fsl_rows)
+        # De-dupe: carrier match wins if a row is queued by both paths
+        # (this shouldn't happen — SG rows almost never appear on
+        # DHL/FedEx — but be defensive).
+        used_rows = {u.row_number for u in carrier_updates}
+        hc_updates = [u for u in hc_updates if u.row_number not in used_rows]
+        all_updates = carrier_updates + hc_updates
+        log.info(
+            "%s: %d FSL row(s), %d carrier match(es), %d HAND CARRY default(s)",
+            tab, len(fsl_rows), len(carrier_updates), len(hc_updates),
+        )
 
         written = 0
-        if updates and not dry_run:
+        if all_updates and not dry_run:
             try:
                 written = await asyncio.to_thread(
                     sheets.write_awb_updates,
                     tab,
-                    [(u.row_number, u.awb) for u in updates],
+                    [(u.row_number, u.awb) for u in all_updates],
                 )
                 # write_awb_updates is batch + atomic — either every
-                # cell wrote or none did. So when written > 0 we can
-                # safely treat all `updates` as the applied set.
+                # cell wrote or none did. When written > 0 the whole
+                # all_updates list got persisted. Split into the two
+                # buckets so the chat message only shows carrier hits.
                 if written:
-                    result.applied_updates.extend(updates)
+                    result.applied_updates.extend(carrier_updates)
+                    result.hand_carry_defaults += len(hc_updates)
             except Exception as e:  # noqa: BLE001
                 log.warning("write %s failed: %s", tab, e)
                 result.errors.append(f"{tab} write: {e}")
-        result.by_tab[tab] = {"matched": len(updates), "written": written}
+        result.by_tab[tab] = {
+            "matched": len(carrier_updates),
+            "hand_carry": len(hc_updates),
+            "written": written,
+        }
 
     return result
 
@@ -428,9 +495,11 @@ def format_result_for_telegram(result: SyncResult) -> str:
     )
     lines.append("")
     for tab, stats in result.by_tab.items():
+        hc = stats.get("hand_carry", 0)
+        hc_text = f" · 🚗 {hc} hand-carry" if hc else ""
         lines.append(
             f"• <i>{tab}</i>: {stats['matched']} matched · "
-            f"{stats['written']} written"
+            f"{stats['written']} written{hc_text}"
         )
     if result.errors:
         lines.append("")

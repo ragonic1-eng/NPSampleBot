@@ -152,6 +152,19 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     # and absorbs every click into a void. See _dismiss_usercentrics.
     await _dismiss_usercentrics(page)
 
+    # After consent is accepted FedEx's Angular app does a partial
+    # re-render of the form region — sometimes the spinner overlay
+    # also briefly returns. Wait it out so we don't try to type into
+    # a stale or disabled input.
+    log.info("FedEx: waiting for post-consent spinner to clear…")
+    try:
+        await page.locator(".loading-overlay, wlgn-spinner").first.wait_for(
+            state="hidden", timeout=10_000
+        )
+    except Exception:  # noqa: BLE001
+        log.info("FedEx: no post-consent spinner (or already gone)")
+    await _dump(page, "01b_after_consent")
+
     # ---- 2. Fill credentials and click LOG IN ----
     log.info("FedEx step 2/7: filling credentials…")
     user_field = (
@@ -170,15 +183,38 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     # username input is properly interactive before trying to click —
     # otherwise we click 'into' a still-animating overlay and lose
     # the keystrokes.
+    log.info("FedEx: waiting for username field to become visible…")
     await user_field.wait_for(state="visible", timeout=15_000)
-    # Same React-controlled-component fix as DHL: real keyboard events
-    # via press_sequentially, otherwise React's onChange doesn't fire
-    # and the form validator rejects with "Required".
+
+    # Diagnostic: how many candidate elements does our locator match
+    # right now, and is the resolved one actually editable? If FedEx
+    # changes the layout we want to see this in the log, not silent
+    # failure.
+    try:
+        candidate_count = await user_field.count()
+        log.info("FedEx: username locator matched %d element(s)", candidate_count)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Real keyboard events (page.keyboard.type after .click + .focus)
+    # are the most reliable path for React/Angular controlled inputs.
+    # press_sequentially on a Locator also works but couples typing to
+    # the locator's element; if the locator resolves to a stale node
+    # after a re-render, the chars go nowhere. Doing click → focus →
+    # page.keyboard.type avoids that — keyboard events go to whatever
+    # has focus right now.
+    log.info("FedEx: typing username (%d char)…", len(user))
     await user_field.click(timeout=8_000)
-    await user_field.press_sequentially(user, delay=25)
+    await user_field.focus()
+    await page.keyboard.type(user, delay=25)
+
+    log.info("FedEx: typing password (%d char)…", len(pwd))
     await pw_field.click(timeout=8_000)
-    await pw_field.press_sequentially(pwd, delay=25)
+    await pw_field.focus()
+    await page.keyboard.type(pwd, delay=25)
+
     await asyncio.sleep(0.3)
+    await _dump(page, "01c_after_fill")
 
     log.info("FedEx step 3/7: submitting login…")
     login_btn = page.get_by_role("button", name=re.compile(r"^\s*log in\s*$", re.I)).first

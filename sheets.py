@@ -467,6 +467,7 @@ def append_fsl_rows(rows: list[list[str]], tab: str = FSL_TAB) -> int:
         values=padded,
         value_input_option="USER_ENTERED",
     )
+    _invalidate_fsl_cache()
     return len(padded)
 
 
@@ -620,6 +621,7 @@ def write_awb_updates(tab: str, updates: list[tuple[int, str]]) -> int:
         for row, awb in clean
     ]
     ws.batch_update(body, value_input_option="USER_ENTERED")
+    _invalidate_fsl_cache()
     return len(clean)
 
 
@@ -1029,13 +1031,39 @@ def find_fsl_product_by_code(code: str) -> dict | None:
     return matches[0]
 
 
+# 90-second TTL cache for the read-heavy FSL paths. /lastsample and
+# /alllastsample each pull all 3 region tabs from scratch; a single
+# search burst (rep types a query, paginates twice, then refines)
+# easily blew through the Sheets API's 60-reads-per-minute-per-user
+# quota and returned silent "no match" errors to the user. 90s keeps
+# searches snappy without hiding genuine data updates for long.
+# Writes (append_fsl_rows, write_awb_updates) call _invalidate_fsl_cache.
+_FSL_ROWS_CACHE: dict[tuple, tuple[float, list]] = {}
+_FSL_CACHE_TTL_SEC = 90
+
+
+def _invalidate_fsl_cache() -> None:
+    """Clear the FSL row cache. Called after any write so the next read
+    sees fresh data instead of pre-write snapshot."""
+    _FSL_ROWS_CACHE.clear()
+
+
 def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
     """Return every row from the target FSL tab, regardless of Sales rep.
 
     Admin-only path: /alllastsample uses this to search across all reps,
     in contrast to load_fsl_rows_for_sales() which scopes to one rep.
     Each row includes a parsed ``_date`` for sorting.
+
+    90s TTL cache — see _FSL_ROWS_CACHE docstring.
     """
+    import time as _time
+    cache_key = ("all", tab)
+    cached = _FSL_ROWS_CACHE.get(cache_key)
+    now = _time.time()
+    if cached and now - cached[0] < _FSL_CACHE_TTL_SEC:
+        return cached[1]
+
     sh = _open_seasoning_master()
     try:
         ws = sh.worksheet(tab)
@@ -1050,6 +1078,7 @@ def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
         row = {hdr: restore_mangled_unicode(padded[i]) for i, hdr in enumerate(FSL_HEADER)}
         row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
         out.append(row)
+    _FSL_ROWS_CACHE[cache_key] = (now, out)
     return out
 
 
@@ -1058,10 +1087,21 @@ def load_fsl_rows_for_sales(sales_name: str, tab: str = FSL_TAB) -> list[dict[st
     tab (case-insensitive, whitespace-collapsed). Each row is a dict with
     the FSL_HEADER columns as keys + a parsed `_date` (datetime.date | None)
     for sorting. Returns [] if the sales name is empty or the tab is missing.
+
+    90s TTL cache keyed by (sales_name lowered, tab) — see
+    _FSL_ROWS_CACHE docstring above.
     """
     if not (sales_name or "").strip():
         return []
     target = " ".join(sales_name.lower().split())
+
+    import time as _time
+    cache_key = ("sales", target, tab)
+    cached = _FSL_ROWS_CACHE.get(cache_key)
+    now = _time.time()
+    if cached and now - cached[0] < _FSL_CACHE_TTL_SEC:
+        return cached[1]
+
     sh = _open_seasoning_master()
     try:
         ws = sh.worksheet(tab)
@@ -1084,6 +1124,7 @@ def load_fsl_rows_for_sales(sales_name: str, tab: str = FSL_TAB) -> list[dict[st
         row = {h: restore_mangled_unicode(padded[i]) for i, h in enumerate(FSL_HEADER)}
         row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
         out.append(row)
+    _FSL_ROWS_CACHE[cache_key] = (now, out)
     return out
 
 

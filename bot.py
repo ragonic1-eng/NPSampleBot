@@ -48,6 +48,12 @@ import state
 import vision_scan
 from state import FIELDS, FIELD_LABELS
 
+# Sales names recognised by the Vercel quotation builder (?sales= param).
+# Kept here (not pulled from a module) so bot.py has zero import-time
+# dependency on reportlab — the in-bot Python PDF generator was removed
+# in V1.15.0 when the form moved to the web.
+_QUOTE_SALES_NAMES = ["Alex", "Adrian", "Eric", "Jay", "Rich", "Melissa"]
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -462,6 +468,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     menu = [
         [("🔎 Search seasonings", "menu:search")],
         [("💲 Look up product code", "menu:lookup")],
+        [("📄 Build a quotation", "menu:quote")],
         [("👤 My samples (me only)", "menu:lastsample")],
         [("🌐 All reps' samples", "menu:alllastsample")],
     ]
@@ -479,6 +486,80 @@ async def cmd_bulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _authorized(update):
         return
     await _start_bulk(update, ctx)
+
+
+def _resolve_quote_sales_name(user) -> str:
+    """Best-effort map of the Telegram rep to a known sales-person name.
+
+    Used to pre-fill the ?sales=<name> query param when handing out the
+    Vercel quote-builder link. Strategy:
+      1. Authorized-Users tab → MMS Name column → match against the six
+         recognised sales names (Alex, Adrian, Eric, Jay, Rich, Melissa).
+      2. Fall back to the Telegram first name if it matches.
+      3. Return "" if nothing matches → web form just shows an empty
+         dropdown, no harm done.
+    """
+    try:
+        mms_name = sheets.get_user_mms_name(getattr(user, "id", None),
+                                            getattr(user, "username", None))
+    except Exception:
+        mms_name = ""
+    candidates = [mms_name or "", getattr(user, "first_name", "") or ""]
+    for cand in candidates:
+        cand = (cand or "").strip()
+        if not cand:
+            continue
+        for name in _QUOTE_SALES_NAMES:
+            if name.lower() == cand.lower():
+                return name
+            # Some MMS names are full names ("Jay Wong") — match on first token.
+            first = cand.split()[0]
+            if name.lower() == first.lower():
+                return name
+    return ""
+
+
+async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Hand the rep a clickable link to the Vercel quotation web app.
+
+    The form + PDF generation live on Vercel (see quote_web/). The bot's
+    only job here is to deep-link with the rep's sales name pre-filled so
+    the dropdown lands on the right person on page load.
+    """
+    if not await _authorized(update):
+        return
+    if not config.QUOTE_WEB_URL:
+        await send(
+            update,
+            "⚠️ The quotation builder URL isn't configured yet.\n\n"
+            "<b>Admin:</b> deploy the <code>quote_web/</code> folder to "
+            "Vercel (see <code>quote_web/README.md</code>), then set the "
+            "<code>QUOTE_WEB_URL</code> env var on Railway and restart the bot.",
+            kb([[("🏠 Main menu", "menu:home")]]),
+        )
+        return
+    user = update.effective_user
+    sales = _resolve_quote_sales_name(user)
+    sep = "&" if "?" in config.QUOTE_WEB_URL else "?"
+    url = f"{config.QUOTE_WEB_URL}{sep}sales={sales}" if sales else config.QUOTE_WEB_URL
+    body = (
+        "📄 <b>Build a quotation</b>\n\n"
+        "Tap the button below to open the quotation builder. Fill in the "
+        "customer details and product lines, then tap <b>Generate &amp; "
+        "download PDF</b> to save a print-ready A4 file."
+    )
+    if sales:
+        body += f"\n\n<i>Signed-by dropdown pre-filled as: <b>{h(sales)}</b></i>"
+    else:
+        body += (
+            "\n\n<i>I couldn't auto-detect your sales name — pick it from "
+            "the dropdown on the page.</i>"
+        )
+    btns = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Open quotation builder", url=url)],
+        [InlineKeyboardButton("🏠 Main menu", callback_data="menu:home")],
+    ])
+    await send(update, body, btns)
 
 
 async def cmd_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -508,6 +589,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/start — main menu",
         "/bulk — paste a multi-seasoning email, I split it for you",
         "/samples — review the requests you've raised",
+        "",
+        "<b>Quotations</b>",
+        "/quote — open the web quotation builder (Vercel) in your browser",
         "",
         "<b>While drafting</b>",
         "/edit — jump back to the review to change any field",
@@ -4859,6 +4943,9 @@ async def _handle_menu_callback(update, ctx, action: str):
     if action == "bulk":
         await _start_bulk(update, ctx)
         return
+    if action == "quote":
+        await cmd_quote(update, ctx)
+        return
     if action == "search":
         # V1.12.0 — browse-only seasoning search (does NOT raise a sample
         # request). Asks region first, then takes free text or a code.
@@ -6718,6 +6805,7 @@ def main():
     app.add_handler(CommandHandler("reload", cmd_reload))
     app.add_handler(CommandHandler("samples", cmd_samples))
     app.add_handler(CommandHandler("bulk", cmd_bulk))
+    app.add_handler(CommandHandler("quote", cmd_quote))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("whichchat", cmd_whichchat))
     app.add_handler(CommandHandler("sampleupdate", cmd_sampleupdate))
@@ -6744,6 +6832,7 @@ def main():
         default_cmds = [
             BotCommand("start", "Main menu — new request / bulk / samples"),
             BotCommand("bulk", "Paste a multi-seasoning email, I split it"),
+            BotCommand("quote", "📄 Open the web quotation builder"),
             BotCommand("samples", "List samples you've raised"),
             BotCommand("edit", "Jump to the draft review to change a field"),
             BotCommand("cancel", "Discard the current draft"),

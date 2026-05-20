@@ -4,7 +4,14 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.13.15"
+BOT_VERSION = "V1.15.0"
+
+# Public URL of the Vercel-hosted quotation builder web app (no trailing
+# slash). When set, /quote and the 📄 menu button hand the rep a clickable
+# button that opens this URL with their sales name pre-filled via ?sales=.
+# Empty value = the URL isn't configured yet; the bot will tell the rep
+# to ask the admin to set it.
+QUOTE_WEB_URL = os.getenv("QUOTE_WEB_URL", "").strip().rstrip("/")
 
 # Margin added to MMS raw_material_cost before showing it to the user (and
 # before logging to the Query audit tab). Covers handling / overhead so

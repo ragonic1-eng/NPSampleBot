@@ -4,7 +4,17 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.15.0"
+BOT_VERSION = "V1.16.0"
+
+# DHL Express + FedEx login credentials used by awb_sync to scrape recent
+# shipments. NEVER commit values to .env — set them on Railway's
+# Variables tab. Empty values disable the corresponding carrier (the
+# AWB sync logs a "skipping" line and continues with whatever's
+# available). See awb_dhl.py / awb_fedex.py.
+DHL_USER = os.getenv("DHL_USER", "").strip()
+DHL_PASS = os.getenv("DHL_PASS", "").strip()
+FEDEX_USER = os.getenv("FEDEX_USER", "").strip()
+FEDEX_PASS = os.getenv("FEDEX_PASS", "").strip()
 
 # Public URL of the Vercel-hosted quotation builder web app (no trailing
 # slash). When set, /quote and the 📄 menu button hand the rep a clickable

@@ -39,6 +39,7 @@ from telegram.ext import (
 )
 
 import ai
+import awb_sync
 import config
 import groq_voice
 import matcher
@@ -620,6 +621,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "",
             "<b>🔧 Admin (hidden from / autocomplete; still work if typed)</b>",
             "/reload — refresh seasoning &amp; customer lists from Sheets",
+            "/syncawb [dry] — run the AWB sync manually (DHL + FedEx → FSL col K)",
             "/diag — diagnostics (auth / sheet visibility)",
             "/whichchat — show this chat's ID (for DAILY_DIGEST_CHAT_ID setup)",
             "/sampleupdate — preview &amp; post today's 6pm digest now",
@@ -633,6 +635,36 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # were retired in V1.7.1. The MMS → Full Sample Listing sync is now
 # automated via the JobQueue scheduled task in main(); see sync_engine.py
 # for the actual fetch+enrich+append logic.
+
+
+async def cmd_syncawb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Manual AWB sync — ragonic-only. Runs once, posts the result.
+
+    /syncawb           → full run, writes matches to the FSL tabs
+    /syncawb dry       → preview run, reports matches without writing
+    """
+    if not await _authorized(update):
+        return
+    if not _is_update_sample_owner(update.effective_user):
+        await send(update, "🛑 This command is admin-only.")
+        return
+    args = (ctx.args or [])
+    dry_run = bool(args and args[0].lower() in ("dry", "preview", "test"))
+    mode = "preview" if dry_run else "live"
+    await send(
+        update,
+        f"📦 <b>Running AWB sync</b> ({mode})…\n\n"
+        "<i>Fetching from DHL + FedEx, matching against the 3 FSL tabs, "
+        "then writing to col K. This may take ~30s.</i>",
+        with_footer=False,
+    )
+    try:
+        result = await awb_sync.run_awb_sync(days_back=14, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        await send(update, f"⚠️ AWB sync crashed: <code>{h(e)}</code>")
+        log.exception("/syncawb crashed")
+        return
+    await send(update, awb_sync.format_result_for_telegram(result))
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -6681,6 +6713,61 @@ async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await send(update, f"❌ Post to group failed: <code>{h(str(e))}</code>")
 
 
+async def _awb_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback for the twice-daily AWB sync.
+
+    Runs awb_sync.run_awb_sync(), logs the result. Failures are caught
+    and logged — a broken DHL scrape must not take down the rest of the
+    bot. The result.errors list bubbles up to the Railway logs so an
+    admin watching the logs can spot a recurring DHL/FedEx breakage.
+    """
+    log.info("awb_sync_job: starting")
+    try:
+        result = await awb_sync.run_awb_sync(days_back=14, dry_run=False)
+    except Exception as e:  # noqa: BLE001
+        log.exception("awb_sync_job crashed: %s", e)
+        return
+    log.info(
+        "awb_sync_job: done · fetched %d (DHL %d + FedEx %d) · "
+        "matched %d · written %d · errors %d",
+        result.dhl_count + result.fedex_count,
+        result.dhl_count, result.fedex_count,
+        result.total_matched, result.total_written, len(result.errors),
+    )
+    for err in result.errors:
+        log.warning("awb_sync_job error: %s", err)
+
+
+async def _schedule_awb_sync(application: Application) -> None:
+    """Set up the twice-daily AWB sync (07:00 + 20:00 SGT, every day).
+
+    The 7am run catches anything shipped overnight; the 8pm run sweeps
+    up what reps shipped during the day. 14-day overlap window in the
+    fetchers means a missed run isn't fatal — the next one re-checks
+    the same period and fills any gaps.
+    """
+    from datetime import time as _time
+    job_queue = application.job_queue
+    if job_queue is None:
+        log.warning("JobQueue not available — AWB sync NOT scheduled.")
+        return
+    sgt = ZoneInfo("Asia/Singapore")
+    # PTB day numbering: 0=Mon … 6=Sun. Empty tuple means all 7 days.
+    job_queue.run_daily(
+        _awb_sync_job,
+        time=_time(hour=7, minute=0, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="awb_sync_morning",
+    )
+    job_queue.run_daily(
+        _awb_sync_job,
+        time=_time(hour=20, minute=0, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="awb_sync_evening",
+    )
+    log.info("awb_sync scheduled: 07:00 + 20:00 SGT, daily")
+
+
 async def _schedule_weekly_mms_sync(application: Application) -> None:
     """Set up the recurring weekday sync job + catch-up if overdue.
 
@@ -6809,6 +6896,7 @@ def main():
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("whichchat", cmd_whichchat))
     app.add_handler(CommandHandler("sampleupdate", cmd_sampleupdate))
+    app.add_handler(CommandHandler("syncawb", cmd_syncawb))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("scan", cmd_scan))
@@ -6855,6 +6943,7 @@ def main():
         await _install_commands(application)
         await _schedule_weekly_mms_sync(application)
         await _schedule_daily_digest(application)
+        await _schedule_awb_sync(application)
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

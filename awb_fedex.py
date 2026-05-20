@@ -165,6 +165,12 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
         .or_(page.locator('input[type="password"]'))
     ).first
 
+    # Even after the cookie banner is dismissed, FedEx's Angular app
+    # takes a beat to re-enable the login form. Wait until the
+    # username input is properly interactive before trying to click —
+    # otherwise we click 'into' a still-animating overlay and lose
+    # the keystrokes.
+    await user_field.wait_for(state="visible", timeout=15_000)
     # Same React-controlled-component fix as DHL: real keyboard events
     # via press_sequentially, otherwise React's onChange doesn't fire
     # and the form validator rejects with "Required".
@@ -296,7 +302,11 @@ async def _dismiss_usercentrics(page) -> None:
                 "FedEx: cookie consent dismissed via Accept button (%r)",
                 name_pattern.pattern,
             )
-            await asyncio.sleep(0.4)
+            # FedEx's bottom banner has a slide-out animation and the
+            # Angular app re-renders the form region after consent is
+            # recorded — both take ~1-2s. Wait it out so the username
+            # field is actually interactive before we try to fill it.
+            await asyncio.sleep(2.5)
             return
         except Exception:  # noqa: BLE001
             continue
@@ -320,7 +330,11 @@ async def _dismiss_usercentrics(page) -> None:
         )
         if accepted:
             log.info("FedEx: cookie consent accepted via UC_UI JS API")
-            await asyncio.sleep(0.4)
+            # FedEx's bottom banner has a slide-out animation and the
+            # Angular app re-renders the form region after consent is
+            # recorded — both take ~1-2s. Wait it out so the username
+            # field is actually interactive before we try to fill it.
+            await asyncio.sleep(2.5)
             return
     except Exception:  # noqa: BLE001
         pass
@@ -359,7 +373,11 @@ async def _dismiss_usercentrics(page) -> None:
         )
         if clicked:
             log.info("FedEx: cookie consent — clicked Accept via shadow-DOM walk")
-            await asyncio.sleep(0.4)
+            # FedEx's bottom banner has a slide-out animation and the
+            # Angular app re-renders the form region after consent is
+            # recorded — both take ~1-2s. Wait it out so the username
+            # field is actually interactive before we try to fill it.
+            await asyncio.sleep(2.5)
             return
     except Exception:  # noqa: BLE001
         pass

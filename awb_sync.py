@@ -66,8 +66,10 @@ class MatchUpdate:
     row_number: int  # 1-indexed sheet row
     awb: str
     carrier: str
-    customer: str  # for the log line only
-    fsl_date_iso: str  # for the log line only
+    customer: str
+    fsl_date_iso: str
+    sales: str = ""   # filled from FSL row — used by the chat update post
+    country: str = ""  # filled from FSL row — used by the chat update post
 
 
 @dataclass
@@ -78,6 +80,9 @@ class SyncResult:
     by_tab: dict[str, dict[str, int]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # Updates that were actually written to the sheet this run. Used to
+    # build the post-sync chat message. Stays empty on dry_run.
+    applied_updates: list[MatchUpdate] = field(default_factory=list)
 
     @property
     def total_matched(self) -> int:
@@ -197,6 +202,8 @@ def build_updates_for_tab(
                 carrier=s.carrier,
                 customer=fsl.get("Customer Name", ""),
                 fsl_date_iso=fsl.get("Sample Date Out", ""),
+                sales=fsl.get("Sales", ""),
+                country=fsl.get("Country", ""),
             ))
             seen_rows.add(row_num)
     return out
@@ -298,6 +305,11 @@ async def run_awb_sync(
                     tab,
                     [(u.row_number, u.awb) for u in updates],
                 )
+                # write_awb_updates is batch + atomic — either every
+                # cell wrote or none did. So when written > 0 we can
+                # safely treat all `updates` as the applied set.
+                if written:
+                    result.applied_updates.extend(updates)
             except Exception as e:  # noqa: BLE001
                 log.warning("write %s failed: %s", tab, e)
                 result.errors.append(f"{tab} write: {e}")
@@ -308,6 +320,100 @@ async def run_awb_sync(
 
 async def _empty_coro() -> list[Shipment]:
     return []
+
+
+def format_update_message(result: SyncResult) -> str | None:
+    """Build the 'AWB Update' message we post to the group chat.
+
+    Used by the scheduled AWB sync job to announce newly-filled AWBs
+    after the run completes. Returns None when there's nothing to
+    announce (no writes happened) — the caller skips the post in
+    that case so we don't spam the chat with empty updates.
+
+    Format (one block per customer-shipment, grouped by rep):
+
+      📦 <b>AWB Update</b> — 2026-05-20 22:00 SGT
+      <i>5 new AWB(s) just filled in from DHL + FedEx</i>
+
+      👤 <b>Adrian</b>
+         • Daiya Food (Middle East) — 8 samples · 19 May
+           AWB Number: <code>871963570184</code>
+
+      👤 <b>Jay</b>
+         • Acme Brand (Vietnam) — 3 samples · 18 May
+           AWB Number: <code>872017312410</code>
+    """
+    if not result.applied_updates:
+        return None
+
+    # Group by (sales, customer, fsl_date_iso, awb). One shipment block
+    # collapses N FSL rows that share all four fields — typical when a
+    # DHL box contained multiple sample bags.
+    groups: dict[tuple[str, str, str, str], dict] = {}
+    for u in result.applied_updates:
+        key = (
+            u.sales or "—",
+            u.customer or "—",
+            u.fsl_date_iso or "",
+            u.awb,
+        )
+        g = groups.setdefault(key, {
+            "sales": u.sales or "—",
+            "customer": u.customer or "—",
+            "country": u.country or "",
+            "fsl_date_iso": u.fsl_date_iso or "",
+            "awb": u.awb,
+            "count": 0,
+        })
+        g["count"] += 1
+
+    # Order: sales A→Z, then most-recent date first within each rep.
+    grouped = list(groups.values())
+    grouped.sort(key=lambda g: (g["sales"].lower(), -_date_sort_key(g["fsl_date_iso"])))
+
+    sgt_now = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime(
+        "%Y-%m-%d %H:%M SGT"
+    )
+    lines = [
+        f"📦 <b>AWB Update</b> — {sgt_now}",
+        f"<i>{len(grouped)} new AWB(s) just filled in from DHL + FedEx</i>",
+    ]
+    current_sales = None
+    for g in grouped:
+        if g["sales"] != current_sales:
+            current_sales = g["sales"]
+            lines.append("")
+            lines.append(f"👤 <b>{_h(current_sales)}</b>")
+        cust = g["customer"]
+        country_tail = f" ({_h(g['country'])})" if g["country"] else ""
+        count = g["count"]
+        date_tail = ""
+        if g["fsl_date_iso"]:
+            try:
+                d = datetime.strptime(g["fsl_date_iso"], "%Y-%m-%d").date()
+                date_tail = " · " + d.strftime("%d %b")
+            except ValueError:
+                date_tail = " · " + g["fsl_date_iso"]
+        sample_word = "samples" if count != 1 else "sample"
+        lines.append(
+            f"   • {_h(cust)}{country_tail} — {count} {sample_word}{date_tail}"
+        )
+        lines.append(f"     AWB Number: <code>{_h(g['awb'])}</code>")
+    return "\n".join(lines)
+
+
+def _date_sort_key(iso: str) -> int:
+    """Best-effort numeric key for descending date sort. Bad dates → 0."""
+    try:
+        return int(iso.replace("-", ""))
+    except ValueError:
+        return 0
+
+
+def _h(s) -> str:
+    """Minimal HTML escape — used by format_update_message."""
+    import html as _html_lib
+    return _html_lib.escape(str(s or ""), quote=False)
 
 
 def format_result_for_telegram(result: SyncResult) -> str:

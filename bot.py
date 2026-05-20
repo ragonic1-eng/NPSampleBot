@@ -6799,10 +6799,12 @@ async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 async def _awb_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """JobQueue callback for the twice-daily AWB sync.
 
-    Runs awb_sync.run_awb_sync(), logs the result. Failures are caught
-    and logged — a broken DHL scrape must not take down the rest of the
-    bot. The result.errors list bubbles up to the Railway logs so an
-    admin watching the logs can spot a recurring DHL/FedEx breakage.
+    Runs awb_sync.run_awb_sync(), logs the result, and posts an 'AWB
+    Update' message to the digest chat if any new AWBs were actually
+    written this run. Skip-post when nothing was written so the chat
+    doesn't get 'Update: 0 new AWBs' noise. Failures are caught and
+    logged — a broken DHL scrape must not take down the rest of the
+    bot.
     """
     log.info("awb_sync_job: starting")
     try:
@@ -6819,6 +6821,32 @@ async def _awb_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     for err in result.errors:
         log.warning("awb_sync_job error: %s", err)
+
+    # Push a follow-up "AWB Update" message to the same chat as the
+    # daily digest, when (a) we wrote at least one new AWB AND (b)
+    # DAILY_DIGEST_CHAT_ID is configured. format_update_message
+    # returns None on no-writes so we skip the post then.
+    msg = awb_sync.format_update_message(result)
+    if not msg:
+        return
+    if not config.DAILY_DIGEST_CHAT_ID:
+        log.info(
+            "awb_sync_job: %d update(s) written but DAILY_DIGEST_CHAT_ID "
+            "not set — skipping chat post",
+            result.total_written,
+        )
+        return
+    try:
+        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
+        await context.bot.send_message(
+            chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML,
+        )
+        log.info(
+            "awb_sync_job: posted AWB update (%d shipment(s)) to chat %s",
+            len(result.applied_updates), chat_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("awb_sync_job: chat post failed: %s", e)
 
 
 async def _schedule_awb_sync(application: Application) -> None:

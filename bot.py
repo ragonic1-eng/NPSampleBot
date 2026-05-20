@@ -6389,6 +6389,20 @@ def _fmt_digest_price(raw: str) -> str:
         return s
 
 
+def _is_hand_carry(awb_value: str) -> bool:
+    """Detect manually-entered hand-carry markers in the AWB cell.
+
+    Reps mark a row as hand-delivered by typing one of these in the AWB
+    column (case + whitespace agnostic). The sync's skip-if-non-empty
+    rule preserves the value across re-runs.
+    """
+    s = (awb_value or "").strip().upper()
+    if not s:
+        return False
+    return s in {"HAND CARRY", "HAND-CARRY", "HANDCARRY", "HC"} or \
+        s.startswith("HAND ")
+
+
 async def _build_daily_digest_body() -> tuple[str, int]:
     """Read all 3 FSL tabs, filter to today's SGT date, build the
     formatted digest body. Returns (html_body, total_sample_count).
@@ -6500,12 +6514,20 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                 # then we join them with "/" so the digest doesn't hide
                 # one. Missing AWBs show as "—" so the reader knows the
                 # data is just unmapped, not that we forgot to fetch.
+                #
+                # Hand-carry samples (rep delivers in person — no DHL/
+                # FedEx record) get a 🚗 badge instead of the AWB code.
+                # Reps mark them by typing 'HAND CARRY' (or 'HC') into
+                # the AWB cell directly; the sync's skip-if-non-empty
+                # rule then preserves it forever.
                 awbs = sorted({
                     (s.get("AWB") or "").strip()
                     for s in samples
                     if (s.get("AWB") or "").strip()
                 })
-                if awbs:
+                if any(_is_hand_carry(a) for a in awbs):
+                    awb_html = " · 🚗 Hand carry"
+                elif awbs:
                     awb_str = "/".join(awbs)
                     awb_html = f" · AWB <code>{h(awb_str)}</code>"
                 else:

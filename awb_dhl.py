@@ -125,6 +125,11 @@ async def fetch_recent_shipments(*, days_back: int = 14) -> list[Shipment]:
             viewport={"width": 1440, "height": 900},
             locale="en-SG",
             timezone_id="Asia/Singapore",
+            # Suppress the "wants to know your location" Chrome prompt
+            # that pops in the headed window — DHL asks for geo on the
+            # login page but it's not required to log in.
+            permissions=[],
+            geolocation=None,
         )
         page = await ctx.new_page()
         try:
@@ -163,13 +168,26 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
         .or_(page.locator('input[type="email"]'))
         .or_(page.locator('input[name*="email" i]'))
     ).first
-    await email_field.fill(user, timeout=8_000)
-
     pw_field = (
         page.get_by_label(re.compile(r"^password$", re.I))
         .or_(page.locator('input[type="password"]'))
     ).first
-    await pw_field.fill(pwd, timeout=8_000)
+
+    # IMPORTANT: use click() + type() instead of fill() — DHL's login
+    # form is a React/MUI controlled component. fill() writes to the
+    # DOM but doesn't trigger React's onChange the way real typing
+    # does, so the form's internal state stays empty and validation
+    # rejects on submit ("Required"). type() with a small delay
+    # dispatches real keydown/keyup events; React picks them up the
+    # same way it picks up a user typing.
+    await email_field.click(timeout=8_000)
+    await email_field.press_sequentially(user, delay=25)
+    await pw_field.click(timeout=8_000)
+    await pw_field.press_sequentially(pwd, delay=25)
+    # Brief pause so DHL's client-side validator clears the "Required"
+    # markers before we click Login — without it, the button click
+    # sometimes lands a frame before React commits the state.
+    await asyncio.sleep(0.3)
 
     log.info("DHL step 4/6: submitting login…")
     login_btn = page.get_by_role("button", name=re.compile(r"^\s*login\s*$", re.I)).first

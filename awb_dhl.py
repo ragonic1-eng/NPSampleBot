@@ -383,10 +383,13 @@ _EXTRACT_JS = r"""
     const ship_date_text = dateMatch ? dateMatch[1] : "";
 
     // 5. The Ship To block — three lines (company, contact, city/country)
-    //    following the literal "Ship To" label. Capture until a blank
-    //    line or the next labelled section.
+    //    following the literal "Ship To" label. The old generic "stop on
+    //    Xxxx Xx" rule was too eager — it matched the company name on
+    //    line 1 and aborted, giving us only one line. New stop list is
+    //    the explicit DHL action-row labels that always follow the
+    //    ship-to block on the card.
     const shipToMatch = text.match(
-      /Ship To\s*\n([\s\S]*?)(?:\n\s*\n|\n[A-Z][a-z]+ [A-Z][a-z]|$)/i
+      /Ship To\s*\n([\s\S]*?)\n\s*(?:Quick View|Print Labels|Create Return Label|Copy|Track|Edit|$)/i
     );
     const ship_to_text = shipToMatch ? shipToMatch[1].trim() : "";
 

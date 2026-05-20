@@ -4,8 +4,7 @@ Phase 1 STUB. Same shape as awb_dhl.py — Phase 2 fills in the Playwright
 login + shipment-list scrape.
 
 When implementing the real version, fill in:
-  - log in via FEDEX_USER / FEDEX_PASS env vars at
-    https://www.fedex.com/secure-login/en-us/#/credentials
+  - log in via FEDEX_USER / FEDEX_PASS env vars at LOGIN_URL (below)
   - navigate to the recent-shipments view
   - read each row's tracking number + recipient + ship date
   - return them as Shipment dataclasses
@@ -20,6 +19,13 @@ from awb_sync import Shipment, cutoff_date
 
 
 log = logging.getLogger("npsamplebot.awb_fedex")
+
+
+# FedEx secure-login URL. The "#/credentials" hash route is the literal
+# username+password screen — landing on /secure-login/ alone drops the
+# user on the FedEx homepage. User-confirmed value.
+LOGIN_URL = "https://www.fedex.com/secure-login/en-us/#/credentials"
+
 
 _TEST_MODE = os.getenv("AWB_TEST_MODE", "0").strip() == "1"
 

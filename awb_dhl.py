@@ -7,8 +7,7 @@ list scrape — that part needs your portal open so I can read the right
 CSS selectors / network responses.
 
 When implementing the real version, fill in:
-  - log in via DHL_USER / DHL_PASS env vars at
-    https://dhlpass.dhl.com/en-sg/login/...
+  - log in via DHL_USER / DHL_PASS env vars at LOGIN_URL (below)
   - navigate to "Shipment History" (or equivalent)
   - read each row's AWB + recipient + ship date
   - return them as Shipment dataclasses
@@ -27,6 +26,22 @@ from awb_sync import Shipment, cutoff_date
 
 
 log = logging.getLogger("npsamplebot.awb_dhl")
+
+
+# Full DHL Express MyDHL+ login URL — Singapore tenant, OIDC flow. The
+# exact URL matters because mydhl.express.dhl rejects the cookie unless
+# the redirect_uri matches the OIDC client registration. User-confirmed
+# value, do not abbreviate or query-string-mangle.
+LOGIN_URL = (
+    "https://dhlpass.dhl.com/en-sg/login/"
+    "?CountryCode=sg"
+    "&LangCode=en"
+    "&client_id=mydhlplus"
+    "&redirect_uri=https://mydhl.express.dhl/index/en/login-redirect.html"
+    "&response_type=code"
+    "&rt=1"
+    "&oidc-auth=true"
+)
 
 
 # Env-var driven test mode. When AWB_TEST_MODE=1, returns a hardcoded

@@ -640,17 +640,21 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_syncawb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Manual AWB sync — ragonic-only. Runs once, posts the result.
 
-    /syncawb           → full run, writes matches to the FSL tabs
-    /syncawb dry       → preview run, reports matches without writing
+    /syncawb           → full run, writes matches + push 'AWB Update' to group
+    /syncawb dry       → preview run, no writes, no group post
+    /syncawb quiet     → full run, write matches, DON'T post to group (admin
+                         reply only — useful when re-running just to backfill
+                         without spamming the chat)
     """
     if not await _authorized(update):
         return
     if not _is_update_sample_owner(update.effective_user):
         await send(update, "🛑 This command is admin-only.")
         return
-    args = (ctx.args or [])
-    dry_run = bool(args and args[0].lower() in ("dry", "preview", "test"))
-    mode = "preview" if dry_run else "live"
+    args = [a.lower() for a in (ctx.args or [])]
+    dry_run = any(a in ("dry", "preview", "test") for a in args)
+    quiet = any(a in ("quiet", "nopost", "silent") for a in args)
+    mode = "preview" if dry_run else ("live (quiet)" if quiet else "live + push")
     await send(
         update,
         f"📦 <b>Running AWB sync</b> ({mode})…\n\n"
@@ -664,7 +668,37 @@ async def cmd_syncawb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send(update, f"⚠️ AWB sync crashed: <code>{h(e)}</code>")
         log.exception("/syncawb crashed")
         return
+    # Reply to the admin with the result summary first.
     await send(update, awb_sync.format_result_for_telegram(result))
+
+    # Also push the 'AWB Update' message to the daily digest chat —
+    # same behaviour as the scheduled job — unless this was a dry run
+    # or the rep asked for 'quiet'. Skip silently if nothing was
+    # written or DAILY_DIGEST_CHAT_ID isn't configured.
+    if dry_run or quiet:
+        return
+    msg = awb_sync.format_update_message(result)
+    if not msg:
+        return  # no carrier matches were written → nothing to announce
+    if not config.DAILY_DIGEST_CHAT_ID:
+        await send(
+            update,
+            "<i>ℹ️ Skipped group post — DAILY_DIGEST_CHAT_ID env var is not "
+            "set on Railway.</i>",
+        )
+        return
+    try:
+        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
+        await ctx.bot.send_message(
+            chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML,
+        )
+        await send(
+            update,
+            f"✅ AWB Update posted to chat <code>{h(config.DAILY_DIGEST_CHAT_ID)}</code>.",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("/syncawb: group post failed")
+        await send(update, f"⚠️ Group post failed: <code>{h(e)}</code>")
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

@@ -975,11 +975,21 @@ async def _load_lastsample_rows(scope: str, mms_name: str = "") -> list[dict]:
     BANGKOK_FSL_TAB to the union — same fix for B-codes which now
     have their own region tab instead of being lumped into Singapore.
 
+    V1.16.0 — wraps the per-tab read in the 90s TTL cache (see
+    sheets._FSL_ROWS_CACHE) so search bursts don't blow through the
+    Sheets API's 60-reads-per-minute quota.
+
     scope='all'  → all reps' samples across all three tabs
     scope='self' → mms_name's samples across all three tabs
+
+    Raises RuntimeError if every tab failed to read (typically
+    Sheets API 429). Caller surfaces a clear retry message to the
+    user instead of silently returning [] which used to look like
+    "no match".
     """
     region_tabs = (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB)
     rows: list[dict] = []
+    failures: list[str] = []
     for tab in region_tabs:
         try:
             if scope == "all":
@@ -990,9 +1000,16 @@ async def _load_lastsample_rows(scope: str, mms_name: str = "") -> list[dict]:
                 )
             rows.extend(part)
         except Exception as e:  # noqa: BLE001
-            # One tab failing shouldn't kill the whole search — log and
-            # keep going with whatever we got from the other tab(s).
             log.warning("_load_lastsample_rows: tab %r read failed: %s", tab, e)
+            failures.append(f"{tab}: {type(e).__name__}")
+    # If ALL tabs failed we deliberately raise so the search handler can
+    # tell the user 'Sheets is rate-limited, try again in a minute'
+    # instead of showing 'no match'.
+    if not rows and failures and len(failures) == len(region_tabs):
+        raise RuntimeError(
+            "All FSL tab reads failed (likely Sheets API rate limit). "
+            "Failures: " + " · ".join(failures)
+        )
     return rows
 
 
@@ -2853,7 +2870,23 @@ async def _run_lastsample_search(
         rows = await _load_lastsample_rows(scope, mms_name)
     except Exception as e:  # noqa: BLE001
         log.exception("lastsample: FSL read failed")
-        await send(update, f"😕 Couldn't read Full Sample Listing: {h(str(e))}", _last_kb(scope))
+        # Detect the common rate-limit case and show a friendlier message
+        # — reps used to interpret silent 'no match' as 'the sample isn't
+        # in the system' and waste time double-checking. Now we tell
+        # them it's a transient quota issue, retry in a moment.
+        err_text = str(e)
+        if "429" in err_text or "Quota exceeded" in err_text or "rate limit" in err_text.lower():
+            msg = (
+                "⏳ <b>Google Sheets rate limit hit</b> — try the same "
+                "search again in 60-90 seconds.\n\n"
+                "<i>This bot reads the Full Sample Listing tabs and "
+                "Google caps reads at 60/minute per user. Multiple "
+                "rapid searches can trip the limit; the next attempt "
+                "after a short wait will succeed.</i>"
+            )
+        else:
+            msg = f"😕 Couldn't read Full Sample Listing: <code>{h(err_text)}</code>"
+        await send(update, msg, _last_kb(scope))
         _re_arm(prev)
         return
 

@@ -253,54 +253,127 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
 
 
 async def _dismiss_usercentrics(page) -> None:
-    """Get the FedEx cookie consent banner out of the way.
+    """Click 'Accept All' on FedEx's Usercentrics cookie banner.
 
-    FedEx uses Usercentrics CMP. The banner is an <aside id=
-    'usercentrics-cmp-ui'> with the controls rendered inside a Shadow
-    DOM. Strategy:
-      1. Try clicking 'Accept All' / 'Allow All' via role+name (Playwright
-         pierces the shadow DOM automatically for role-based queries).
-      2. If the click doesn't land in 2s, just remove the <aside> from
-         the page so it stops intercepting pointer events on the
-         login form. Cookies aren't persisted between automation runs
-         anyway — the banner re-appears next session and we re-nuke it.
+    The banner is an <aside id='usercentrics-cmp-ui'> rendered inside a
+    Shadow DOM. We try multiple strategies in escalating order and
+    return as soon as one succeeds. DOM removal is the absolute last
+    resort because it 'works' visually but doesn't actually accept
+    consent — preferable to fire a real Accept click so cookie state
+    sticks.
+
+    Strategies, in priority order:
+      1. Playwright role-based click (auto-pierces *open* shadow DOMs)
+      2. Usercentrics' official JS API: window.UC_UI.acceptAllConsents()
+      3. Manual shadow-DOM walk + button.click()
+      4. Remove the <aside> so it stops intercepting clicks (so the
+         login can still proceed even if accept itself failed)
     """
-    # Strategy 1: click an accept button if Playwright can find one.
+    # Wait briefly for the banner to actually render — Usercentrics
+    # boots ~500ms after page load. If it never appears, we're done.
     try:
-        accept_btn = (
-            page.get_by_role("button", name=re.compile(r"accept all", re.I))
-            .or_(page.get_by_role("button", name=re.compile(r"allow all", re.I)))
-            .or_(page.get_by_role("button", name=re.compile(r"^accept$", re.I)))
-        ).first
-        await accept_btn.click(timeout=2_000)
-        log.info("FedEx: cookie consent dismissed via Accept button")
-        # Tiny pause so the aside's exit animation completes before we
-        # try to click anything underneath.
-        await asyncio.sleep(0.4)
+        await page.locator(
+            "aside#usercentrics-cmp-ui, #usercentrics-root"
+        ).first.wait_for(state="attached", timeout=5_000)
+    except Exception:  # noqa: BLE001
+        log.info("FedEx: no Usercentrics banner detected (already accepted?)")
         return
+
+    # --- Strategy 1: Playwright role-based click ---
+    for name_pattern in (
+        re.compile(r"^accept all$", re.I),
+        re.compile(r"^allow all$", re.I),
+        re.compile(r"accept all", re.I),
+        re.compile(r"^accept$", re.I),
+    ):
+        try:
+            btn = page.get_by_role("button", name=name_pattern).first
+            await btn.click(timeout=2_500)
+            log.info("FedEx: cookie consent dismissed via Accept button (Playwright)")
+            await asyncio.sleep(0.4)
+            return
+        except Exception:  # noqa: BLE001
+            continue
+
+    # --- Strategy 2: Usercentrics' official JS API ---
+    try:
+        accepted = await page.evaluate(
+            """
+            async () => {
+                if (typeof window.UC_UI === 'undefined') return false;
+                if (typeof window.UC_UI.acceptAllConsents === 'function') {
+                    await window.UC_UI.acceptAllConsents();
+                    if (typeof window.UC_UI.closeCMP === 'function') {
+                        window.UC_UI.closeCMP();
+                    }
+                    return true;
+                }
+                return false;
+            }
+            """
+        )
+        if accepted:
+            log.info("FedEx: cookie consent accepted via UC_UI JS API")
+            await asyncio.sleep(0.4)
+            return
     except Exception:  # noqa: BLE001
         pass
 
-    # Strategy 2: nuke the element. Removes the aside entirely so its
-    # pointer-events: auto subtree stops blocking the username input.
+    # --- Strategy 3: walk the shadow DOM and click manually ---
     try:
-        removed = await page.evaluate("""
+        clicked = await page.evaluate(
+            r"""
             () => {
-                const ids = ["usercentrics-cmp-ui", "usercentrics-root"];
-                let removed = 0;
-                for (const id of ids) {
-                    const el = document.getElementById(id);
-                    if (el) { el.remove(); removed++; }
-                }
-                return removed;
+                const aside = document.getElementById("usercentrics-cmp-ui")
+                              || document.getElementById("usercentrics-root");
+                if (!aside) return false;
+                const accepts = /^(accept all|allow all|accept|i agree)$/i;
+                const walk = (root) => {
+                    if (!root) return false;
+                    const buttons = root.querySelectorAll
+                        ? root.querySelectorAll("button, [role='button']")
+                        : [];
+                    for (const b of buttons) {
+                        const t = (b.textContent || "").trim();
+                        if (accepts.test(t)) { b.click(); return true; }
+                    }
+                    const all = root.querySelectorAll
+                        ? root.querySelectorAll("*")
+                        : [];
+                    for (const el of all) {
+                        if (el.shadowRoot && walk(el.shadowRoot)) return true;
+                    }
+                    return false;
+                };
+                return walk(aside.shadowRoot || aside);
             }
-        """)
-        if removed:
-            log.info("FedEx: removed %d Usercentrics element(s) from DOM", removed)
-        else:
-            log.info("FedEx: no Usercentrics banner found (already accepted?)")
-    except Exception as e:  # noqa: BLE001
-        log.warning("FedEx: couldn't remove Usercentrics banner: %s", e)
+            """
+        )
+        if clicked:
+            log.info("FedEx: cookie consent — clicked Accept inside shadow DOM")
+            await asyncio.sleep(0.4)
+            return
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- Strategy 4: last resort — remove the aside so login can proceed ---
+    log.warning(
+        "FedEx: couldn't trigger Accept All — removing banner from DOM "
+        "as fallback so the login form is unblocked"
+    )
+    try:
+        await page.evaluate(
+            """
+            () => {
+                ["usercentrics-cmp-ui", "usercentrics-root"].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.remove();
+                });
+            }
+            """
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _wait_for_shipments_table(page) -> None:

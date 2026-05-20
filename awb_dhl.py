@@ -142,39 +142,39 @@ async def fetch_recent_shipments(*, days_back: int = 14) -> list[Shipment]:
 async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     """Walk through the login → manage shipments flow and parse the list."""
     # ---- 1. Login page ----
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
+    log.info("DHL step 1/6: loading login page…")
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
     await _dump(page, "01_login_page")
 
-    # Some tenants pop a cookie consent banner BEFORE the form is usable.
-    # Best-effort dismiss; ignore if not there.
+    log.info("DHL step 2/6: checking for cookie banner…")
     await _maybe_accept_cookies(page)
 
-    # The two inputs are labelled "Email Address or Phone Number" and
-    # "Password". Telegram-Playwright's accessible-name locator works
-    # here, and is more durable than CSS class names that DHL might
-    # change between releases.
-    await _fill_first_match(page, [
-        ("label", re.compile(r"email address or phone number", re.I)),
-        ("placeholder", re.compile(r"email", re.I)),
-        ("css", 'input[type="email"]'),
-        ("css", 'input[name*="email" i]'),
-    ], user)
+    log.info("DHL step 3/6: filling credentials…")
+    # Locator.or_() composes selector strategies into a single race —
+    # Playwright resolves whichever matches first, no per-strategy
+    # timeout stacking. Cuts the worst-case wait from ~30s to ~3s.
+    email_field = (
+        page.get_by_label(re.compile(r"email address or phone number", re.I))
+        .or_(page.locator('input[type="email"]'))
+        .or_(page.locator('input[name*="email" i]'))
+    ).first
+    await email_field.fill(user, timeout=8_000)
 
-    await _fill_first_match(page, [
-        ("label", re.compile(r"^password$", re.I)),
-        ("css", 'input[type="password"]'),
-    ], pwd)
+    pw_field = (
+        page.get_by_label(re.compile(r"^password$", re.I))
+        .or_(page.locator('input[type="password"]'))
+    ).first
+    await pw_field.fill(pwd, timeout=8_000)
 
-    # Click "Login". DHL's button is a plain <button> with text "Login".
-    await _click_first_match(page, [
-        ("role", ("button", re.compile(r"^login$", re.I))),
-        ("text", re.compile(r"^\s*login\s*$", re.I)),
-    ])
+    log.info("DHL step 4/6: submitting login…")
+    login_btn = page.get_by_role("button", name=re.compile(r"^\s*login\s*$", re.I)).first
+    await login_btn.click(timeout=8_000)
 
     # Wait for the OIDC redirect chain to land on the MyDHL+ home page.
+    log.info("DHL step 5/6: waiting for post-login redirect…")
     await page.wait_for_url(
         re.compile(r"mydhl\.express\.dhl/.*login=successful", re.I),
-        timeout=60_000,
+        timeout=45_000,
     )
     await _dump(page, "02_post_login_home")
 
@@ -182,8 +182,8 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     await _maybe_accept_cookies(page)
 
     # ---- 2. Manage Shipments → All Shipments ----
-    # Direct-nav is faster + more reliable than driving the dropdown.
-    await page.goto(SHIPMENTS_URL, wait_until="domcontentloaded", timeout=45_000)
+    log.info("DHL step 6/6: opening Manage Shipments…")
+    await page.goto(SHIPMENTS_URL, wait_until="domcontentloaded", timeout=30_000)
     # The list itself is XHR-loaded — wait for at least one shipment row
     # to be visible or 'no shipments' text, whichever appears first.
     await _wait_for_shipments_loaded(page)
@@ -214,26 +214,23 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
 # --------------------------- locator helpers ---------------------------
 
 async def _maybe_accept_cookies(page) -> None:
-    """Click any visible 'Accept all' / 'I agree' cookie consent button.
+    """One-shot click of 'Accept all' if visible, otherwise no-op.
 
-    Defensive — DHL's consent banner is OneTrust on some tenants and
-    a custom banner on others. We try several common patterns and
-    swallow the timeout when none match (i.e. no banner present).
+    Uses Playwright's Locator.or_() to wait for whichever consent
+    button appears first (the OneTrust id is standard across DHL
+    tenants; the role-based fallback covers the custom banner). Single
+    2-second wait — if nothing's there we move on, no fallback chain.
     """
-    patterns = [
-        ("role", ("button", re.compile(r"accept all", re.I))),
-        ("role", ("button", re.compile(r"i agree", re.I))),
-        ("role", ("button", re.compile(r"accept", re.I))),
-        ("css", "#onetrust-accept-btn-handler"),
-        ("css", "button.ot-pc-refuse-all-handler"),  # no, that's reject
-    ]
-    for kind, target in patterns[:4]:  # don't click reject by accident
-        try:
-            await _click_first_match(page, [(kind, target)], timeout=3_000)
-            log.info("DHL: dismissed cookie consent (%s)", target)
-            return
-        except Exception:  # noqa: BLE001
-            continue
+    accept = (
+        page.locator("#onetrust-accept-btn-handler").or_(
+            page.get_by_role("button", name=re.compile(r"accept all", re.I))
+        )
+    ).first
+    try:
+        await accept.click(timeout=2_000)
+        log.info("DHL: cookie consent dismissed")
+    except Exception:  # noqa: BLE001
+        log.info("DHL: no cookie banner visible")
 
 
 async def _fill_first_match(page, strategies: list[tuple], value: str) -> None:
@@ -286,21 +283,18 @@ def _build_locator(page, kind: str, target):
 
 
 async def _wait_for_shipments_loaded(page) -> None:
-    """The shipments list arrives via XHR. Wait for any of the signals
-    that mean the data is ready (or definitively absent)."""
-    candidates = [
-        ("text", re.compile(r"\d{10}")),                  # a 10-digit AWB
-        ("text", re.compile(r"manage my shipments", re.I)),
-        ("text", re.compile(r"no shipments", re.I)),
-    ]
-    for kind, target in candidates:
-        try:
-            loc = _build_locator(page, kind, target)
-            await loc.wait_for(state="visible", timeout=20_000)
-            return
-        except Exception:  # noqa: BLE001
-            continue
-    log.warning("DHL: shipments page didn't show a recognised state in 20s")
+    """Wait until the shipments list is either populated or empty.
+
+    Races a 10-digit AWB anchor (the populated case) against the
+    "no shipments" empty-state text. Single 25-second timeout instead
+    of three sequential 20-second ones.
+    """
+    populated = page.locator("a").filter(has_text=re.compile(r"^\s*\d{10}\s*$")).first
+    empty = page.get_by_text(re.compile(r"no shipments", re.I)).first
+    try:
+        await populated.or_(empty).wait_for(state="visible", timeout=25_000)
+    except Exception:  # noqa: BLE001
+        log.warning("DHL: shipments page didn't show a recognised state in 25s")
 
 
 # --------------------------- DOM extraction JS ---------------------------

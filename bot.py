@@ -3235,6 +3235,7 @@ async def _show_lastsample_results(
         price_str = _fmt_price(r.get("R&D Price") or "")
         customer = (r.get("Customer Name") or "—").strip()
         sales = (r.get("Sales") or "").strip()
+        awb_raw = (r.get("AWB") or "").strip()
 
         # Line 1: number + product name (bold).
         lines.append(f"<b>{i}. {h(name)}</b>")
@@ -3249,6 +3250,15 @@ async def _show_lastsample_results(
         if scope == "all" and sales:
             cust_line += f"  <i>· sent by {h(sales)}</i>"
         lines.append(cust_line)
+        # Line 4: AWB. Same three-state rendering as the digest +
+        # customer view — real tracking number, 🚗 hand-carry marker,
+        # or '—' when the row is still unmapped.
+        if not awb_raw:
+            lines.append("   📦 AWB —")
+        elif _is_hand_carry(awb_raw):
+            lines.append("   🚗 Hand carry")
+        else:
+            lines.append(f"   📦 AWB <code>{h(awb_raw)}</code>")
         # Spacer between results.
         lines.append("")
 
@@ -3378,15 +3388,25 @@ async def _show_customer_samples(
         name = r.get("Product Name") or "—"
         code = r.get("Product Code") or "—"
         price = _fmt_price(r.get("R&D Price") or "")
+        # AWB suffix. The same value the digest shows — real tracking
+        # number, '🚗 Hand carry' marker, or '—' when still unmatched.
+        awb_raw = (r.get("AWB") or "").strip()
+        if not awb_raw:
+            awb_suffix = " · AWB —"
+        elif _is_hand_carry(awb_raw):
+            awb_suffix = " · 🚗 Hand carry"
+        else:
+            awb_suffix = f" · AWB <code>{h(awb_raw)}</code>"
         if scope == "all":
             sales = (r.get("Sales") or "").strip() or "—"
             lines.append(
                 f" {i}. {h(date_str)} · <b>{h(sales)}</b> · {h(name)} · "
-                f"<code>{h(code)}</code> · {h(price)}"
+                f"<code>{h(code)}</code> · {h(price)}{awb_suffix}"
             )
         else:
             lines.append(
-                f" {i}. {h(date_str)} · {h(name)} · <code>{h(code)}</code> · {h(price)}"
+                f" {i}. {h(date_str)} · {h(name)} · <code>{h(code)}</code> · "
+                f"{h(price)}{awb_suffix}"
             )
 
     sync_footer = await _last_sync_footer()

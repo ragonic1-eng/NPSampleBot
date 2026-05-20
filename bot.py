@@ -6415,6 +6415,24 @@ async def _build_daily_digest_body() -> tuple[str, int]:
     today = _today_sgt()
     log.info("daily_digest: building for SGT date %s", today)
 
+    # Load alias map once and reverse it (FSL Customer Name → carrier
+    # label name). Used to show 'SARL HYGIENIX MANUFACTURE COMPANY' in
+    # parens alongside the FSL-side 'Daiya Food'. Multiple aliases per
+    # FSL name are joined with ' / ' on display. Lookup key is lower-
+    # cased to match the carrier name regardless of capitalisation
+    # variations between the alias sheet and the FSL row.
+    try:
+        raw_aliases = await asyncio.to_thread(sheets.load_customer_aliases)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily_digest: alias load failed (continuing): %s", e)
+        raw_aliases = {}
+    reverse_aliases: dict[str, list[str]] = {}
+    for carrier_name, fsl_name in raw_aliases.items():
+        key = (fsl_name or "").strip().lower()
+        if not key or not carrier_name:
+            continue
+        reverse_aliases.setdefault(key, []).append(carrier_name.strip())
+
     # Region order fixed (SG → ID → TH) for predictable scanning.
     region_specs = (
         ("Singapore / Intl", "🇸🇬", sheets.FSL_TAB, True),   # show country
@@ -6506,33 +6524,31 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                 customer_keys.add(f"{label}::{cust_label}")
                 cnt = len(samples)
                 suffix = f" — {cnt} samples" if cnt > 1 else ""
-                # AWB display. The matcher fills every row in the same
-                # customer/date block with the same AWB (one DHL box →
-                # many sample bags), so usually there's one distinct
-                # value. Multiple distinct AWBs would only happen if a
-                # customer got two separate shipments on the same day —
-                # then we join them with "/" so the digest doesn't hide
-                # one. Missing AWBs show as "—" so the reader knows the
-                # data is just unmapped, not that we forgot to fetch.
-                #
-                # Hand-carry samples (rep delivers in person — no DHL/
-                # FedEx record) get a 🚗 badge instead of the AWB code.
-                # Reps mark them by typing 'HAND CARRY' (or 'HC') into
-                # the AWB cell directly; the sync's skip-if-non-empty
-                # rule then preserves it forever.
-                awbs = sorted({
-                    (s.get("AWB") or "").strip()
-                    for s in samples
-                    if (s.get("AWB") or "").strip()
-                })
-                if any(_is_hand_carry(a) for a in awbs):
-                    awb_html = " · 🚗 Hand carry"
-                elif awbs:
-                    awb_str = "/".join(awbs)
-                    awb_html = f" · AWB <code>{h(awb_str)}</code>"
-                else:
-                    awb_html = " · AWB —"
-                lines.append(f"   ▸ {h(cust_label)}{awb_html}{suffix}")
+
+                # Build the parenthesised header parts:
+                #   (FSL Name) (Carrier Name) (Country)
+                # The carrier name appears only when there's a known
+                # alias from the OPS sheet's 'AWB Customer Aliases'
+                # tab (reverse lookup). Country only on regions where
+                # show_country is True (Singapore / Intl).
+                bare_customer = (
+                    samples[0].get("Customer Name") or ""
+                ).strip() or "—"
+                country = (samples[0].get("Country") or "").strip()
+                aliases_for_this = reverse_aliases.get(
+                    bare_customer.lower(), []
+                )
+                header_parts = [f"({h(bare_customer)})"]
+                if aliases_for_this:
+                    carrier_display = " / ".join(aliases_for_this)
+                    header_parts.append(f"({h(carrier_display)})")
+                if show_country and country:
+                    header_parts.append(f"({h(country)})")
+                lines.append(
+                    f"   ▸ {' '.join(header_parts)}{suffix}"
+                )
+
+                # Sample bullets
                 for s in samples:
                     name = (s.get("Product Name") or "—").strip() or "—"
                     code = (s.get("Product Code") or "—").strip() or "—"
@@ -6543,6 +6559,33 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                         f"       • {h(name)} · <code>{h(code)}</code> · "
                         f"{h(qty)} · R&amp;D {h(price)}"
                     )
+
+                # AWB Number on its own line AFTER the samples. The
+                # matcher fills every row in the same customer/date
+                # block with the same AWB (one DHL box → many sample
+                # bags), so usually one distinct value. Multiple
+                # distinct AWBs only happen if a customer got two
+                # separate shipments on the same day — joined with
+                # ' / ' so the digest doesn't silently hide one.
+                # Missing AWBs show as '—' so the reader knows it's
+                # unmapped, not that we forgot to fetch. Hand-carry
+                # samples (rep delivers in person, no DHL/FedEx
+                # record — see _is_hand_carry) render as 🚗 Hand
+                # carry instead of an AWB code.
+                awbs = sorted({
+                    (s.get("AWB") or "").strip()
+                    for s in samples
+                    if (s.get("AWB") or "").strip()
+                })
+                if any(_is_hand_carry(a) for a in awbs):
+                    lines.append("       🚗 Hand carry")
+                elif awbs:
+                    awb_str = " / ".join(awbs)
+                    lines.append(
+                        f"       AWB Number: <code>{h(awb_str)}</code>"
+                    )
+                else:
+                    lines.append("       AWB Number: —")
 
     # Footer summary — at-a-glance "who did the most today."
     if sales_totals:

@@ -2,15 +2,17 @@
 
 Login flow (user-confirmed, May 2026):
   1. GET LOGIN_URL → fill User ID + Password → click LOG IN
-  2. Page lands on fedex.com/en-us/logged-in-home.html and a
-     "Choose your location" modal pops up. Click "Singapore ENGLISH".
-  3. Redirect to fedex.com/en-sg/home.html. Click the username
-     dropdown in the top-right (e.g. "Li Ting"), pick "View all my
-     Shipments".
-  4. Tracking page at fedex.com/fedextracking/ loads asynchronously
-     (5-10s before the table populates).
-  5. Parse each row → tracking number (AWB), recipient company, ship
-     date.
+  2. Page lands on fedex.com/en-sg/home.html (or /en-us/logged-in-home
+     if account hasn't set a location yet). If a "Choose your location"
+     modal pops up, click "Singapore ENGLISH" — but most live accounts
+     have this remembered and the modal never appears.
+  3. Direct-nav to SHIPMENTS_URL (the FedEx Ship Manager all-shipments
+     view). This bypasses the Shipping → Ship Now → Shipments nav
+     dance entirely.
+  4. Read the data grid. Columns: SHIP DATE / RECIPIENT (formatted as
+     "COMPANY, CONTACT" — split on the first comma to get the
+     company) / STATUS / TRACKING ID (the AWB) / SHIPMENT TYPE /
+     REFERENCE.
 
 Returns Shipment dataclasses with carrier='FedEx'. Empty list on any
 failure — never raises (awb_sync's wrapper expects this).
@@ -39,10 +41,13 @@ log = logging.getLogger("npsamplebot.awb_fedex")
 # user on the FedEx homepage. User-confirmed value.
 LOGIN_URL = "https://www.fedex.com/secure-login/en-us/#/credentials"
 
-# Direct URL to the "All my shipments" table. Reachable via the user
-# menu dropdown, but direct-nav is faster + survives layout drift in
-# the home page.
-SHIPMENTS_URL = "https://www.fedex.com/fedextracking/"
+# Direct URL to the FedEx Ship Manager "all shipments" view. The user-
+# friendly path is Shipping menu → Ship Now → Shipments tab in the
+# left rail, but this URL drops us on the same page in one navigation
+# (works on every NPFoods account session — user-confirmed).
+SHIPMENTS_URL = (
+    "https://www.fedex.com/shippingplus/en-sg/shipments-overview/all-shipments"
+)
 
 
 _TEST_MODE = os.getenv("AWB_TEST_MODE", "0").strip() == "1"
@@ -232,14 +237,14 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
 
 
 async def _wait_for_shipments_table(page) -> None:
-    """User said the table needs 5-10s to populate. Wait for any row,
-    or the empty-state, whichever appears first. Generous 30s ceiling."""
-    populated = page.locator("table tbody tr").first
+    """The FedEx Ship Manager grid is XHR-loaded. Wait for either a
+    tracking-id-shaped text node to appear (populated) or the empty-
+    state text. Generous 30s ceiling; 2s settling pause once the
+    first row appears so subsequent XHRs can fill the rest."""
+    populated = page.locator("text=/^\\d{10,14}$/").first
     empty = page.get_by_text(re.compile(r"no shipments", re.I)).first
     try:
         await populated.or_(empty).wait_for(state="visible", timeout=30_000)
-        # Even after the first row appears, FedEx often adds more rows
-        # in subsequent XHRs. Brief settling pause so we catch them.
         await asyncio.sleep(2.0)
     except Exception:  # noqa: BLE001
         log.warning("FedEx: shipments table didn't populate in 30s")
@@ -247,42 +252,118 @@ async def _wait_for_shipments_table(page) -> None:
 
 # --------------------------- DOM extraction JS ---------------------------
 
-# Header-driven extractor. Reads the table's <th> cells, maps header
-# names to indices, then for each <tr> emits a dict keyed by header
-# name. This way we don't hard-code column positions — if FedEx
-# rearranges or the user adds/removes columns via EDIT COLUMNS, the
-# scraper still finds the right cell by name.
+# Multi-strategy extractor. The FedEx Ship Manager grid isn't a plain
+# <table> — it's a React data grid that may use <table>, role="grid",
+# or pure <div>s with class names. We try the three patterns in order
+# and return the first non-empty result.
 #
-# Cell text uses element.innerText (preserves line breaks for multi-
-# line cells like an address block).
+# In all strategies we build a {header_name → value} dict per row so
+# downstream code (Python _find_field) can look fields up by name
+# substring, surviving column reorders or renames.
 _EXTRACT_JS = r"""
 () => {
+  const TRACKING_RE = /^\s*\d{10,14}\s*$/;
+
+  // -- Strategy 1: standard HTML <table> --
   const tables = Array.from(document.querySelectorAll("table"));
-  // Pick the table whose header row contains a 'tracking' label —
-  // FedEx may render auxiliary tables on the same page (filters,
-  // stats etc.), and we want the shipments grid specifically.
-  const table = tables.find(t => {
-    const ths = Array.from(t.querySelectorAll("thead th"));
-    return ths.some(th => /tracking/i.test(th.innerText || ""));
-  });
-  if (!table) return [];
-
-  const ths = Array.from(table.querySelectorAll("thead th"));
-  const headers = ths.map(th => (th.innerText || "").trim());
-
-  const rows = [];
-  const trs = Array.from(table.querySelectorAll("tbody tr"));
-  for (const tr of trs) {
-    const cells = Array.from(tr.querySelectorAll("td"));
-    if (cells.length === 0) continue;
-    const obj = {};
-    for (let i = 0; i < headers.length && i < cells.length; i++) {
-      const key = headers[i] || `col_${i}`;
-      obj[key] = (cells[i].innerText || "").trim();
+  for (const t of tables) {
+    const headers = Array.from(t.querySelectorAll("thead th"))
+      .map(th => (th.innerText || "").trim());
+    if (!headers.some(h => /tracking/i.test(h) || /recipient/i.test(h))) continue;
+    const out = [];
+    const trs = Array.from(t.querySelectorAll("tbody tr"));
+    for (const tr of trs) {
+      const cells = Array.from(tr.querySelectorAll("td"));
+      if (!cells.length) continue;
+      const obj = {};
+      for (let i = 0; i < headers.length && i < cells.length; i++) {
+        obj[headers[i] || ("col_" + i)] = (cells[i].innerText || "").trim();
+      }
+      out.push(obj);
     }
-    rows.push(obj);
+    if (out.length) return out;
   }
-  return rows;
+
+  // -- Strategy 2: ARIA grid --
+  const grids = Array.from(document.querySelectorAll(
+    '[role="grid"], [role="table"]'
+  ));
+  for (const g of grids) {
+    const headers = Array.from(g.querySelectorAll('[role="columnheader"]'))
+      .map(h => (h.innerText || "").trim());
+    if (!headers.some(h => /tracking/i.test(h) || /recipient/i.test(h))) continue;
+    const out = [];
+    const rows = Array.from(g.querySelectorAll('[role="row"]'));
+    for (const r of rows) {
+      const cells = Array.from(
+        r.querySelectorAll('[role="cell"], [role="gridcell"]')
+      );
+      if (!cells.length) continue;
+      const obj = {};
+      for (let i = 0; i < headers.length && i < cells.length; i++) {
+        obj[headers[i] || ("col_" + i)] = (cells[i].innerText || "").trim();
+      }
+      out.push(obj);
+    }
+    if (out.length) return out;
+  }
+
+  // -- Strategy 3: heuristic walk-up from each tracking-id text node --
+  // Find every element whose direct text matches the AWB pattern, then
+  // climb up looking for the row container (heuristic: nearest ancestor
+  // whose innerText also contains a date pattern). Returns raw text
+  // chunks for Python-side parsing.
+  const out3 = [];
+  const all = document.querySelectorAll("*");
+  const seenRows = new Set();
+  for (const el of all) {
+    if (el.children.length) continue;
+    const txt = (el.textContent || "").trim();
+    if (!TRACKING_RE.test(txt)) continue;
+    const awb = txt;
+
+    let row = el;
+    let rowText = "";
+    for (let i = 0; i < 12; i++) {
+      row = row.parentElement;
+      if (!row) break;
+      const rt = row.innerText || "";
+      // Found a container with this row's tracking AND a recipient label
+      // OR a date pattern → that's the row.
+      if (rt.includes(awb) && /\d{4}-\d{2}-\d{2}/.test(rt) && rt.length > 30) {
+        rowText = rt;
+        break;
+      }
+    }
+    if (!rowText) continue;
+    if (seenRows.has(rowText.slice(0, 200))) continue;
+    seenRows.add(rowText.slice(0, 200));
+
+    // Pull ship date — first ISO date in the row text.
+    const dateMatch = rowText.match(/\d{4}-\d{2}-\d{2}/);
+    const ship_date_text = dateMatch ? dateMatch[0] : "";
+
+    // Pull recipient — the FedEx grid renders "COMPANY, CONTACT" as a
+    // single line. Find the first non-date, non-tracking, non-status
+    // line that contains a comma.
+    const lines = rowText.split("\n").map(l => l.trim()).filter(Boolean);
+    let recipient = "";
+    for (const ln of lines) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(ln)) continue;
+      if (TRACKING_RE.test(ln)) continue;
+      if (/^(outbound|inbound|shipment|status)/i.test(ln)) continue;
+      if (ln.length < 5 || ln.length > 200) continue;
+      if (ln.includes(",")) { recipient = ln; break; }
+      if (!recipient && /[A-Z]{3,}/.test(ln)) recipient = ln;
+    }
+
+    out3.push({
+      "Tracking ID": awb,
+      "Recipient": recipient,
+      "Ship Date": ship_date_text,
+    });
+  }
+  return out3;
 }
 """
 
@@ -310,15 +391,19 @@ def _find_field(row: dict, *patterns: str) -> str:
 
 
 def _parse_fedex_date(text: str) -> date | None:
-    """Parse FedEx's many date formats: '6/3/26', '06/03/2026',
-    'Jun 3, 2026', '3 Jun 2026', etc."""
+    """Parse FedEx's many date formats.
+
+    The Ship Manager grid uses ISO (e.g. '2026-05-20'); the older
+    tracking views use US/UK locale formats ('6/3/26', 'Jun 3 2026'
+    etc.). Try ISO first, then a fan of locale variants.
+    """
     if not text:
         return None
     t = text.strip()
-    # Drop non-date prefixes like 'Estimated' / 'On' that FedEx
-    # sometimes prepends.
-    t = re.sub(r"^(estimated|on|by|delivered)\s*", "", t, flags=re.I)
+    t = re.sub(r"^(estimated|on|by|delivered|shipped)\s*", "", t, flags=re.I)
+    # ISO comes first — it's an unambiguous match and the cheap case.
     for fmt in (
+        "%Y-%m-%d",
         "%m/%d/%Y", "%m/%d/%y",
         "%d/%m/%Y", "%d/%m/%y",
         "%B %d, %Y", "%b %d, %Y",
@@ -334,32 +419,48 @@ def _parse_fedex_date(text: str) -> date | None:
 def _row_to_shipment(raw: dict) -> Shipment | None:
     """Convert one parsed table row → Shipment. None on bad data."""
     awb = _find_field(raw, "tracking")
-    awb = re.sub(r"\D", "", awb)  # strip status icons / whitespace
+    awb = re.sub(r"\D", "", awb)  # strip status icons / whitespace / copy icon
     if not re.fullmatch(r"\d{10,14}", awb):
         return None
 
-    # Prefer the recipient COMPANY column if present; fall back to
-    # recipient contact name as the last resort.
-    customer = (
-        _find_field(raw, "recipient", "company")
-        or _find_field(raw, "recipient", "contact")
-        or _find_field(raw, "recipient")
+    # The Ship Manager grid renders recipient as a single cell with the
+    # company name BEFORE the comma and the contact person AFTER, e.g.
+    # "TAKATA KORYO CO LTD, MR NAKANISHI". We split on the first comma
+    # and take the left side as the customer (which is what FSL stores
+    # under "Customer Name"). Fall through to dedicated company /
+    # contact columns if the grid layout changes back to multi-column.
+    raw_recipient = (
+        _find_field(raw, "recipient")
+        or _find_field(raw, "ship", "to")
+        or _find_field(raw, "consignee")
     )
+    customer = ""
+    if raw_recipient:
+        # Strip trailing whitespace / commas; take the part before the
+        # first comma. Handles "COMPANY, CONTACT" and just "COMPANY".
+        customer = raw_recipient.split(",", 1)[0].strip()
+    if not customer:
+        # Last resort: explicit company / contact columns.
+        customer = (
+            _find_field(raw, "recipient", "company")
+            or _find_field(raw, "recipient", "contact")
+        )
     if not customer:
         log.info("FedEx: skipping row with no recipient (awb=%s)", awb)
         return None
 
-    # Prefer an actual ship/created/label date column. If none exists,
-    # back-derive from the scheduled delivery date (typical FedEx
-    # international transit is ~3 days SG → most markets).
+    # Prefer an actual ship-date column (this view has it). If absent,
+    # fall back to label/created/pickup, or back-derive from scheduled
+    # delivery or delivered date (typical SG → destination FedEx
+    # international is ~3 days).
     ship_date = None
     for patterns, offset in [
         (("ship", "date"), 0),
         (("label", "date"), 0),
         (("created",), 0),
         (("pickup",), 0),
-        (("scheduled", "delivery"), -3),  # back-derive
-        (("delivered",), -3),             # back-derive from delivery
+        (("scheduled", "delivery"), -3),
+        (("delivered",), -3),
     ]:
         raw_date = _find_field(raw, *patterns)
         parsed = _parse_fedex_date(raw_date) if raw_date else None
@@ -373,12 +474,11 @@ def _row_to_shipment(raw: dict) -> Shipment | None:
         )
         ship_date = date.today()
 
-    # Best-effort country: not in the visible table, so leave blank.
     return Shipment(
         carrier="FedEx",
         awb=awb,
         recipient_name=customer,
-        recipient_country="",
+        recipient_country="",  # not in the Ship Manager grid
         ship_date=ship_date,
     )
 

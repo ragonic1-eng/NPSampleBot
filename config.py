@@ -4,7 +4,24 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.13.15"
+BOT_VERSION = "V1.16.0"
+
+# DHL Express + FedEx login credentials used by awb_sync to scrape recent
+# shipments. NEVER commit values to .env — set them on Railway's
+# Variables tab. Empty values disable the corresponding carrier (the
+# AWB sync logs a "skipping" line and continues with whatever's
+# available). See awb_dhl.py / awb_fedex.py.
+DHL_USER = os.getenv("DHL_USER", "").strip()
+DHL_PASS = os.getenv("DHL_PASS", "").strip()
+FEDEX_USER = os.getenv("FEDEX_USER", "").strip()
+FEDEX_PASS = os.getenv("FEDEX_PASS", "").strip()
+
+# Public URL of the Vercel-hosted quotation builder web app (no trailing
+# slash). When set, /quote and the 📄 menu button hand the rep a clickable
+# button that opens this URL with their sales name pre-filled via ?sales=.
+# Empty value = the URL isn't configured yet; the bot will tell the rep
+# to ask the admin to set it.
+QUOTE_WEB_URL = os.getenv("QUOTE_WEB_URL", "").strip().rstrip("/")
 
 # Margin added to MMS raw_material_cost before showing it to the user (and
 # before logging to the Query audit tab). Covers handling / overhead so

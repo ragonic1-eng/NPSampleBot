@@ -39,6 +39,7 @@ from telegram.ext import (
 )
 
 import ai
+import awb_sync
 import config
 import groq_voice
 import matcher
@@ -47,6 +48,12 @@ import sheets
 import state
 import vision_scan
 from state import FIELDS, FIELD_LABELS
+
+# Sales names recognised by the Vercel quotation builder (?sales= param).
+# Kept here (not pulled from a module) so bot.py has zero import-time
+# dependency on reportlab — the in-bot Python PDF generator was removed
+# in V1.15.0 when the form moved to the web.
+_QUOTE_SALES_NAMES = ["Alex", "Adrian", "Eric", "Jay", "Rich", "Melissa"]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -462,6 +469,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     menu = [
         [("🔎 Search seasonings", "menu:search")],
         [("💲 Look up product code", "menu:lookup")],
+        [("📄 Build a quotation", "menu:quote")],
         [("👤 My samples (me only)", "menu:lastsample")],
         [("🌐 All reps' samples", "menu:alllastsample")],
     ]
@@ -479,6 +487,80 @@ async def cmd_bulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _authorized(update):
         return
     await _start_bulk(update, ctx)
+
+
+def _resolve_quote_sales_name(user) -> str:
+    """Best-effort map of the Telegram rep to a known sales-person name.
+
+    Used to pre-fill the ?sales=<name> query param when handing out the
+    Vercel quote-builder link. Strategy:
+      1. Authorized-Users tab → MMS Name column → match against the six
+         recognised sales names (Alex, Adrian, Eric, Jay, Rich, Melissa).
+      2. Fall back to the Telegram first name if it matches.
+      3. Return "" if nothing matches → web form just shows an empty
+         dropdown, no harm done.
+    """
+    try:
+        mms_name = sheets.get_user_mms_name(getattr(user, "id", None),
+                                            getattr(user, "username", None))
+    except Exception:
+        mms_name = ""
+    candidates = [mms_name or "", getattr(user, "first_name", "") or ""]
+    for cand in candidates:
+        cand = (cand or "").strip()
+        if not cand:
+            continue
+        for name in _QUOTE_SALES_NAMES:
+            if name.lower() == cand.lower():
+                return name
+            # Some MMS names are full names ("Jay Wong") — match on first token.
+            first = cand.split()[0]
+            if name.lower() == first.lower():
+                return name
+    return ""
+
+
+async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Hand the rep a clickable link to the Vercel quotation web app.
+
+    The form + PDF generation live on Vercel (see quote_web/). The bot's
+    only job here is to deep-link with the rep's sales name pre-filled so
+    the dropdown lands on the right person on page load.
+    """
+    if not await _authorized(update):
+        return
+    if not config.QUOTE_WEB_URL:
+        await send(
+            update,
+            "⚠️ The quotation builder URL isn't configured yet.\n\n"
+            "<b>Admin:</b> deploy the <code>quote_web/</code> folder to "
+            "Vercel (see <code>quote_web/README.md</code>), then set the "
+            "<code>QUOTE_WEB_URL</code> env var on Railway and restart the bot.",
+            kb([[("🏠 Main menu", "menu:home")]]),
+        )
+        return
+    user = update.effective_user
+    sales = _resolve_quote_sales_name(user)
+    sep = "&" if "?" in config.QUOTE_WEB_URL else "?"
+    url = f"{config.QUOTE_WEB_URL}{sep}sales={sales}" if sales else config.QUOTE_WEB_URL
+    body = (
+        "📄 <b>Build a quotation</b>\n\n"
+        "Tap the button below to open the quotation builder. Fill in the "
+        "customer details and product lines, then tap <b>Generate &amp; "
+        "download PDF</b> to save a print-ready A4 file."
+    )
+    if sales:
+        body += f"\n\n<i>Signed-by dropdown pre-filled as: <b>{h(sales)}</b></i>"
+    else:
+        body += (
+            "\n\n<i>I couldn't auto-detect your sales name — pick it from "
+            "the dropdown on the page.</i>"
+        )
+    btns = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Open quotation builder", url=url)],
+        [InlineKeyboardButton("🏠 Main menu", callback_data="menu:home")],
+    ])
+    await send(update, body, btns)
 
 
 async def cmd_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -509,6 +591,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/bulk — paste a multi-seasoning email, I split it for you",
         "/samples — review the requests you've raised",
         "",
+        "<b>Quotations</b>",
+        "/quote — open the web quotation builder (Vercel) in your browser",
+        "",
         "<b>While drafting</b>",
         "/edit — jump back to the review to change any field",
         "/cancel — discard the current draft",
@@ -536,6 +621,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "",
             "<b>🔧 Admin (hidden from / autocomplete; still work if typed)</b>",
             "/reload — refresh seasoning &amp; customer lists from Sheets",
+            "/syncawb [dry] — run the AWB sync manually (DHL + FedEx → FSL col K)",
             "/diag — diagnostics (auth / sheet visibility)",
             "/whichchat — show this chat's ID (for DAILY_DIGEST_CHAT_ID setup)",
             "/sampleupdate — preview &amp; post today's 6pm digest now",
@@ -549,6 +635,70 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # were retired in V1.7.1. The MMS → Full Sample Listing sync is now
 # automated via the JobQueue scheduled task in main(); see sync_engine.py
 # for the actual fetch+enrich+append logic.
+
+
+async def cmd_syncawb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Manual AWB sync — ragonic-only. Runs once, posts the result.
+
+    /syncawb           → full run, writes matches + push 'AWB Update' to group
+    /syncawb dry       → preview run, no writes, no group post
+    /syncawb quiet     → full run, write matches, DON'T post to group (admin
+                         reply only — useful when re-running just to backfill
+                         without spamming the chat)
+    """
+    if not await _authorized(update):
+        return
+    if not _is_update_sample_owner(update.effective_user):
+        await send(update, "🛑 This command is admin-only.")
+        return
+    args = [a.lower() for a in (ctx.args or [])]
+    dry_run = any(a in ("dry", "preview", "test") for a in args)
+    quiet = any(a in ("quiet", "nopost", "silent") for a in args)
+    mode = "preview" if dry_run else ("live (quiet)" if quiet else "live + push")
+    await send(
+        update,
+        f"📦 <b>Running AWB sync</b> ({mode})…\n\n"
+        "<i>Fetching from DHL + FedEx, matching against the 3 FSL tabs, "
+        "then writing to col K. This may take ~30s.</i>",
+        with_footer=False,
+    )
+    try:
+        result = await awb_sync.run_awb_sync(days_back=14, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001
+        await send(update, f"⚠️ AWB sync crashed: <code>{h(e)}</code>")
+        log.exception("/syncawb crashed")
+        return
+    # Reply to the admin with the result summary first.
+    await send(update, awb_sync.format_result_for_telegram(result))
+
+    # Also push the 'AWB Update' message to the daily digest chat —
+    # same behaviour as the scheduled job — unless this was a dry run
+    # or the rep asked for 'quiet'. Skip silently if nothing was
+    # written or DAILY_DIGEST_CHAT_ID isn't configured.
+    if dry_run or quiet:
+        return
+    msg = awb_sync.format_update_message(result)
+    if not msg:
+        return  # no carrier matches were written → nothing to announce
+    if not config.DAILY_DIGEST_CHAT_ID:
+        await send(
+            update,
+            "<i>ℹ️ Skipped group post — DAILY_DIGEST_CHAT_ID env var is not "
+            "set on Railway.</i>",
+        )
+        return
+    try:
+        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
+        await ctx.bot.send_message(
+            chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML,
+        )
+        await send(
+            update,
+            f"✅ AWB Update posted to chat <code>{h(config.DAILY_DIGEST_CHAT_ID)}</code>.",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("/syncawb: group post failed")
+        await send(update, f"⚠️ Group post failed: <code>{h(e)}</code>")
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4859,6 +5009,9 @@ async def _handle_menu_callback(update, ctx, action: str):
     if action == "bulk":
         await _start_bulk(update, ctx)
         return
+    if action == "quote":
+        await cmd_quote(update, ctx)
+        return
     if action == "search":
         # V1.12.0 — browse-only seasoning search (does NOT raise a sample
         # request). Asks region first, then takes free text or a code.
@@ -6270,6 +6423,20 @@ def _fmt_digest_price(raw: str) -> str:
         return s
 
 
+def _is_hand_carry(awb_value: str) -> bool:
+    """Detect manually-entered hand-carry markers in the AWB cell.
+
+    Reps mark a row as hand-delivered by typing one of these in the AWB
+    column (case + whitespace agnostic). The sync's skip-if-non-empty
+    rule preserves the value across re-runs.
+    """
+    s = (awb_value or "").strip().upper()
+    if not s:
+        return False
+    return s in {"HAND CARRY", "HAND-CARRY", "HANDCARRY", "HC"} or \
+        s.startswith("HAND ")
+
+
 async def _build_daily_digest_body() -> tuple[str, int]:
     """Read all 3 FSL tabs, filter to today's SGT date, build the
     formatted digest body. Returns (html_body, total_sample_count).
@@ -6281,6 +6448,24 @@ async def _build_daily_digest_body() -> tuple[str, int]:
     """
     today = _today_sgt()
     log.info("daily_digest: building for SGT date %s", today)
+
+    # Load alias map once and reverse it (FSL Customer Name → carrier
+    # label name). Used to show 'SARL HYGIENIX MANUFACTURE COMPANY' in
+    # parens alongside the FSL-side 'Daiya Food'. Multiple aliases per
+    # FSL name are joined with ' / ' on display. Lookup key is lower-
+    # cased to match the carrier name regardless of capitalisation
+    # variations between the alias sheet and the FSL row.
+    try:
+        raw_aliases = await asyncio.to_thread(sheets.load_customer_aliases)
+    except Exception as e:  # noqa: BLE001
+        log.warning("daily_digest: alias load failed (continuing): %s", e)
+        raw_aliases = {}
+    reverse_aliases: dict[str, list[str]] = {}
+    for carrier_name, fsl_name in raw_aliases.items():
+        key = (fsl_name or "").strip().lower()
+        if not key or not carrier_name:
+            continue
+        reverse_aliases.setdefault(key, []).append(carrier_name.strip())
 
     # Region order fixed (SG → ID → TH) for predictable scanning.
     region_specs = (
@@ -6373,7 +6558,31 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                 customer_keys.add(f"{label}::{cust_label}")
                 cnt = len(samples)
                 suffix = f" — {cnt} samples" if cnt > 1 else ""
-                lines.append(f"   ▸ {h(cust_label)}{suffix}")
+
+                # Build the parenthesised header parts:
+                #   (FSL Name) (Carrier Name) (Country)
+                # The carrier name appears only when there's a known
+                # alias from the OPS sheet's 'AWB Customer Aliases'
+                # tab (reverse lookup). Country only on regions where
+                # show_country is True (Singapore / Intl).
+                bare_customer = (
+                    samples[0].get("Customer Name") or ""
+                ).strip() or "—"
+                country = (samples[0].get("Country") or "").strip()
+                aliases_for_this = reverse_aliases.get(
+                    bare_customer.lower(), []
+                )
+                header_parts = [f"({h(bare_customer)})"]
+                if aliases_for_this:
+                    carrier_display = " / ".join(aliases_for_this)
+                    header_parts.append(f"({h(carrier_display)})")
+                if show_country and country:
+                    header_parts.append(f"({h(country)})")
+                lines.append(
+                    f"   ▸ {' '.join(header_parts)}{suffix}"
+                )
+
+                # Sample bullets
                 for s in samples:
                     name = (s.get("Product Name") or "—").strip() or "—"
                     code = (s.get("Product Code") or "—").strip() or "—"
@@ -6384,6 +6593,33 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                         f"       • {h(name)} · <code>{h(code)}</code> · "
                         f"{h(qty)} · R&amp;D {h(price)}"
                     )
+
+                # AWB Number on its own line AFTER the samples. The
+                # matcher fills every row in the same customer/date
+                # block with the same AWB (one DHL box → many sample
+                # bags), so usually one distinct value. Multiple
+                # distinct AWBs only happen if a customer got two
+                # separate shipments on the same day — joined with
+                # ' / ' so the digest doesn't silently hide one.
+                # Missing AWBs show as '—' so the reader knows it's
+                # unmapped, not that we forgot to fetch. Hand-carry
+                # samples (rep delivers in person, no DHL/FedEx
+                # record — see _is_hand_carry) render as 🚗 Hand
+                # carry instead of an AWB code.
+                awbs = sorted({
+                    (s.get("AWB") or "").strip()
+                    for s in samples
+                    if (s.get("AWB") or "").strip()
+                })
+                if any(_is_hand_carry(a) for a in awbs):
+                    lines.append("       🚗 Hand carry")
+                elif awbs:
+                    awb_str = " / ".join(awbs)
+                    lines.append(
+                        f"       AWB Number: <code>{h(awb_str)}</code>"
+                    )
+                else:
+                    lines.append("       AWB Number: —")
 
     # Footer summary — at-a-glance "who did the most today."
     if sales_totals:
@@ -6594,6 +6830,101 @@ async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await send(update, f"❌ Post to group failed: <code>{h(str(e))}</code>")
 
 
+async def _awb_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback for the twice-daily AWB sync.
+
+    Runs awb_sync.run_awb_sync(), logs the result, and posts an 'AWB
+    Update' message to the digest chat if any new AWBs were actually
+    written this run. Skip-post when nothing was written so the chat
+    doesn't get 'Update: 0 new AWBs' noise. Failures are caught and
+    logged — a broken DHL scrape must not take down the rest of the
+    bot.
+    """
+    log.info("awb_sync_job: starting")
+    try:
+        result = await awb_sync.run_awb_sync(days_back=14, dry_run=False)
+    except Exception as e:  # noqa: BLE001
+        log.exception("awb_sync_job crashed: %s", e)
+        return
+    log.info(
+        "awb_sync_job: done · fetched %d (DHL %d + FedEx %d) · "
+        "matched %d · written %d · errors %d",
+        result.dhl_count + result.fedex_count,
+        result.dhl_count, result.fedex_count,
+        result.total_matched, result.total_written, len(result.errors),
+    )
+    for err in result.errors:
+        log.warning("awb_sync_job error: %s", err)
+
+    # Push a follow-up "AWB Update" message to the same chat as the
+    # daily digest, when (a) we wrote at least one new AWB AND (b)
+    # DAILY_DIGEST_CHAT_ID is configured. format_update_message
+    # returns None on no-writes so we skip the post then.
+    msg = awb_sync.format_update_message(result)
+    if not msg:
+        return
+    if not config.DAILY_DIGEST_CHAT_ID:
+        log.info(
+            "awb_sync_job: %d update(s) written but DAILY_DIGEST_CHAT_ID "
+            "not set — skipping chat post",
+            result.total_written,
+        )
+        return
+    try:
+        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
+        await context.bot.send_message(
+            chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML,
+        )
+        log.info(
+            "awb_sync_job: posted AWB update (%d shipment(s)) to chat %s",
+            len(result.applied_updates), chat_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("awb_sync_job: chat post failed: %s", e)
+
+
+async def _schedule_awb_sync(application: Application) -> None:
+    """Set up the twice-daily AWB sync.
+
+    Schedule (user-specified):
+      • 17:30 SGT daily — first pass, aligned with the 5:30 PM FSL
+        update window. Catches AWBs that became available during the
+        day for FSL rows already on the sheet.
+      • 00:00 SGT daily — overnight catch-up. Picks up AWBs for FSL
+        rows that arrived after the 17:30 pass (e.g. samples added to
+        MMS in the late afternoon, then MMS-synced into the FSL at
+        17:40 — after our 17:30 AWB pass missed them).
+
+    The matcher's skip-if-non-empty rule means re-runs only fill empty
+    AWB cells, so neither time can clobber a previously-written value
+    (real AWB, HAND CARRY marker, anything else manually entered).
+    The 14-day overlap window in the fetchers means a missed run isn't
+    fatal either — the next pass re-checks the same period.
+    """
+    from datetime import time as _time
+    job_queue = application.job_queue
+    if job_queue is None:
+        log.warning("JobQueue not available — AWB sync NOT scheduled.")
+        return
+    sgt = ZoneInfo("Asia/Singapore")
+    # Both runs fire every day (0=Mon … 6=Sun) — DHL/FedEx still
+    # record AWBs on weekends if a rep ships then, and we want the
+    # FSL to be current even when the Mon-Fri digest is off.
+    job_queue.run_daily(
+        _awb_sync_job,
+        time=_time(hour=17, minute=30, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="awb_sync_evening",
+    )
+    job_queue.run_daily(
+        _awb_sync_job,
+        time=_time(hour=0, minute=0, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="awb_sync_overnight",
+    )
+    log.info("awb_sync scheduled: 17:30 + 00:00 SGT, daily")
+
+
 async def _schedule_weekly_mms_sync(application: Application) -> None:
     """Set up the recurring weekday sync job + catch-up if overdue.
 
@@ -6718,9 +7049,11 @@ def main():
     app.add_handler(CommandHandler("reload", cmd_reload))
     app.add_handler(CommandHandler("samples", cmd_samples))
     app.add_handler(CommandHandler("bulk", cmd_bulk))
+    app.add_handler(CommandHandler("quote", cmd_quote))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("whichchat", cmd_whichchat))
     app.add_handler(CommandHandler("sampleupdate", cmd_sampleupdate))
+    app.add_handler(CommandHandler("syncawb", cmd_syncawb))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("scan", cmd_scan))
@@ -6744,6 +7077,7 @@ def main():
         default_cmds = [
             BotCommand("start", "Main menu — new request / bulk / samples"),
             BotCommand("bulk", "Paste a multi-seasoning email, I split it"),
+            BotCommand("quote", "📄 Open the web quotation builder"),
             BotCommand("samples", "List samples you've raised"),
             BotCommand("edit", "Jump to the draft review to change a field"),
             BotCommand("cancel", "Discard the current draft"),
@@ -6766,6 +7100,7 @@ def main():
         await _install_commands(application)
         await _schedule_weekly_mms_sync(application)
         await _schedule_daily_digest(application)
+        await _schedule_awb_sync(application)
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

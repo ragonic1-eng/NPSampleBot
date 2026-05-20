@@ -9,3 +9,4 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 pytesseract==0.3.13
 Pillow==11.0.0
+playwright==1.49.0

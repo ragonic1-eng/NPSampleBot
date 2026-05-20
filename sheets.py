@@ -217,6 +217,10 @@ FSL_HEADER = [
     "Sales", "Customer Name", "Country", "Product Code", "Product Name",
     "Quantity (g)", "Sample Date Out", "Taste describe", "Category",
     "R&D Price",
+    # V1.16.0 — filled by the twice-daily AWB sync (awb_sync.py) from the
+    # DHL Express + FedEx shipping portals. Matched by customer name +
+    # sample date out (±2 days). Initial value on append is "".
+    "AWB",
 ]
 
 # Code-prefix → tab routing. Used by /pp's FSL fallback and by the sync
@@ -253,6 +257,7 @@ FSL_COL_DATE = 6
 FSL_COL_TASTE = 7
 FSL_COL_CATEGORY = 8
 FSL_COL_RD_PRICE = 9
+FSL_COL_AWB = 10
 
 
 def _open_seasoning_master():
@@ -415,10 +420,13 @@ def sort_fsl_by_date(tab: str = FSL_TAB) -> int:
 def append_fsl_rows(rows: list[list[str]], tab: str = FSL_TAB) -> int:
     """Append rows to the bottom of the target FSL tab.
 
-    Each row must already be a 10-element list matching FSL_HEADER. Returns
-    the number of rows actually appended. Header is refreshed if missing.
-    The tab is auto-created if it doesn't yet exist (used by the Indonesia
-    backfill the first time it runs).
+    Each row should match FSL_HEADER's column order. Rows shorter than
+    len(FSL_HEADER) are right-padded with "" (so callers that still hand
+    over 10-element rows from before V1.16.0 keep working — AWB starts
+    empty and gets filled later by awb_sync). Returns the number of rows
+    actually appended. Header is refreshed if missing. The tab is
+    auto-created if it doesn't yet exist (used by the Indonesia backfill
+    the first time it runs).
     """
     if not rows:
         return 0
@@ -428,29 +436,191 @@ def append_fsl_rows(rows: list[list[str]], tab: str = FSL_TAB) -> int:
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=tab, rows=2000, cols=len(FSL_HEADER))
 
-    # Ensure header.
+    # Ensure header. V1.16.0 added a new AWB col to FSL_HEADER — existing
+    # tabs may still have the 10-col layout, so this also widens them.
     first = ws.row_values(1)
     if first != FSL_HEADER:
         if ws.col_count < len(FSL_HEADER):
             ws.add_cols(len(FSL_HEADER) - ws.col_count)
         ws.update(values=[FSL_HEADER], range_name="A1")
 
+    # Pad each row up to the full FSL_HEADER width so callers from before
+    # V1.16.0 (which still produce 10-element rows) keep working.
+    width = len(FSL_HEADER)
+    padded = [list(r) + [""] * (width - len(r)) if len(r) < width else list(r)
+              for r in rows]
+
     # Find the first empty row at the bottom of the existing data.
     existing = ws.get_all_values()
     next_row = max(2, len(existing) + 1)
 
     # Make sure the sheet is tall enough.
-    needed = next_row + len(rows) - 1
+    needed = next_row + len(padded) - 1
     if ws.row_count < needed:
         ws.add_rows(needed - ws.row_count)
 
-    end_col_letter = "J"  # 10th column
+    # _col_letter(11) → "K". Lifted to a helper so future column additions
+    # don't need a fresh end-letter constant each time.
+    end_col_letter = _col_letter(width)
     ws.update(
-        range_name=f"A{next_row}:{end_col_letter}{next_row + len(rows) - 1}",
-        values=rows,
+        range_name=f"A{next_row}:{end_col_letter}{next_row + len(padded) - 1}",
+        values=padded,
         value_input_option="USER_ENTERED",
     )
-    return len(rows)
+    return len(padded)
+
+
+def _col_letter(col_1_indexed: int) -> str:
+    """Convert 1-indexed column number to A1 column letter (1 → 'A', 11 → 'K')."""
+    result = ""
+    n = col_1_indexed
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(ord("A") + rem) + result
+    return result
+
+
+# ---------- AWB customer-name aliases (V1.16.0) ----------
+
+# Tab name on OPS_SHEET_ID. Reps maintain it manually whenever a
+# carrier label name doesn't match the FSL Customer Name (e.g. the
+# DHL waybill says "SARL HYGIENIX MANUFACTURE COMPANY" but in your
+# FSL the customer is "Daiya Food" — same shipment, different
+# label conventions). One row per alias.
+TAB_AWB_ALIASES = "AWB Customer Aliases"
+AWB_ALIAS_HEADER = ["Carrier Name", "FSL Customer Name", "Notes"]
+
+# 10-min TTL cache so the twice-daily sync hits Sheets at most once.
+_AWB_ALIASES_CACHE: dict = {}
+
+
+def load_customer_aliases() -> dict[str, str]:
+    """Return a {carrier_name: fsl_customer_name} mapping from the
+    'AWB Customer Aliases' tab in OPS_SHEET_ID.
+
+    Auto-creates the tab (with the header row + a one-line example
+    comment) the first time it's called against a workbook that
+    doesn't have it yet. Empty mapping returned when the tab exists
+    but contains only the header.
+
+    awb_sync calls this once per sync run and uses it to rewrite each
+    inbound shipment's recipient_name BEFORE the fuzzy matcher runs.
+    Keys are case-preserved here; awb_sync normalises both sides
+    before comparing, so capitalisation in the sheet doesn't matter.
+    """
+    import time as _time
+    now = _time.time()
+    cached = _AWB_ALIASES_CACHE.get("data")
+    if cached and now - cached["ts"] < 600:
+        return cached["map"]
+
+    sh = _open_ops()
+    try:
+        ws = sh.worksheet(TAB_AWB_ALIASES)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TAB_AWB_ALIASES, rows=200, cols=3)
+        ws.update(values=[AWB_ALIAS_HEADER], range_name="A1")
+        # Add a single illustrative example row that's clearly a
+        # placeholder. Reps can delete or overwrite it.
+        ws.update(
+            values=[[
+                "SARL HYGIENIX MANUFACTURE COMPANY",
+                "Daiya Food",
+                "Example — distributor → end customer brand",
+            ]],
+            range_name="A2",
+        )
+        _AWB_ALIASES_CACHE["data"] = {
+            "ts": now,
+            "map": {"SARL HYGIENIX MANUFACTURE COMPANY": "Daiya Food"},
+        }
+        return _AWB_ALIASES_CACHE["data"]["map"]
+
+    rows = ws.get_all_values()
+    result: dict[str, str] = {}
+    for r in rows[1:]:
+        if len(r) < 2:
+            continue
+        carrier = (r[0] or "").strip()
+        fsl = (r[1] or "").strip()
+        if carrier and fsl:
+            result[carrier] = fsl
+    _AWB_ALIASES_CACHE["data"] = {"ts": now, "map": result}
+    return result
+
+
+# ---------- AWB column updates (V1.16.0 — driven by awb_sync.py) ----------
+
+def ensure_awb_column(tab: str = FSL_TAB) -> bool:
+    """Make sure the target FSL tab has the AWB column header in place.
+
+    Idempotent — safe to call before every sync run. Returns True if the
+    sheet was modified (column added or header rewritten), False if the
+    header was already correct. Used by awb_sync so the first run on a
+    pre-V1.16.0 tab self-heals before we try to write AWB cells.
+    """
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        return False
+    first = ws.row_values(1)
+    if first == FSL_HEADER:
+        return False
+    if ws.col_count < len(FSL_HEADER):
+        ws.add_cols(len(FSL_HEADER) - ws.col_count)
+    ws.update(values=[FSL_HEADER], range_name="A1")
+    return True
+
+
+def load_fsl_rows_with_row_numbers(tab: str = FSL_TAB) -> list[dict]:
+    """Like load_fsl_rows_all() but also stamps each dict with `_row` =
+    the 1-indexed row number in the sheet (so an AWB update can target
+    the exact cell). Used by awb_sync's matcher.
+    """
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        return []
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    out: list[dict] = []
+    for i, r in enumerate(values[1:], start=2):
+        padded = r + [""] * (len(FSL_HEADER) - len(r))
+        row = {hdr: restore_mangled_unicode(padded[idx])
+               for idx, hdr in enumerate(FSL_HEADER)}
+        row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
+        row["_row"] = i
+        out.append(row)
+    return out
+
+
+def write_awb_updates(tab: str, updates: list[tuple[int, str]]) -> int:
+    """Write AWB values into the K-column of `tab`.
+
+    `updates` is a list of (row_number, awb) tuples — row_number is the
+    1-indexed sheet row (as returned by load_fsl_rows_with_row_numbers).
+    Empty AWBs are filtered out. Returns the number of cells actually
+    written. Uses a single batch_update call so the whole sync is one
+    Sheets API round-trip regardless of how many rows match.
+    """
+    clean = [(r, awb) for r, awb in updates if (awb or "").strip()]
+    if not clean:
+        return 0
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        return 0
+    awb_col = _col_letter(FSL_COL_AWB + 1)  # "K"
+    body = [
+        {"range": f"{awb_col}{row}", "values": [[awb]]}
+        for row, awb in clean
+    ]
+    ws.batch_update(body, value_input_option="USER_ENTERED")
+    return len(clean)
 
 
 # ---------- /pp query log (audit trail of product price lookups) ----------

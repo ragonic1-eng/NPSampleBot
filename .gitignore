@@ -18,3 +18,5 @@ _*.json
 NPSampleBotSkills/
 SETUP.md
 run.bat
+
+.vercel

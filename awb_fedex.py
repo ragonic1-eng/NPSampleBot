@@ -167,15 +167,22 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
 
     # ---- 2. Fill credentials and click LOG IN ----
     log.info("FedEx step 2/7: filling credentials…")
+    # IMPORTANT: target the actual username field by id / autocomplete
+    # role, NOT a generic input[type="text"]. FedEx's top nav has a
+    # hidden <input type="text" id="search"> that the broader selector
+    # was resolving to → wait_for(visible) loops forever because the
+    # search box is correctly hidden. Confirmed via the live error log:
+    # 34× resolved to <input id="search" class="…js-searchfield"/>.
     user_field = (
-        page.get_by_label(re.compile(r"^user\s*id$", re.I))
-        .or_(page.locator('input[id*="user" i]'))
-        .or_(page.locator('input[name*="user" i]'))
-        .or_(page.locator('input[type="text"]'))
+        page.locator('input#username')
+        .or_(page.locator('input[autocomplete="username"]'))
+        .or_(page.get_by_label(re.compile(r"^user\s*id$", re.I)))
     ).first
     pw_field = (
-        page.get_by_label(re.compile(r"^password$", re.I))
+        page.locator('input#password')
+        .or_(page.locator('input[autocomplete="current-password"]'))
         .or_(page.locator('input[type="password"]'))
+        .or_(page.get_by_label(re.compile(r"^password$", re.I)))
     ).first
 
     # Even after the cookie banner is dismissed, FedEx's Angular app

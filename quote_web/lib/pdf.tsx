@@ -96,8 +96,14 @@ const styles = StyleSheet.create({
   remarkLine: { fontSize: 11, marginBottom: 1.5 * 2.835 },
   remarkBold: { fontFamily: "Helvetica-Bold" },
 
-  // ---- Signature.
-  sigBlock: { marginTop: 4 * 2.835 },
+  // ---- Signature. marginTop:'auto' pushes the block to the bottom of
+  // the Page's flex column — so on short quotations it sits anchored
+  // at the bottom-left instead of floating just below the remarks.
+  // 6mm of bottom padding keeps it clear of the page margin edge.
+  sigBlock: {
+    marginTop: "auto",
+    paddingBottom: 6 * 2.835,
+  },
   sigLine:  { fontSize: 10, marginBottom: 1 },
   sigName:  { fontSize: 10, fontFamily: "Helvetica-Bold", marginTop: 6, marginBottom: 1 },
 });

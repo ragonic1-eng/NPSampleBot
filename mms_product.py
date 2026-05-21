@@ -331,9 +331,15 @@ def _extract_rd_price_from_sample_request(
 ) -> Optional[tuple[float, str]]:
     """On a sampleRequestUpdate page, find the product's row and read its R&D Price cell."""
     soup = BeautifulSoup(html, "html.parser")
+    # Case-insensitive code match — MMS3 stores codes in canonical
+    # upper-case (e.g. 'J-X33A1-06') but reps often type the casing
+    # they see on labels ('J-X33a1-06'). Without this, the R&D price
+    # lookup silently failed for any mixed-case code and the bot
+    # fell back to the FSL "last sampled" value.
+    target_code = (product_code or "").strip().upper()
     for tag in soup.find_all("small"):
         b = tag.find("b")
-        if not (b and b.get_text(strip=True) == product_code):
+        if not (b and b.get_text(strip=True).strip().upper() == target_code):
             continue
         row = tag.find_parent("tr")
         if not row:

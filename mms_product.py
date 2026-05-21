@@ -253,22 +253,32 @@ class MMSProductClient:
             return usd, amount, cur
         return None
 
-    def get_rate_from_usd(self, currency: str) -> Optional[float]:
-        """Return how many `currency` units make up 1 USD per MMS3.
+    def get_rate_to_usd(self, currency: str) -> Optional[float]:
+        """Return how many USD equal 1 unit of `currency` per MMS3.
 
-        Used by the bot's /pp display so IDR / THB reps see the figure
-        MMS3 considers current, not a stale hardcoded rate. Returns
+        e.g. for IDR this is ~0.0000559 (1 IDR ≈ 0.0000559 USD). Returns
         None when MMS3 doesn't list this currency or the rates page
-        couldn't be parsed (caller falls back to the hardcoded rate).
+        couldn't be parsed. Callers should NOT substitute a hardcoded
+        rate — they should show the source value verbatim instead.
         """
         cur = (currency or "").upper()
         if cur == "USD":
             return 1.0
-        rates_to_usd = self._get_rates_to_usd()  # {CUR: USD per 1 CUR}
-        rate_to_usd = rates_to_usd.get(cur)
+        rates_to_usd = self._get_rates_to_usd()
+        return rates_to_usd.get(cur)
+
+    def get_rate_from_usd(self, currency: str) -> Optional[float]:
+        """Return how many `currency` units make up 1 USD per MMS3.
+
+        Inverse of `get_rate_to_usd`. Used by /pp + /lastsample display
+        so IDR / THB reps see figures consistent with MMS3's quotes,
+        not derived from stale hardcoded constants. Returns None when
+        MMS3 doesn't list this currency or the rates page couldn't be
+        parsed — caller must NOT fall back to a hardcoded rate.
+        """
+        rate_to_usd = self.get_rate_to_usd(currency)
         if not rate_to_usd:
             return None
-        # rate_to_usd is "1 CUR = X USD". Inverse: "1 USD = (1 / X) CUR".
         return 1.0 / rate_to_usd
 
     def _get_rates_to_usd(self) -> dict[str, float]:

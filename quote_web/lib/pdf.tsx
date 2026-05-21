@@ -204,12 +204,33 @@ export function QuotePDF({ data, origin }: QuotePDFProps) {
           </View>
         ) : null}
 
-        {/* Remark section */}
+        {/* Remark section.
+            Packaging Size: for the 20Kg / 25Kg carton options we
+            spell out the full carton dimensions + liner spec the
+            customer expects on a quotation. Other packaging
+            choices (bottle, barrel, pack) show the dropdown value
+            as-is. */}
         {data.packagingSize ? (
-          <Text style={styles.remarkLine}>
-            <Text style={styles.remarkBold}>Packaging Size: </Text>
-            {data.packagingSize}
-          </Text>
+          (() => {
+            const isCartonBox =
+              data.packagingSize === "20 KG / BOX" ||
+              data.packagingSize === "25 KG / BOX";
+            if (isCartonBox) {
+              return (
+                <Text style={styles.remarkLine}>
+                  <Text style={styles.remarkBold}>Packaging Size</Text>
+                  {" – 20/25Kg Carton Box (380mm x 290mm x 350mm <H>) "}
+                  with one layers of Polyethylene
+                </Text>
+              );
+            }
+            return (
+              <Text style={styles.remarkLine}>
+                <Text style={styles.remarkBold}>Packaging Size: </Text>
+                {data.packagingSize}
+              </Text>
+            );
+          })()
         ) : null}
         <Text style={styles.remarkLine}>
           <Text style={styles.remarkBold}>Order Lead time</Text>

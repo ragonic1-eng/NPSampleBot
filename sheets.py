@@ -221,6 +221,13 @@ FSL_HEADER = [
     # DHL Express + FedEx shipping portals. Matched by customer name +
     # sample date out (±2 days). Initial value on append is "".
     "AWB",
+    # V1.17.0 — customer mailing address as printed on the DHL Ship-To
+    # label. Captured opportunistically during AWB sync (DHL only — the
+    # FedEx grid doesn't expose full address). Drives the quote_web
+    # form's address auto-fill: when a rep picks a customer in the
+    # quotation builder, this value pre-populates the address textarea.
+    # Latest shipment wins (overwrites on each match).
+    "Customer Address",
 ]
 
 # Code-prefix → tab routing. Used by /pp's FSL fallback and by the sync
@@ -258,6 +265,7 @@ FSL_COL_TASTE = 7
 FSL_COL_CATEGORY = 8
 FSL_COL_RD_PRICE = 9
 FSL_COL_AWB = 10
+FSL_COL_ADDR = 11  # V1.17.0 — Customer Address (col L), filled by AWB sync from DHL ship-to
 
 
 def _open_seasoning_master():
@@ -598,16 +606,33 @@ def load_fsl_rows_with_row_numbers(tab: str = FSL_TAB) -> list[dict]:
     return out
 
 
-def write_awb_updates(tab: str, updates: list[tuple[int, str]]) -> int:
-    """Write AWB values into the K-column of `tab`.
+def write_awb_updates(tab: str, updates: list[tuple[int, str, str]]) -> int:
+    """Write AWB + (optional) Customer Address into K + L of `tab`.
 
-    `updates` is a list of (row_number, awb) tuples — row_number is the
-    1-indexed sheet row (as returned by load_fsl_rows_with_row_numbers).
-    Empty AWBs are filtered out. Returns the number of cells actually
-    written. Uses a single batch_update call so the whole sync is one
-    Sheets API round-trip regardless of how many rows match.
+    `updates` is a list of (row_number, awb, address) triples — row_number
+    is the 1-indexed sheet row (as returned by load_fsl_rows_with_row_numbers).
+    Rows with an empty AWB are skipped entirely. Empty address values are
+    written as no-ops (the L cell is left untouched). Returns the number
+    of rows whose K cell was written. Uses a single batch_update call so
+    the whole sync is one Sheets API round-trip regardless of how many
+    rows match.
+
+    Backwards-compatible at the call-site level: older code that passes
+    2-tuples still works because we degrade gracefully on a short tuple
+    (treating address as empty).
     """
-    clean = [(r, awb) for r, awb in updates if (awb or "").strip()]
+    clean: list[tuple[int, str, str]] = []
+    for u in updates:
+        # Accept (row, awb) for backwards-compat with any caller that
+        # hasn't been updated yet. Tuple-of-three is the new shape.
+        if len(u) == 2:
+            r, awb = u  # type: ignore[misc]
+            addr = ""
+        else:
+            r, awb, addr = u
+        if not (awb or "").strip():
+            continue
+        clean.append((r, awb, (addr or "").strip()))
     if not clean:
         return 0
     sh = _open_seasoning_master()
@@ -615,11 +640,13 @@ def write_awb_updates(tab: str, updates: list[tuple[int, str]]) -> int:
         ws = sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         return 0
-    awb_col = _col_letter(FSL_COL_AWB + 1)  # "K"
-    body = [
-        {"range": f"{awb_col}{row}", "values": [[awb]]}
-        for row, awb in clean
-    ]
+    awb_col = _col_letter(FSL_COL_AWB + 1)   # "K"
+    addr_col = _col_letter(FSL_COL_ADDR + 1)  # "L"
+    body: list[dict] = []
+    for row, awb, addr in clean:
+        body.append({"range": f"{awb_col}{row}", "values": [[awb]]})
+        if addr:
+            body.append({"range": f"{addr_col}{row}", "values": [[addr]]})
     ws.batch_update(body, value_input_option="USER_ENTERED")
     _invalidate_fsl_cache()
     return len(clean)

@@ -32,6 +32,7 @@ const COL_NAME = 4;
 const COL_QTY = 5;
 const COL_DATE = 6;
 const COL_RD_PRICE = 9;
+const COL_ADDR = 11;  // V1.17.0 — Customer Address, filled by AWB sync
 
 export type CustomerSummary = {
   name: string;
@@ -39,6 +40,12 @@ export type CustomerSummary = {
   sales: string;        // most-frequent sales rep
   productCount: number; // unique product codes ever sent
   lastDate: string;     // YYYY-MM-DD of most-recent shipment
+  // Multi-line mailing address pulled from the latest FSL row that has
+  // one. Empty if no shipment to this customer has been address-tagged
+  // yet (e.g. FedEx-only customers, pre-V1.17.0 shipments not yet
+  // backfilled). The quote_web form pre-fills the address textarea
+  // with this value when the rep picks the customer.
+  address: string;
 };
 
 export type ProductSummary = {
@@ -134,7 +141,9 @@ async function loadFromSheet(): Promise<CacheEntry> {
   // cell-by-cell loadCells() that google-spreadsheet was doing.
   const resp = await sheets.spreadsheets.values.batchGet({
     spreadsheetId: SHEET_ID,
-    ranges: FSL_TABS.map((t) => `'${t}'!A:K`),
+    // V1.17.0: bumped from A:K to A:L to pick up the Customer Address
+    // column written by awb_sync from DHL ship-to labels.
+    ranges: FSL_TABS.map((t) => `'${t}'!A:L`),
     valueRenderOption: "UNFORMATTED_VALUE",
     dateTimeRenderOption: "FORMATTED_STRING",
   });
@@ -149,6 +158,12 @@ async function loadFromSheet(): Promise<CacheEntry> {
     salesCounts: Map<string, number>;
     codeSet: Set<string>;
     lastDate: string;
+    // Address from the FSL row with the most-recent ship date that
+    // also has a non-empty address cell. Tracked alongside the
+    // lastDate-for-address (a row may have a later date but no
+    // address — we'd still want the older row's address).
+    address: string;
+    addressDate: string;
   }>();
   const byCustomerKey = new Map<string, Map<string, ProductSummary>>();
 
@@ -172,6 +187,7 @@ async function loadFromSheet(): Promise<CacheEntry> {
       const productName = get(COL_NAME);
       const rdPrice = get(COL_RD_PRICE);
       const isoDate = parseIsoDate(get(COL_DATE));
+      const addr = get(COL_ADDR);
 
       // ----- customer aggregation -----
       let cust = custMap.get(key);
@@ -182,6 +198,8 @@ async function loadFromSheet(): Promise<CacheEntry> {
           salesCounts: new Map(),
           codeSet: new Set(),
           lastDate: "",
+          address: "",
+          addressDate: "",
         };
         custMap.set(key, cust);
       }
@@ -193,6 +211,14 @@ async function loadFromSheet(): Promise<CacheEntry> {
       }
       if (code) cust.codeSet.add(code);
       if (isoDate && isoDate > cust.lastDate) cust.lastDate = isoDate;
+      // Address: keep the value from the row with the most-recent date
+      // that has a non-empty address. A newer row WITHOUT an address
+      // (e.g. FedEx-only shipment) doesn't clobber the older known
+      // value — the rep can still edit it after auto-fill anyway.
+      if (addr && (!cust.address || (isoDate && isoDate > cust.addressDate))) {
+        cust.address = addr;
+        cust.addressDate = isoDate || cust.addressDate;
+      }
 
       // ----- per-customer product aggregation -----
       if (code) {
@@ -235,6 +261,7 @@ async function loadFromSheet(): Promise<CacheEntry> {
       sales: topSales,
       productCount: cust.codeSet.size,
       lastDate: cust.lastDate,
+      address: cust.address,
     });
   }
   // Sort by most-recent activity for the autocomplete.

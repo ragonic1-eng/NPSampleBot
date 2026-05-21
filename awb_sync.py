@@ -57,6 +57,12 @@ class Shipment:
     recipient_name: str   # customer/company name as printed on the label
     recipient_country: str  # ISO country name (best-effort, may be "")
     ship_date: date       # the day the carrier picked the box up
+    # Multi-line mailing address from the carrier label. DHL extracts
+    # this from the Ship-To block (contact + street + city). FedEx
+    # leaves it empty — the FedEx grid view doesn't expose a full
+    # address and drilling into each shipment's detail page would 10x
+    # the scrape time without much payoff for FSL coverage.
+    ship_to_address: str = ""
 
 
 @dataclass
@@ -70,6 +76,7 @@ class MatchUpdate:
     fsl_date_iso: str
     sales: str = ""   # filled from FSL row — used by the chat update post
     country: str = ""  # filled from FSL row — used by the chat update post
+    address: str = ""  # carrier ship-to address, written to FSL col L
 
 
 @dataclass
@@ -197,6 +204,7 @@ def _apply_alias(s: Shipment, aliases_normalized: dict[str, str]) -> Shipment:
             recipient_name=replacement,
             recipient_country=s.recipient_country,
             ship_date=s.ship_date,
+            ship_to_address=s.ship_to_address,
         )
     return s
 
@@ -258,6 +266,7 @@ def build_updates_for_tab(
                 fsl_date_iso=fsl.get("Sample Date Out", ""),
                 sales=fsl.get("Sales", ""),
                 country=fsl.get("Country", ""),
+                address=s.ship_to_address,
             ))
             seen_rows.add(row_num)
     return out
@@ -423,7 +432,7 @@ async def run_awb_sync(
                 written = await asyncio.to_thread(
                     sheets.write_awb_updates,
                     tab,
-                    [(u.row_number, u.awb) for u in all_updates],
+                    [(u.row_number, u.awb, u.address) for u in all_updates],
                 )
                 # write_awb_updates is batch + atomic — either every
                 # cell wrote or none did. When written > 0 the whole

@@ -25,6 +25,11 @@ type CustomerSuggestion = {
   sales: string;
   productCount: number;
   lastDate: string;
+  // V1.17.0 — auto-populated by AWB sync from the carrier's ship-to
+  // label. Empty for customers with no DHL shipment yet (FedEx-only
+  // customers, hand-carry samples). The form pre-fills the address
+  // textarea on customer pick; rep can edit before generating the PDF.
+  address: string;
 };
 type ProductSuggestion = {
   code: string;
@@ -445,16 +450,19 @@ function QuoteBuilder() {
   );
 
   function pickCustomer(c: CustomerSuggestion) {
-    // Fill company name + we leave the customer address blank (FSL
-    // doesn't have addresses — rep types it). Bump 'no products yet'
-    // out of productCacheRef so the next product autocomplete fetches
-    // the fresh customer's products.
+    // Fill company name and pre-fill the address textarea from the
+    // latest DHL ship-to capture (if we have one — see fsl.ts). Address
+    // stays editable so the rep can tweak before generating the PDF.
+    // We DON'T overwrite an address the rep has already typed — they
+    // might have hand-customised it for this specific quote.
     productCacheRef.current.delete(data.companyName);
     setData((d) => ({
       ...d,
       companyName: c.name,
-      // If the rep hasn't typed a quotation title yet, suggest one
-      // based on the customer's typical sales rep activity.
+      customerAddress:
+        d.customerAddress.trim() === "" && c.address
+          ? c.address
+          : d.customerAddress,
     }));
   }
 

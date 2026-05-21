@@ -897,6 +897,18 @@ def _format_price_for_currency(
             return f"USD {s}"
         except ValueError:
             return s
+    # V1.17.x — native passthrough. When the input string's currency
+    # already matches the rep's target currency, return it verbatim
+    # (with a clean normalised prefix). No conversion, no round-trip
+    # through USD that compounds two different rates. Fixes the case
+    # where FSL stores 'IDR 44,575' and the bot was previously
+    # displaying that as 'IDR 50,147 (from IDR 44,575)' to an IDR rep.
+    m = _CURRENCY_PRICE_PARSE_RE.match(s)
+    if m:
+        cur_raw = m.group(1).upper()
+        cur_norm = {"S$": "SGD", "$": "USD", "RM": "MYR"}.get(cur_raw, cur_raw)
+        if cur_norm == target.upper():
+            return f"{cur_norm} {m.group(2)}"
     usd, original = _parse_price_to_usd(s)
     if usd is None:
         return original  # unparseable — show as-is rather than guess

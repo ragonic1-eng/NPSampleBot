@@ -274,6 +274,7 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
     )
 
     shipments: list[Shipment] = []
+    detail_pairs: list[tuple[int, str, str]] = []  # (index, awb, shipment_id)
     for r in rows:
         s = _row_to_shipment(r)
         if s is None:
@@ -281,10 +282,44 @@ async def _scrape(page, user: str, pwd: str, cutoff: date) -> list[Shipment]:
         if s.ship_date < cutoff:
             continue
         shipments.append(s)
+        sid = (r.get("shipment_id") or "").strip()
+        if sid:
+            detail_pairs.append((len(shipments) - 1, s.awb, sid))
     log.info(
         "DHL: %d shipment(s) within %d-day window (cutoff=%s)",
         len(shipments), (date.today() - cutoff).days, cutoff,
     )
+
+    # ---- 4. Enrich each shipment with full address from its detail page ----
+    # The list view only shows company + contact + city/country. The
+    # shipment-detail page exposes the full postal address (street,
+    # building, postal code). Worth ~5s per shipment for the higher
+    # quality data — the quote_web form pre-fill is the only consumer
+    # so far and reps need the full address there.
+    if detail_pairs:
+        log.info(
+            "DHL: fetching detail pages for %d shipment(s) — ~%ds total",
+            len(detail_pairs), 5 * len(detail_pairs),
+        )
+        enriched = 0
+        for idx, awb, sid in detail_pairs:
+            addr = await _fetch_detail_address(page, sid, awb)
+            if addr:
+                # Shipment is a frozen dataclass — rebuild with the
+                # enriched address. Keep the original list-view address
+                # as a fallback when detail extraction fails.
+                old = shipments[idx]
+                shipments[idx] = Shipment(
+                    carrier=old.carrier,
+                    awb=old.awb,
+                    recipient_name=old.recipient_name,
+                    recipient_country=old.recipient_country,
+                    ship_date=old.ship_date,
+                    ship_to_address=addr,
+                )
+                enriched += 1
+        log.info("DHL: enriched %d/%d addresses from detail pages",
+                 enriched, len(detail_pairs))
     return shipments
 
 
@@ -450,12 +485,29 @@ async def _wait_for_shipments_loaded(page) -> None:
 _EXTRACT_JS = r"""
 () => {
   const rows = [];
+  const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
   // 1. Find every potential AWB link (anchor with 10-digit text).
   const awbAnchors = Array.from(document.querySelectorAll("a"))
     .filter(a => /^\s*\d{10}\s*$/.test(a.textContent || ""));
 
   for (const anchor of awbAnchors) {
+    // 1b. Walk up the DOM looking for a UUID in any ancestor's attributes.
+    //     DHL's React render attaches the shipmentId to a data-* attribute
+    //     somewhere up the tree. We need it to navigate directly to the
+    //     detail page (which has the FULL postal address).
+    let shipment_id = "";
+    {
+      let el = anchor;
+      for (let d = 0; d < 12 && el && !shipment_id; d++) {
+        for (const attr of el.attributes || []) {
+          const m = (attr.value || "").match(UUID_RE);
+          if (m) { shipment_id = m[0]; break; }
+        }
+        el = el.parentElement;
+      }
+    }
+
     // 2. Climb to the nearest card-like ancestor. We stop at the first
     //    element that contains both a 'Ship To' label and a date-ish
     //    block, capped at 8 levels to avoid grabbing the whole page.
@@ -492,12 +544,80 @@ _EXTRACT_JS = r"""
     );
     const ship_to_text = shipToMatch ? shipToMatch[1].trim() : "";
 
-    rows.push({ awb, ship_date_text, ship_to_text });
+    rows.push({ awb, ship_date_text, ship_to_text, shipment_id });
   }
 
   return rows;
 }
 """
+
+
+_DETAIL_URL_TEMPLATE = (
+    "https://mydhl.express.dhl/sg/en/manage-shipment-details.html"
+    "#/manageShipmentDetails?shipmentId={sid}"
+)
+
+
+async def _fetch_detail_address(page, shipment_id: str, awb: str) -> str:
+    """Open the shipment-detail page for `shipment_id` and parse the full
+    Ship-To postal address out of it.
+
+    The detail page shows a much richer block than the list view — full
+    street address, city, postal code, country, phone. We keep the
+    company name + everything between it and the phone number; drop the
+    contact-person line at the top (often a name) and the phone at the
+    bottom (not part of postal address). Empty string on any failure
+    so the caller can fall back to the list-view address.
+    """
+    url = _DETAIL_URL_TEMPLATE.format(sid=shipment_id)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        # Detail page hydrates the Ship-To block via XHR; the parent <h1>
+        # "Shipment Details" appears almost immediately but the address
+        # may lag ~1-3 seconds. Wait for the literal "Ship To" label.
+        try:
+            await page.get_by_text(
+                re.compile(r"^Ship To$", re.I), exact=True
+            ).first.wait_for(state="visible", timeout=15_000)
+        except Exception:  # noqa: BLE001
+            pass
+        # Small additional settle wait so all lines under "Ship To" are in.
+        await asyncio.sleep(1.5)
+        text = await page.evaluate("() => document.body.innerText")
+    except Exception as e:  # noqa: BLE001
+        log.warning("DHL detail: navigate/extract failed for AWB %s: %s", awb, e)
+        return ""
+    # Extract everything between "Ship To" and the next labelled section.
+    # VAT/Tax ID or Shipment Details are the most common stops. Be
+    # lenient about line endings — DHL's React render sometimes inserts
+    # extra whitespace.
+    m = re.search(
+        r"Ship To\s*\n([\s\S]+?)\n\s*(?:VAT/Tax ID|Shipment Details|Picked Up)",
+        text,
+    )
+    if not m:
+        log.warning(
+            "DHL detail: 'Ship To' block not parseable for AWB %s "
+            "(detail page length=%d). Skipping.",
+            awb, len(text),
+        )
+        return ""
+    raw_lines = [ln.strip() for ln in m.group(1).split("\n") if ln.strip()]
+    if not raw_lines:
+        return ""
+    # Drop the contact-name line at the top (always has "(Personal Address)"
+    # or "(Business Address)" suffix per DHL's UI). Drop phone lines and
+    # blank-marker lines at the bottom.
+    cleaned: list[str] = []
+    for ln in raw_lines:
+        # Skip the contact-person line (first one with parenthetical).
+        if not cleaned and re.search(r"\(\s*(?:Personal|Business)\s+Address\s*\)", ln, re.I):
+            continue
+        # Skip phone numbers.
+        if re.match(r"^\+?\d[\d\s\-()/]+(?:Extension|x|ext)?", ln):
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned)
 
 
 # --------------------------- row → Shipment ---------------------------

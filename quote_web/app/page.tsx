@@ -76,6 +76,25 @@ function Field({
 }
 
 
+/** Render an ISO YYYY-MM-DD as 'DD Month YYYY' for the PDF + the
+ * 'Will print as:' hint under the date input. Returns the original
+ * string verbatim if it's not parseable (e.g. legacy free-text values
+ * carried over from a saved draft). */
+function formatValidityForDisplay(iso: string): string {
+  if (!iso) return "";
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return iso;  // unrecognised format → leave as-is
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+
 /** Debounce hook — returns a value that lags `value` by `delay` ms. Used
  * by the autocomplete inputs so we don't fire a fetch on every keystroke. */
 function useDebounced<T>(value: T, delay = 250): T {
@@ -103,7 +122,7 @@ function Autocomplete<T extends Record<string, unknown>>({
   placeholder,
   fetcher,
   renderItem,
-  className = "border rounded-md px-3 py-2 text-sm",
+  className = "w-full border rounded-md px-3 py-2 text-sm",
   minChars = 1,
   emptyMessage = "No matches",
   disabledMessage,
@@ -240,11 +259,46 @@ function QuoteBuilder() {
     return match || "";
   }, [params]);
 
+  // Initial state: try localStorage first (refresh recovery), fall
+  // back to a blank form pre-filled with the rep's sales name from
+  // the ?sales=... URL param.
+  const DRAFT_KEY = "npfoods-quote-draft-v1";
   const [data, setData] = useState<QuoteData>(() => blankQuote(initialSales));
+  const [draftRestored, setDraftRestored] = useState(false);
 
-  // If the param resolves after the initial render, sync it once.
+  // Restore draft on mount (effect runs only on client, so window is safe).
   useEffect(() => {
-    if (initialSales && !data.salesPerson) {
+    try {
+      const raw = window.localStorage.getItem(DRAFT_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as QuoteData;
+      // Sanity check — only restore if it looks like a quote.
+      if (parsed && typeof parsed === "object" && Array.isArray(parsed.products)) {
+        setData(parsed);
+        setDraftRestored(true);
+      }
+    } catch {
+      // Malformed draft — ignore.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist every change to localStorage. Debounced via the React
+  // commit boundary — runs after every state-driven re-render, but
+  // that's cheap (JSON.stringify of a few KB).
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
+    } catch {
+      // Quota exceeded or storage disabled — silently ignore. Worst
+      // case the rep loses their draft on refresh, same as before.
+    }
+  }, [data]);
+
+  // If the param resolves after the initial render and no draft was
+  // restored, sync the sales pre-fill from the URL.
+  useEffect(() => {
+    if (initialSales && !data.salesPerson && !draftRestored) {
       setData((d) => ({ ...d, salesPerson: initialSales }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -290,20 +344,41 @@ function QuoteBuilder() {
     patch("quotationTitle", `RE: Quotation for ${t}`);
   }
 
-  // Quick presets for the validity date.
+  // Quick presets for the validity date. Stored as ISO (YYYY-MM-DD)
+  // so the native <input type="date"> can read/write the same field
+  // round-trip; PDF rendering formats it as 'DD Month YYYY'.
   function presetValidity(daysAhead: number) {
-    const dt = new Date(Date.now() + (8 + 24 * daysAhead) * 60 * 60 * 1000);
-    const human = dt.toLocaleDateString("en-GB", {
-      day: "numeric",
-      month: "long",
-      year: "numeric",
-      timeZone: "UTC",
-    });
-    patch("validityDate", human);
+    const sgt = new Date(Date.now() + (8 + 24 * daysAhead) * 60 * 60 * 1000);
+    const iso = sgt.toISOString().slice(0, 10); // YYYY-MM-DD
+    patch("validityDate", iso);
   }
 
   const filename = suggestedFilename(data);
-  const canGenerate = data.products.some((p) => p.name && p.price);
+  // Stricter readiness check: don't let reps download a PDF that's
+  // missing customer-facing essentials. Each missing field surfaces
+  // as a one-line nudge under the Generate button.
+  const missingFields: string[] = [];
+  if (!data.companyName.trim()) missingFields.push("Company name");
+  if (!data.salesPerson) missingFields.push("Sales person");
+  const hasValidProduct = data.products.some(
+    (p) => p.name.trim() && p.price.trim(),
+  );
+  if (!hasValidProduct) missingFields.push("a product with name + price");
+  const canGenerate = missingFields.length === 0;
+
+  // Reset confirm-then-clear. Two-step UX so a stray click doesn't
+  // discard a half-written quote.
+  const [confirmReset, setConfirmReset] = useState(false);
+  function startNewQuote() {
+    setData(blankQuote(initialSales));
+    productCacheRef.current.clear();
+    setConfirmReset(false);
+    setError(null);
+    setDraftRestored(false);
+    try { window.localStorage.removeItem(DRAFT_KEY); } catch {}
+    // Scroll back to top so the rep starts cleanly on the customer block.
+    if (typeof window !== "undefined") window.scrollTo({ top: 0, behavior: "smooth" });
+  }
 
   // ---- Autocomplete fetchers ----
   // Each fetcher hits one of the /api/* routes. JSON shape matches
@@ -418,8 +493,16 @@ function QuoteBuilder() {
       ]);
       const origin =
         typeof window !== "undefined" ? window.location.origin : "";
+      // Bridge: form stores validityDate as ISO (YYYY-MM-DD) so the
+      // native <input type="date"> can round-trip it. The PDF wants
+      // human-readable 'DD Month YYYY'. Convert at render time only;
+      // don't mutate the stored form state.
+      const dataForPdf: QuoteData = {
+        ...data,
+        validityDate: formatValidityForDisplay(data.validityDate),
+      };
       const blob = await pdf(
-        <QuotePDF data={data} origin={origin} />
+        <QuotePDF data={dataForPdf} origin={origin} />
       ).toBlob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -443,14 +526,65 @@ function QuoteBuilder() {
   return (
     <main className="max-w-3xl mx-auto p-4 sm:p-8">
       <header className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">
-          📄 NP Foods — Quotation Builder
-        </h1>
-        <p className="text-sm text-gray-600 mt-1">
-          Fill in the customer details and product lines, then tap{" "}
-          <span className="font-semibold">Generate PDF</span> to download
-          a print-ready A4 quotation.
-        </p>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900">
+              📄 NP Foods — Quotation Builder
+            </h1>
+            <p className="text-sm text-gray-600 mt-1">
+              Fill in the customer details and product lines, then tap{" "}
+              <span className="font-semibold">Generate PDF</span> to download
+              a print-ready A4 quotation.
+            </p>
+          </div>
+          {/* Reset / start-new. Two-tap confirmation so a stray click
+              doesn't wipe a half-finished quote. */}
+          {confirmReset ? (
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={startNewQuote}
+                className="text-xs px-3 py-1.5 rounded-md bg-red-600 text-white font-semibold hover:opacity-90"
+              >
+                Confirm — discard
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmReset(false)}
+                className="text-xs px-3 py-1.5 rounded-md border bg-white hover:bg-gray-100"
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setConfirmReset(true)}
+              className="shrink-0 text-xs px-3 py-1.5 rounded-md border bg-white hover:bg-gray-100"
+              title="Clear the form and start over"
+            >
+              🆕 New quotation
+            </button>
+          )}
+        </div>
+        {/* 'Draft restored' banner — shown for one session after a
+            refresh restored saved state. Lets the rep know that the
+            form ISN'T blank because of a bug, it's their own work. */}
+        {draftRestored && (
+          <div className="mt-3 p-2 rounded-md bg-blue-50 border border-blue-200 text-xs text-blue-800 flex items-center justify-between gap-2">
+            <span>
+              💾 Restored your draft from the last session. Tap{" "}
+              <b>New quotation</b> above to start fresh.
+            </span>
+            <button
+              type="button"
+              onClick={() => setDraftRestored(false)}
+              className="text-blue-700 hover:underline shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
       </header>
 
       {/* ---- Customer block ---- */}
@@ -482,7 +616,7 @@ function QuoteBuilder() {
         <Field label="Customer address" hint="Multi-line supported; line breaks are preserved.">
           <textarea
             rows={3}
-            className="border rounded-md px-3 py-2 text-sm"
+            className="w-full border rounded-md px-3 py-2 text-sm"
             value={data.customerAddress}
             onChange={(e) => patch("customerAddress", e.target.value)}
             placeholder={"No. 268, Ln. 190, Dianyan Rd.,\nYangmei Dist., Taoyuan City 326, Taiwan"}
@@ -491,7 +625,7 @@ function QuoteBuilder() {
 
         <Field label="Customer contact name" hint="The person addressed in the letter, e.g. Mr Tony Cheng">
           <input
-            className="border rounded-md px-3 py-2 text-sm"
+            className="w-full border rounded-md px-3 py-2 text-sm"
             value={data.customerName}
             onChange={(e) => patch("customerName", e.target.value)}
             placeholder="Mr Tony Cheng"
@@ -503,7 +637,7 @@ function QuoteBuilder() {
           hint="Type the topic — I'll auto-prefix 'RE: Quotation for' when you click out of the box."
         >
           <input
-            className="border rounded-md px-3 py-2 text-sm"
+            className="w-full border rounded-md px-3 py-2 text-sm"
             value={data.quotationTitle}
             onChange={(e) => patch("quotationTitle", e.target.value)}
             onBlur={normaliseTitleOnBlur}
@@ -517,7 +651,7 @@ function QuoteBuilder() {
         >
           <textarea
             rows={2}
-            className="border rounded-md px-3 py-2 text-sm"
+            className="w-full border rounded-md px-3 py-2 text-sm"
             value={data.extraComment}
             onChange={(e) => patch("extraComment", e.target.value)}
           />
@@ -609,24 +743,24 @@ function QuoteBuilder() {
                 inputMode="decimal"
               />
             </div>
-            <div className="col-span-9 sm:col-span-2">
+            <div className="col-span-12 sm:col-span-2">
               <label className="text-xs font-medium text-gray-600">MOQ</label>
               <input
-                className="border rounded-md px-2 py-1.5 text-sm w-full"
+                className="w-full border rounded-md px-2 py-1.5 text-sm"
                 value={p.moq}
                 onChange={(e) => patchProduct(i, { moq: e.target.value })}
                 placeholder="1000 Kgs"
               />
             </div>
-            <div className="col-span-3 sm:col-span-12 flex justify-end">
+            <div className="col-span-12 flex justify-end">
               <button
                 type="button"
                 onClick={() => removeProduct(i)}
                 disabled={data.products.length === 1}
-                className="text-xs text-red-600 hover:underline disabled:text-gray-300 disabled:cursor-not-allowed"
+                className="text-xs text-red-600 hover:underline disabled:text-gray-300 disabled:cursor-not-allowed py-1"
                 title={data.products.length === 1 ? "Keep at least one row" : "Remove this row"}
               >
-                ✕ Remove
+                ✕ Remove row
               </button>
             </div>
           </div>
@@ -648,7 +782,7 @@ function QuoteBuilder() {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
           <Field label="Packaging size">
             <select
-              className="border rounded-md px-3 py-2 text-sm bg-white"
+              className="w-full border rounded-md px-3 py-2 text-sm bg-white"
               value={data.packagingSize}
               onChange={(e) => patch("packagingSize", e.target.value)}
             >
@@ -660,7 +794,7 @@ function QuoteBuilder() {
 
           <Field label="Payment term">
             <select
-              className="border rounded-md px-3 py-2 text-sm bg-white"
+              className="w-full border rounded-md px-3 py-2 text-sm bg-white"
               value={data.paymentTerm}
               onChange={(e) => patch("paymentTerm", e.target.value)}
             >
@@ -672,7 +806,7 @@ function QuoteBuilder() {
 
           <Field label="Price basis (incoterm)">
             <select
-              className="border rounded-md px-3 py-2 text-sm bg-white"
+              className="w-full border rounded-md px-3 py-2 text-sm bg-white"
               value={data.incoterm}
               onChange={(e) => patch("incoterm", e.target.value)}
             >
@@ -684,7 +818,7 @@ function QuoteBuilder() {
 
           <Field label="Destination port / city" hint="e.g. Keelung Port">
             <input
-              className="border rounded-md px-3 py-2 text-sm"
+              className="w-full border rounded-md px-3 py-2 text-sm"
               value={data.port}
               onChange={(e) => patch("port", e.target.value)}
               placeholder="Keelung Port"
@@ -692,14 +826,21 @@ function QuoteBuilder() {
           </Field>
         </div>
 
-        <Field label="Quotation validity" hint="Pick a preset or type your own date.">
-          <div className="flex flex-wrap items-center gap-2">
-            <input
-              className="border rounded-md px-3 py-2 text-sm flex-1 min-w-[200px]"
-              value={data.validityDate}
-              onChange={(e) => patch("validityDate", e.target.value)}
-              placeholder="30 June 2026"
-            />
+        <Field
+          label="Quotation validity"
+          hint={
+            data.validityDate
+              ? `Will print as: ${formatValidityForDisplay(data.validityDate)}`
+              : "Pick a date from the calendar or tap a preset below."
+          }
+        >
+          <input
+            type="date"
+            className="w-full border rounded-md px-3 py-2 text-sm"
+            value={data.validityDate}
+            onChange={(e) => patch("validityDate", e.target.value)}
+          />
+          <div className="flex flex-wrap items-center gap-2 mt-2">
             <button type="button" onClick={() => presetValidity(7)}
               className="text-xs px-2 py-1 rounded-md border bg-gray-50 hover:bg-gray-100">
               + 1 week
@@ -732,14 +873,20 @@ function QuoteBuilder() {
           }
         >
           <select
-            className="border rounded-md px-3 py-2 text-sm bg-white"
+            className="w-full border rounded-md px-3 py-2 text-sm bg-white"
             value={data.salesPerson}
             onChange={(e) => patch("salesPerson", e.target.value)}
           >
             <option value="">— pick a name —</option>
-            {SALES_NAMES.map((n) => (
-              <option key={n} value={n}>{n}</option>
-            ))}
+            {SALES_NAMES.map((n) => {
+              const full = SALES_PEOPLE[n]?.fullName ?? n;
+              // Show 'Jay (Jay Wong)' so reps see what their signature
+              // line will actually read on the PDF.
+              const label = full === n ? n : `${n} — ${full}`;
+              return (
+                <option key={n} value={n}>{label}</option>
+              );
+            })}
           </select>
         </Field>
       </section>
@@ -754,12 +901,22 @@ function QuoteBuilder() {
         >
           {busy
             ? "Building PDF…"
-            : canGenerate
-              ? "⬇ Generate & download PDF"
-              : "Add a product with a name and price to enable"}
+            : "⬇ Generate & download PDF"}
         </button>
         <span className="text-xs text-gray-500">{filename}</span>
       </div>
+      {/* Missing-fields list — explicit so reps know exactly what
+          stops the Generate button from working. Hidden when ready. */}
+      {!canGenerate && missingFields.length > 0 && !busy && (
+        <div className="mb-3 p-3 rounded-md bg-amber-50 border border-amber-200 text-sm text-amber-900">
+          <b>Still needed before you can generate:</b>
+          <ul className="list-disc pl-5 mt-1 space-y-0.5">
+            {missingFields.map((m) => (
+              <li key={m}>{m}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       {error ? (
         <div className="mb-10 p-3 rounded-md bg-red-50 border border-red-200 text-sm text-red-800">
           <b>Couldn&apos;t generate PDF:</b> {error}

@@ -105,6 +105,8 @@ function Autocomplete<T extends Record<string, unknown>>({
   renderItem,
   className = "border rounded-md px-3 py-2 text-sm",
   minChars = 1,
+  emptyMessage = "No matches",
+  disabledMessage,
 }: {
   value: string;
   onChange: (s: string) => void;
@@ -114,6 +116,14 @@ function Autocomplete<T extends Record<string, unknown>>({
   renderItem: (item: T) => React.ReactNode;
   className?: string;
   minChars?: number;
+  // Shown when items.length === 0 and !loading — replaces the
+  // default "No matches" so we can explain WHY (e.g. "Pick a
+  // customer first" for the product autocomplete).
+  emptyMessage?: string;
+  // When set, the autocomplete is fully visible but disabled, and
+  // shows this message instead of opening a dropdown. Used when a
+  // prerequisite (like 'customer must be picked first') is unmet.
+  disabledMessage?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState<T[]>([]);
@@ -164,19 +174,27 @@ function Autocomplete<T extends Record<string, unknown>>({
         value={value}
         onChange={(e) => {
           onChange(e.target.value);
-          setOpen(true);
+          if (!disabledMessage) setOpen(true);
         }}
         onFocus={() => setOpen(true)}
         placeholder={placeholder}
         autoComplete="off"
       />
-      {open && (loading || items.length > 0) && (
+      {open && disabledMessage && (
+        // Prerequisite-not-met state. Shown when the autocomplete is
+        // gated on a previous field (e.g. product needs customer).
+        // Italic + grey so it reads as advice, not an error.
+        <div className="absolute z-10 left-0 right-0 mt-1 bg-yellow-50 border border-yellow-200 rounded-md px-3 py-2 text-xs text-yellow-800 italic">
+          {disabledMessage}
+        </div>
+      )}
+      {open && !disabledMessage && (
         <div className="absolute z-10 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-md shadow-lg max-h-72 overflow-auto">
           {loading && (
             <div className="px-3 py-2 text-xs text-gray-500">Searching…</div>
           )}
           {!loading && items.length === 0 && (
-            <div className="px-3 py-2 text-xs text-gray-500">No matches</div>
+            <div className="px-3 py-2 text-xs text-gray-500">{emptyMessage}</div>
           )}
           {items.map((it, i) => (
             <button
@@ -532,6 +550,16 @@ function QuoteBuilder() {
                 fetcher={fetchProductsForCustomer}
                 className="border rounded-md px-2 py-1.5 text-sm w-full"
                 minChars={0}
+                emptyMessage={
+                  data.companyName.trim()
+                    ? `No products in the FSL for ${data.companyName.trim()} yet — type the product name manually.`
+                    : "Type a product name to search."
+                }
+                disabledMessage={
+                  data.companyName.trim()
+                    ? undefined
+                    : "👆 Pick a customer in Company name first — suggestions are based on what you've previously sent them."
+                }
                 renderItem={(pr) => (
                   <div className="flex justify-between gap-3 items-baseline">
                     <span className="flex-1 truncate">

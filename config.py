@@ -74,6 +74,13 @@ DRAFT_TIMEOUT_MINUTES = int(os.getenv("DRAFT_TIMEOUT_MINUTES", "30"))
 # Only visible to the ragonic-gated command, never exposed to other users.
 MMS_USER = os.getenv("MMS_USER", "Alex").strip()
 MMS_PASSWORD = os.getenv("MMS_PASSWORD", "").strip()
+# V1.17.x — Sample Request code the /pp lookup borrows for the Add-Delete
+# probe trick (mms_product._fetch_rd_via_probe_sr). Used only when a code
+# has never been added to any SR and the normal lookup returns nothing.
+# The bot adds the product, scrapes the R&D price, then ALWAYS deletes
+# the row to leave the SR untouched. Pick a stable, rarely-edited SR.
+# Empty string disables the probe fallback entirely.
+MMS_PROBE_SR_CODE = os.getenv("MMS_PROBE_SR_CODE", "J-123J43-001").strip()
 
 # Telegram username (without @) allowed to use /updatesamplelist.
 UPDATE_SAMPLE_OWNER = os.getenv("UPDATE_SAMPLE_OWNER", "ragonic").lstrip("@").lower()

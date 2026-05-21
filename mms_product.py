@@ -41,6 +41,12 @@ class Product:
     name: str
     raw_material_cost_usd: float
     rd_price_usd: Optional[float] = None
+    # V1.17.x — preserve the SR page's native price + currency so /pp
+    # can display the exact figure when the rep's preferred currency
+    # matches the source (no round-trip via USD). For J- codes the SR
+    # row is usually in IDR, for B- codes in THB, for S- codes in USD.
+    rd_price_native_amount: Optional[float] = None
+    rd_price_native_currency: Optional[str] = None
 
 
 class MMSProductClient:
@@ -199,8 +205,17 @@ class MMSProductClient:
             raw_material_cost_usd=float(price_total) if price_total else 0.0,
         )
 
-    def fetch_rd_price(self, code: str) -> Optional[float]:
-        """Scrape the latest sample request page for the R&D Price cell."""
+    def fetch_rd_price(
+        self, code: str
+    ) -> Optional[tuple[float, float, str]]:
+        """Scrape the latest sample request page for the R&D Price cell.
+
+        Returns (usd_value, native_amount, native_currency) so callers can
+        choose to display the native figure exactly (without round-tripping
+        through USD and losing precision). Returns None when no SR page
+        holds a price for this code, or the SR price is in a currency MMS3
+        won't convert (preserves previous behaviour of "no R&D price").
+        """
         payload = {"code": code, "codeOptions": ["d-code", "p-code"]}
         # doFind first to seed search session, then doList to get sreq codes.
         self._post(
@@ -235,8 +250,26 @@ class MMSProductClient:
                     code, sreq_code, cur,
                 )
                 continue
-            return usd
+            return usd, amount, cur
         return None
+
+    def get_rate_from_usd(self, currency: str) -> Optional[float]:
+        """Return how many `currency` units make up 1 USD per MMS3.
+
+        Used by the bot's /pp display so IDR / THB reps see the figure
+        MMS3 considers current, not a stale hardcoded rate. Returns
+        None when MMS3 doesn't list this currency or the rates page
+        couldn't be parsed (caller falls back to the hardcoded rate).
+        """
+        cur = (currency or "").upper()
+        if cur == "USD":
+            return 1.0
+        rates_to_usd = self._get_rates_to_usd()  # {CUR: USD per 1 CUR}
+        rate_to_usd = rates_to_usd.get(cur)
+        if not rate_to_usd:
+            return None
+        # rate_to_usd is "1 CUR = X USD". Inverse: "1 USD = (1 / X) CUR".
+        return 1.0 / rate_to_usd
 
     def _get_rates_to_usd(self) -> dict[str, float]:
         if self._rates_to_usd is not None:
@@ -276,9 +309,15 @@ class MMSProductClient:
         sid = self.find_sid(code)
         product = self.fetch_detail(sid)
         try:
-            product.rd_price_usd = self.fetch_rd_price(code)
+            rd = self.fetch_rd_price(code)
         except Exception as e:  # noqa: BLE001
             log.warning("R&D price lookup failed for %s: %s", code, e)
+            rd = None
+        if rd is not None:
+            usd, native_amount, native_cur = rd
+            product.rd_price_usd = usd
+            product.rd_price_native_amount = native_amount
+            product.rd_price_native_currency = native_cur
         return product
 
 

@@ -269,6 +269,171 @@ class MMSProductClient:
         )
         return None
 
+    def _fetch_rd_via_probe_sr(
+        self, code: str
+    ) -> Optional[tuple[float, float, str]]:
+        """Fallback R&D price lookup via the Add-then-Delete trick.
+
+        Used when `fetch_rd_price` finds no existing sample-request page
+        listing this code (i.e. the product has never been sampled). MMS3
+        only renders R&D price as part of the `addproduct` response on a
+        sampleRequestUpdate.do page — there is no standalone lookup
+        endpoint. So the bot opens a stable "probe" SR, runs the
+        Find → Add dance to make MMS3 emit the price, scrapes the row,
+        then ALWAYS deletes the row to leave the SR untouched.
+
+        Returns (usd, native_amount, native_currency) on success, None on
+        any failure. Cleanup of the probed row is best-effort but logged
+        loudly when it fails so the SR can be inspected manually.
+        """
+        probe_sr = config.MMS_PROBE_SR_CODE
+        if not probe_sr:
+            log.info(
+                "RD probe: no MMS_PROBE_SR_CODE configured — skipping fallback. "
+                "Set it to an SR code (e.g. 'J-123J43-001') to enable.",
+            )
+            return None
+        url = f"{BASE_URL}/master/sampleRequestUpdate.do?code={probe_sr}"
+
+        # GET the probe SR to load form state.
+        r = self._get(url)
+        soup = BeautifulSoup(r.text, "html.parser")
+        form = soup.find("form")
+        if not form:
+            log.warning("RD probe: SR %s has no form", probe_sr)
+            return None
+
+        # Pick the section with the fewest samples — smallest payload and
+        # least chance of touching whatever a rep is concurrently editing.
+        section_n = _pick_smallest_section(r.text)
+        if section_n is None:
+            log.warning("RD probe: SR %s has no usable sections", probe_sr)
+            return None
+        baseline = _count_section_samples(r.text, section_n)
+        log.info(
+            "RD probe: using SR=%s section=%d (baseline samples=%d) to look up %s",
+            probe_sr, section_n, baseline, code,
+        )
+
+        added_idx: Optional[int] = None
+        result: Optional[tuple[float, float, str]] = None
+        try:
+            # Find: server populates the candidate dropdown.
+            payload = _form_payload(form)
+            find_payload = _override(payload, {
+                "command": f"find{section_n}",
+                f"productSearchCode[{section_n}]": code,
+            })
+            r = self._post(url, data=find_payload)
+            # Check that exactly one candidate matched. If none → product
+            # doesn't exist; if multiple → ambiguous, abort to be safe.
+            soup = BeautifulSoup(r.text, "html.parser")
+            opts = []
+            for sel in soup.find_all("select"):
+                if sel.get("name") == f"productSearchCode[{section_n}]":
+                    opts = [
+                        o.get("value", "") for o in sel.find_all("option")
+                        if o.get("value", "")
+                    ]
+                    break
+            real_matches = [o for o in opts if o.upper() == code.upper()]
+            if not real_matches:
+                log.info("RD probe: Find returned no match for %s", code)
+                return None
+
+            # Add: MMS3 renders a new row with the R&D price.
+            form_after_find = soup.find("form")
+            if form_after_find is None:
+                log.warning("RD probe: Find response has no form")
+                return None
+            payload = _form_payload(form_after_find)
+            add_payload = _override(payload, {"command": f"addproduct{section_n}"})
+            r = self._post(url, data=add_payload)
+            after_count = _count_section_samples(r.text, section_n)
+            if after_count != baseline + 1:
+                log.warning(
+                    "RD probe: addproduct didn't add exactly 1 sample "
+                    "(baseline=%d after=%d). Bailing.",
+                    baseline, after_count,
+                )
+                # added_idx stays None — no row to delete
+                return None
+            added_idx = after_count - 1
+
+            # Scrape the price from the new row.
+            extracted = _extract_rd_price_from_sample_request(
+                r.text, code, debug_label=f"{probe_sr}#probe",
+            )
+            if extracted is None:
+                log.warning("RD probe: row added but no price cell parsed")
+            else:
+                amount, cur = extracted
+                usd = amount if cur == "USD" else self._to_usd(amount, cur)
+                if usd is None:
+                    log.warning(
+                        "RD probe: extracted %s %s but MMS3 has no rate to USD",
+                        cur, amount,
+                    )
+                else:
+                    log.info(
+                        "RD probe: success for %s → %s %s (USD %.4f)",
+                        code, cur, f"{amount:,.2f}", usd,
+                    )
+                    result = (usd, amount, cur)
+        finally:
+            # ALWAYS attempt cleanup if we added a row. Multiple retries
+            # on Delete because leaving a stray row in production SRs is
+            # the worst possible outcome — pollutes data the team relies on.
+            if added_idx is not None:
+                self._cleanup_probe_row(url, probe_sr, section_n, added_idx, baseline)
+        return result
+
+    def _cleanup_probe_row(
+        self, url: str, probe_sr: str, section_n: int,
+        added_idx: int, baseline: int,
+    ) -> None:
+        """Delete a probe row from the SR, with retries. Logs loudly on
+        failure so the team can manually inspect the SR."""
+        for attempt in range(3):
+            try:
+                r = self._get(url)
+                soup = BeautifulSoup(r.text, "html.parser")
+                form = soup.find("form")
+                if form is None:
+                    log.error("RD probe cleanup: form not found on attempt %d", attempt)
+                    continue
+                # If the row at the expected index already isn't there,
+                # check if any sample in this section has the wrong count
+                # and stop trying — we don't want to delete the wrong row.
+                current = _count_section_samples(r.text, section_n)
+                if current == baseline:
+                    log.info("RD probe cleanup: SR %s already at baseline", probe_sr)
+                    return
+                payload = _form_payload(form)
+                del_payload = _override(payload, {
+                    "command": f"delete{section_n}_{added_idx}",
+                })
+                self._post(url, data=del_payload)
+                r = self._get(url)
+                final = _count_section_samples(r.text, section_n)
+                if final == baseline:
+                    log.info(
+                        "RD probe cleanup: SR %s restored to baseline=%d",
+                        probe_sr, baseline,
+                    )
+                    return
+                log.warning(
+                    "RD probe cleanup attempt %d: count=%d, expected=%d",
+                    attempt, final, baseline,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("RD probe cleanup attempt %d failed: %s", attempt, e)
+        log.error(
+            "RD PROBE CLEANUP FAILED on SR %s section %d. Sample row %d "
+            "may still be present — inspect manually.",
+            probe_sr, section_n, added_idx,
+        )
+
     def get_rate_to_usd(self, currency: str) -> Optional[float]:
         """Return how many USD equal 1 unit of `currency` per MMS3.
 
@@ -339,12 +504,89 @@ class MMSProductClient:
         except Exception as e:  # noqa: BLE001
             log.warning("R&D price lookup failed for %s: %s", code, e)
             rd = None
+        # V1.17.x — when the normal SR-search path returns nothing (code
+        # has never been added to any sample request), fall back to the
+        # Add-then-Delete probe trick. Disabled when MMS_PROBE_SR_CODE
+        # isn't configured. Audit data suggests this only fires for a
+        # small fraction of /pp lookups so the per-call overhead is fine.
+        if rd is None:
+            try:
+                rd = self._fetch_rd_via_probe_sr(code)
+            except Exception as e:  # noqa: BLE001
+                log.warning("RD probe SR fallback errored for %s: %s", code, e)
         if rd is not None:
             usd, native_amount, native_cur = rd
             product.rd_price_usd = usd
             product.rd_price_native_amount = native_amount
             product.rd_price_native_currency = native_cur
         return product
+
+
+# ---------- form-payload helpers (for the RD probe Add-Delete dance) ----------
+
+def _form_payload(form) -> list[tuple[str, str]]:
+    """Build the (name, value) list that mirrors what the browser would
+    submit for this form. Preserves field order so the server-side state
+    machine (it's a stateful Struts app) sees identical input to the
+    user's browser. Skips button inputs."""
+    out: list[tuple[str, str]] = []
+    for inp in form.find_all(["input", "select", "textarea"]):
+        name = inp.get("name")
+        if not name:
+            continue
+        if inp.name == "input":
+            typ = (inp.get("type") or "text").lower()
+            if typ in ("button", "submit", "reset"):
+                continue
+            if typ == "checkbox":
+                if inp.has_attr("checked"):
+                    out.append((name, inp.get("value", "on")))
+                continue
+            if typ == "radio":
+                if inp.has_attr("checked"):
+                    out.append((name, inp.get("value", "")))
+                continue
+            out.append((name, inp.get("value", "")))
+        elif inp.name == "select":
+            sel = inp.find("option", selected=True)
+            out.append((name, sel.get("value", "") if sel else ""))
+        elif inp.name == "textarea":
+            out.append((name, inp.get_text()))
+    return out
+
+
+def _override(payload: list[tuple[str, str]], kvs: dict[str, str]) -> list[tuple[str, str]]:
+    """Override payload entries by name; append any not previously present."""
+    used: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for k, v in payload:
+        if k in kvs:
+            out.append((k, kvs[k]))
+            used.add(k)
+        else:
+            out.append((k, v))
+    for k, v in kvs.items():
+        if k not in used:
+            out.append((k, v))
+    return out
+
+
+def _count_section_samples(html: str, section_n: int) -> int:
+    """Count how many sample rows exist in sreq1[N] on this page."""
+    return len(set(re.findall(
+        rf"sreq1\[{section_n}\]\.sample\[(\d+)\]\.callId", html,
+    )))
+
+
+def _pick_smallest_section(html: str) -> Optional[int]:
+    """Pick the SR section with the fewest sample rows. Smallest payload,
+    least risk of touching whatever a rep is actively editing."""
+    # Find all section indices present on the page.
+    sections = set(int(s) for s in re.findall(r"sreq1\[(\d+)\]\.", html))
+    if not sections:
+        return None
+    by_count = sorted((_count_section_samples(html, n), n) for n in sections)
+    return by_count[0][1]
 
 
 # ---------- parser helpers ----------

@@ -235,11 +235,23 @@ class MMSProductClient:
             if c not in seen:
                 seen.add(c)
                 ordered.append(c)
+        if not ordered:
+            log.info(
+                "RD price: productSearch for %s returned no sample-request "
+                "codes. Product has no sampling history in MMS3.", code,
+            )
+            return None
+        log.info(
+            "RD price: trying %d SR page(s) for code %s: %s",
+            len(ordered), code, ordered[:10],
+        )
         for sreq_code in ordered:
             r = self._get(
                 f"{BASE_URL}/master/sampleRequestUpdate.do?code={sreq_code}"
             )
-            extracted = _extract_rd_price_from_sample_request(r.text, code)
+            extracted = _extract_rd_price_from_sample_request(
+                r.text, code, debug_label=sreq_code,
+            )
             if extracted is None:
                 continue
             amount, cur = extracted
@@ -251,6 +263,10 @@ class MMSProductClient:
                 )
                 continue
             return usd, amount, cur
+        log.warning(
+            "RD price: code %s not parseable on any of %d SR page(s). "
+            "Falling back to FSL.", code, len(ordered),
+        )
         return None
 
     def get_rate_to_usd(self, currency: str) -> Optional[float]:
@@ -333,13 +349,24 @@ class MMSProductClient:
 
 # ---------- parser helpers ----------
 
-_RD_PRICE_CELL = re.compile(r"^([A-Z]{3})\s*([\d.,]+)$")
+# Loosened in V1.17.x: was anchored at end with `$`, which broke when
+# MMS3 renders the cell with trailing units like 'IDR 44,707 / Kg' or
+# stray whitespace. Now matches at the START of the cell and allows
+# anything after the number — safe because each row only has one
+# "CUR amount" cell (the price), so the first-match wins is correct.
+_RD_PRICE_CELL = re.compile(r"^\s*([A-Z]{3})\s*([\d.,]+(?:\.\d+)?)")
 
 
 def _extract_rd_price_from_sample_request(
-    html: str, product_code: str
+    html: str, product_code: str, *, debug_label: str = ""
 ) -> Optional[tuple[float, str]]:
-    """On a sampleRequestUpdate page, find the product's row and read its R&D Price cell."""
+    """On a sampleRequestUpdate page, find the product's row and read its R&D Price cell.
+
+    `debug_label` is a free-form string (typically the SR code) included
+    in log lines so we can correlate a failure to the specific MMS3
+    page that didn't yield a price. Helps diagnose Jakarta-specific
+    parsing issues without re-running with verbose tracing.
+    """
     soup = BeautifulSoup(html, "html.parser")
     # Case-insensitive code match — MMS3 stores codes in canonical
     # upper-case (e.g. 'J-X33A1-06') but reps often type the casing
@@ -347,15 +374,27 @@ def _extract_rd_price_from_sample_request(
     # lookup silently failed for any mixed-case code and the bot
     # fell back to the FSL "last sampled" value.
     target_code = (product_code or "").strip().upper()
+    # Collect ALL <small><b>X</b></small> codes on this page so a failed
+    # match can log what was actually there — invaluable for diagnosing
+    # codes the bot consistently can't find (the Jakarta J- code
+    # cluster, in particular, fails for reasons we haven't pinned down).
+    all_smallb_codes: list[str] = []
     for tag in soup.find_all("small"):
         b = tag.find("b")
-        if not (b and b.get_text(strip=True).strip().upper() == target_code):
+        if not b:
+            continue
+        b_txt = b.get_text(strip=True).strip()
+        if b_txt:
+            all_smallb_codes.append(b_txt.upper())
+        if b_txt.upper() != target_code:
             continue
         row = tag.find_parent("tr")
         if not row:
             continue
+        cell_texts: list[str] = []
         for td in row.find_all("td"):
             text = td.get_text(" ", strip=True).replace("\xa0", " ").strip()
+            cell_texts.append(text)
             m = _RD_PRICE_CELL.match(text)
             if not m:
                 continue
@@ -367,6 +406,24 @@ def _extract_rd_price_from_sample_request(
             if amount <= 0:
                 continue
             return amount, cur
+        # Code matched but no parseable price cell in the row — log the
+        # row contents so we can teach the regex about whatever format
+        # MMS3 used here. Common Jakarta-side culprits: '/Kg' suffix,
+        # newlines, or the price living on the next row down.
+        log.warning(
+            "RD price match failed: code=%s found in SR=%r but no price "
+            "cell parsed. Row cells: %s",
+            target_code, debug_label, cell_texts,
+        )
+    # No <small><b>CODE</b></small> matched on this page. Log what codes
+    # we DID find so we can spot Jakarta-side oddities (different
+    # casing, parent-vs-variant codes, alternate HTML structure).
+    if all_smallb_codes:
+        log.info(
+            "RD price: code %s not on SR=%r. Page had %d code tag(s): %s",
+            target_code, debug_label,
+            len(all_smallb_codes), all_smallb_codes[:20],
+        )
     return None
 
 

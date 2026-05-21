@@ -72,7 +72,14 @@ function jwtClient(): JWT {
   return new JWT({
     email: creds.client_email,
     key: creds.private_key,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    // Drive scope needed in addition to spreadsheets — google-spreadsheet
+    // calls the Drive API for sheet metadata (loadInfo) and was 403ing
+    // with just the spreadsheets scope. Both are readonly so this only
+    // grants the service account read-only access to whatever it can see.
+    scopes: [
+      "https://www.googleapis.com/auth/spreadsheets.readonly",
+      "https://www.googleapis.com/auth/drive.readonly",
+    ],
   });
 }
 

@@ -18,7 +18,17 @@ export const PAYMENT_OPTIONS = [
   "TT 60 DAYS",
 ] as const;
 
-export const INCOTERM_OPTIONS = ["EXWORK", "CFR", "CIF", "FOB"] as const;
+// Shipping incoterms. Order from least → most carriage-responsibility,
+// then alphabetical within tier. User-curated set; matches what reps
+// actually quote on.
+export const INCOTERM_OPTIONS = [
+  "EXW",
+  "FOB",
+  "CFR",
+  "CIF",
+  "DAP",
+  "DDP",
+] as const;
 
 export const CURRENCY_OPTIONS = ["USD", "SGD"] as const;
 export type Currency = (typeof CURRENCY_OPTIONS)[number];

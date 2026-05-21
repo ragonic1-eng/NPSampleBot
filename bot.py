@@ -772,6 +772,34 @@ _CURRENCY_PRICE_PARSE_RE = re.compile(
 )
 
 
+def _resolve_usd_to_target_rate(target: str) -> float:
+    """How many `target` units make up 1 USD.
+
+    Prefers the live MMS3 exchange-rate table (same one used by the
+    business for the company's own price math), falling back to the
+    module-level `_CURRENCY_USD_RATE` map only when MMS3 is unreachable
+    or the page layout has changed. The fallback keeps /pp working for
+    everyone even during MMS3 outages; the MMS3-first path keeps IDR
+    and THB display in sync with MMS3 quoted figures.
+
+    Returns 0.0 only as a true sentinel ("we have no rate at all"),
+    which the caller treats as "show original raw value untouched".
+    """
+    t = (target or "").upper()
+    if t == "USD":
+        return 1.0
+    try:
+        mms_rate = mms_product.get_client().get_rate_from_usd(t)
+        if mms_rate and mms_rate > 0:
+            return mms_rate
+    except Exception as e:  # noqa: BLE001 — never block display on MMS3 error
+        log.debug("MMS3 rate lookup failed for %s, using hardcoded: %s", t, e)
+    rate_to_usd = _CURRENCY_USD_RATE.get(t)
+    if not rate_to_usd:
+        return 0.0
+    return 1.0 / rate_to_usd
+
+
 def _user_currency_for_mms(mms_name: str | None) -> str | None:
     """Return user's preferred currency code (IDR / THB) or None."""
     if not mms_name:
@@ -872,10 +900,14 @@ def _format_price_for_currency(
     usd, original = _parse_price_to_usd(s)
     if usd is None:
         return original  # unparseable — show as-is rather than guess
-    target_rate = _CURRENCY_USD_RATE.get(target)
+    # V1.17.x — prefer MMS3's live exchange rate over our hardcoded one,
+    # so IDR / THB display matches what MMS3 quotes internally. Falls
+    # back to the hardcoded rate when MMS3 is offline. Rate semantics
+    # here are "1 USD = N target", so local = usd * rate.
+    target_rate = _resolve_usd_to_target_rate(target)
     if not target_rate:
         return original
-    local = usd / target_rate
+    local = usd * target_rate
     if target == "IDR":
         body = f"{local:,.0f}"
     else:
@@ -1272,7 +1304,23 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         # rd_line: MMS price (when set) is canonical USD; FSL fallback
         # can be in any currency the sheet stores. Both go through the
         # same formatter so the conversion behaviour is consistent.
-        if product.rd_price_usd is not None:
+        #
+        # V1.17.x — when the MMS3 SR page is already in the rep's
+        # preferred currency (J- codes are usually IDR, B- codes THB),
+        # bypass the USD round-trip entirely so the display is EXACTLY
+        # the figure MMS3 shows. Otherwise fall back to the formatter,
+        # which now uses MMS3's exchange rate for conversion.
+        native_amount = product.rd_price_native_amount
+        native_cur = (product.rd_price_native_currency or "").upper()
+        if (
+            native_amount is not None
+            and native_cur
+            and pref_currency
+            and native_cur == pref_currency.upper()
+        ):
+            dp = 0 if native_cur == "IDR" else 2
+            rd_line = f"{native_cur} {native_amount:,.{dp}f}"
+        elif product.rd_price_usd is not None:
             rd_line = _format_price_for_currency(
                 f"USD {product.rd_price_usd:.2f}", pref_currency,
                 show_original=bool(pref_currency),

@@ -13,7 +13,7 @@
 // account the bot uses (npsamplebot-robot@nprecobot.iam.gserviceaccount.com).
 // Treat that env var as a secret; never log it.
 
-import { GoogleSpreadsheet } from "google-spreadsheet";
+import { google } from "googleapis";
 import { JWT } from "google-auth-library";
 
 const SHEET_ID = process.env.SEASONING_SHEET_ID || "1ISo8GyI_btbnHcPwr0q6owotoT1mO4ZykYPwfNmwCNg";
@@ -72,14 +72,12 @@ function jwtClient(): JWT {
   return new JWT({
     email: creds.client_email,
     key: creds.private_key,
-    // Drive scope needed in addition to spreadsheets — google-spreadsheet
-    // calls the Drive API for sheet metadata (loadInfo) and was 403ing
-    // with just the spreadsheets scope. Both are readonly so this only
-    // grants the service account read-only access to whatever it can see.
-    scopes: [
-      "https://www.googleapis.com/auth/spreadsheets.readonly",
-      "https://www.googleapis.com/auth/drive.readonly",
-    ],
+    // Sheets-only scope. Using the raw googleapis SDK lets us call
+    // spreadsheets.values.batchGet directly without touching the
+    // Drive API at all (which the higher-level google-spreadsheet
+    // wrapper had needed). No Drive permissions required on the
+    // service account → simpler ops story.
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 }
 
@@ -129,8 +127,18 @@ function customerKey(name: string): string {
 async function loadFromSheet(): Promise<CacheEntry> {
   console.log("[fsl] loading three FSL tabs from Sheets…");
   const auth = jwtClient();
-  const doc = new GoogleSpreadsheet(SHEET_ID, auth);
-  await doc.loadInfo();
+  const sheets = google.sheets({ version: "v4", auth });
+
+  // Pull all three FSL tabs in one round-trip. batchGet returns each
+  // tab's values as a 2D array of strings — much lighter than the
+  // cell-by-cell loadCells() that google-spreadsheet was doing.
+  const resp = await sheets.spreadsheets.values.batchGet({
+    spreadsheetId: SHEET_ID,
+    ranges: FSL_TABS.map((t) => `'${t}'!A:K`),
+    valueRenderOption: "UNFORMATTED_VALUE",
+    dateTimeRenderOption: "FORMATTED_STRING",
+  });
+  const valueRanges = resp.data.valueRanges || [];
 
   // Aggregations:
   //   customers: per-customer summary (best country, top sales, etc.)
@@ -144,22 +152,17 @@ async function loadFromSheet(): Promise<CacheEntry> {
   }>();
   const byCustomerKey = new Map<string, Map<string, ProductSummary>>();
 
-  for (const tabName of FSL_TABS) {
-    const sheet = doc.sheetsByTitle[tabName];
-    if (!sheet) {
-      console.warn(`[fsl] tab not found: ${tabName}`);
+  for (let i = 0; i < valueRanges.length; i++) {
+    const tabName = FSL_TABS[i];
+    const rows = (valueRanges[i]?.values || []) as unknown[][];
+    if (rows.length < 2) {
+      console.warn(`[fsl] tab ${tabName} empty or header-only`);
       continue;
     }
-    await sheet.loadCells({
-      startRowIndex: 0,
-      endRowIndex: sheet.rowCount,
-      startColumnIndex: 0,
-      endColumnIndex: 11,
-    });
-    const rowCount = sheet.rowCount;
-    for (let r = 1; r < rowCount; r++) {  // skip header row
-      const get = (c: number) =>
-        String(sheet.getCell(r, c).value ?? "").trim();
+    // Skip header row (row 0).
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      const get = (c: number) => String(row[c] ?? "").trim();
       const customerName = get(COL_CUSTOMER);
       if (!customerName) continue;
       const key = customerKey(customerName);
@@ -216,8 +219,8 @@ async function loadFromSheet(): Promise<CacheEntry> {
           });
         }
       }
-    }
-  }
+    }  // end per-row loop
+  }  // end per-tab loop
 
   // Materialise customer summaries (pick most-frequent country + sales).
   const customers: CustomerSummary[] = [];

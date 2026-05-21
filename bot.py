@@ -754,17 +754,18 @@ _USER_CURRENCY_OVERRIDE: dict[str, str] = {
     "ying":    "THB",
 }
 
-# Conversion ratios: 1 unit of currency in USD. To convert local→USD,
-# multiply. To convert USD→local, divide. Rates are approximate but
-# stable enough for sales quoting (sales reps cross-check the
-# customer-facing price separately before committing).
-_CURRENCY_USD_RATE: dict[str, float] = {
-    "USD": 1.0,
-    "SGD": 0.74,    # 1 SGD ≈ 0.74 USD
-    "THB": 0.029,   # 1 THB ≈ 0.029 USD  (1 USD ≈ 34.5 THB)
-    "IDR": 0.000063,  # 1 IDR ≈ 0.000063 USD (1 USD ≈ 15,873 IDR)
-    "MYR": 0.21,
-}
+# V1.17.x — hardcoded currency rates removed. ALL conversions now go
+# through MMS3's live exchange-rate table via mms_product.get_client().
+# get_rate_to_usd / get_rate_from_usd. When MMS3 is unreachable or
+# doesn't list a currency, the bot SHOWS THE SOURCE VALUE VERBATIM
+# rather than inventing a converted number — discrepancies between
+# the bot and MMS3 are now impossible by design.
+#
+# Earlier iterations kept a fallback `_CURRENCY_USD_RATE` dict here
+# (IDR 0.000063, THB 0.029, …). The values drifted from MMS3's actual
+# rates (MMS3 has 1 USD = ~17,883 IDR vs the dict's 15,873) and any
+# conversion path that touched both rate sources compounded the
+# mismatch into visibly wrong figures. The dict has been deleted.
 
 _CURRENCY_PRICE_PARSE_RE = re.compile(
     r"^([A-Z]{3,4}|RM|S\$|\$)\s*([\d,]+(?:\.\d+)?)$",
@@ -772,32 +773,37 @@ _CURRENCY_PRICE_PARSE_RE = re.compile(
 )
 
 
-def _resolve_usd_to_target_rate(target: str) -> float:
-    """How many `target` units make up 1 USD.
+def _mms_rate_to_usd(currency: str) -> float | None:
+    """1 unit of `currency` = X USD per MMS3's live rates. None on fail.
 
-    Prefers the live MMS3 exchange-rate table (same one used by the
-    business for the company's own price math), falling back to the
-    module-level `_CURRENCY_USD_RATE` map only when MMS3 is unreachable
-    or the page layout has changed. The fallback keeps /pp working for
-    everyone even during MMS3 outages; the MMS3-first path keeps IDR
-    and THB display in sync with MMS3 quoted figures.
-
-    Returns 0.0 only as a true sentinel ("we have no rate at all"),
-    which the caller treats as "show original raw value untouched".
+    Caller MUST NOT substitute a hardcoded rate when this returns None —
+    that's how price discrepancies between the bot and MMS3 happen.
+    Show the source value in its original currency instead.
     """
-    t = (target or "").upper()
-    if t == "USD":
+    cur = (currency or "").upper()
+    if cur == "USD":
         return 1.0
     try:
-        mms_rate = mms_product.get_client().get_rate_from_usd(t)
-        if mms_rate and mms_rate > 0:
-            return mms_rate
+        return mms_product.get_client().get_rate_to_usd(cur)
     except Exception as e:  # noqa: BLE001 — never block display on MMS3 error
-        log.debug("MMS3 rate lookup failed for %s, using hardcoded: %s", t, e)
-    rate_to_usd = _CURRENCY_USD_RATE.get(t)
-    if not rate_to_usd:
-        return 0.0
-    return 1.0 / rate_to_usd
+        log.debug("MMS3 rate-to-USD lookup failed for %s: %s", cur, e)
+        return None
+
+
+def _mms_rate_from_usd(currency: str) -> float | None:
+    """1 USD = X units of `currency` per MMS3's live rates. None on fail.
+
+    Same no-fallback contract as `_mms_rate_to_usd` — when None, the
+    caller shows source verbatim rather than inventing a number.
+    """
+    cur = (currency or "").upper()
+    if cur == "USD":
+        return 1.0
+    try:
+        return mms_product.get_client().get_rate_from_usd(cur)
+    except Exception as e:  # noqa: BLE001
+        log.debug("MMS3 rate-from-USD lookup failed for %s: %s", cur, e)
+        return None
 
 
 def _user_currency_for_mms(mms_name: str | None) -> str | None:
@@ -841,9 +847,10 @@ def _parse_price_to_usd(raw: str) -> tuple[float | None, str]:
       • bare number ('5.44')         → assumes USD
       • currency prefix ('USD 5.44') → straightforward
       • exotic currency ('IDR 59,322', 'THB 162.9', 'SGD 6.60', 'RM 12')
-        → converted via _CURRENCY_USD_RATE
-    Returns (None, original) when we can't parse — caller should fall
-    back to showing the original string untouched.
+        → converted via MMS3's live exchange-rate table
+    Returns (None, original) when we can't parse OR MMS3 doesn't list
+    the source currency — the caller shows the original string
+    untouched rather than inventing a fake conversion.
     """
     s = (raw or "").strip()
     if not s:
@@ -865,7 +872,10 @@ def _parse_price_to_usd(raw: str) -> tuple[float | None, str]:
         return None, s
     if v <= 0:
         return None, s
-    rate = _CURRENCY_USD_RATE.get(cur_norm)
+    # V1.17.x — MMS3 rates only. If MMS3 doesn't list this currency,
+    # signal "untranslatable" to the caller so it can show the source
+    # verbatim instead of compounding a wrong number through USD.
+    rate = _mms_rate_to_usd(cur_norm)
     if rate is None:
         return None, s
     return v * rate, s
@@ -883,9 +893,12 @@ def _format_price_for_currency(
     a 'USD ' prefix added if the cell was bare numeric, matching the
     existing _fmt_price behaviour).
 
-    target='IDR' / 'THB' → convert via _CURRENCY_USD_RATE; emit
-    formatted with thousands separators and currency-appropriate
-    decimal places (IDR: 0 dp, others: 2 dp).
+    target='IDR' / 'THB' → if input ALREADY in target currency, pass
+    through verbatim. Otherwise convert via MMS3's live exchange-rate
+    table; emit formatted with thousands separators and
+    currency-appropriate decimal places (IDR: 0 dp, others: 2 dp).
+    When MMS3 doesn't list the source or target currency, the raw
+    input is returned unchanged — never a fake hardcoded conversion.
     """
     s = (raw or "").strip()
     if not s:
@@ -911,12 +924,14 @@ def _format_price_for_currency(
             return f"{cur_norm} {m.group(2)}"
     usd, original = _parse_price_to_usd(s)
     if usd is None:
-        return original  # unparseable — show as-is rather than guess
-    # V1.17.x — prefer MMS3's live exchange rate over our hardcoded one,
-    # so IDR / THB display matches what MMS3 quotes internally. Falls
-    # back to the hardcoded rate when MMS3 is offline. Rate semantics
-    # here are "1 USD = N target", so local = usd * rate.
-    target_rate = _resolve_usd_to_target_rate(target)
+        # Source-currency rate unavailable from MMS3 (or input unparseable).
+        # Show the input verbatim rather than fake a number.
+        return original
+    # V1.17.x — MMS3 rates only. If MMS3 doesn't list the target
+    # currency, show the source verbatim. NEVER fall back to a
+    # hardcoded rate — see the comment where _CURRENCY_USD_RATE was
+    # removed for why doing so introduced visible discrepancies.
+    target_rate = _mms_rate_from_usd(target)
     if not target_rate:
         return original
     local = usd * target_rate

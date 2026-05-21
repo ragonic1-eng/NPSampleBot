@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 
 import {
@@ -16,6 +16,23 @@ import {
   SALES_PEOPLE,
   suggestedFilename,
 } from "@/lib/constants";
+
+
+// ---- types matching the /api/customers + /api/customer-products responses ----
+type CustomerSuggestion = {
+  name: string;
+  country: string;
+  sales: string;
+  productCount: number;
+  lastDate: string;
+};
+type ProductSuggestion = {
+  code: string;
+  name: string;
+  rdPrice: string;
+  lastDate: string;
+  count: number;
+};
 
 // IMPORTANT: do NOT use PDFDownloadLink here. It re-renders the entire
 // PDF document on every prop change — typing one letter in a field
@@ -55,6 +72,132 @@ function Field({
       {children}
       {hint ? <span className="text-xs text-gray-500">{hint}</span> : null}
     </label>
+  );
+}
+
+
+/** Debounce hook — returns a value that lags `value` by `delay` ms. Used
+ * by the autocomplete inputs so we don't fire a fetch on every keystroke. */
+function useDebounced<T>(value: T, delay = 250): T {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setV(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return v;
+}
+
+
+/** Free-text input with a dropdown of suggestions fetched from `fetcher`.
+ *
+ *  - The user can type ANY value (we don't gate on suggestion match).
+ *  - When they click a suggestion, `onPick(item)` fires so the parent
+ *    can also fill OTHER fields from the picked record (country, sales
+ *    rep, etc. for customer; code, price, currency for product).
+ *  - Dropdown auto-hides on outside click + blur.
+ */
+function Autocomplete<T extends Record<string, unknown>>({
+  value,
+  onChange,
+  onPick,
+  placeholder,
+  fetcher,
+  renderItem,
+  className = "border rounded-md px-3 py-2 text-sm",
+  minChars = 1,
+}: {
+  value: string;
+  onChange: (s: string) => void;
+  onPick: (item: T) => void;
+  placeholder?: string;
+  fetcher: (q: string) => Promise<T[]>;
+  renderItem: (item: T) => React.ReactNode;
+  className?: string;
+  minChars?: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const [items, setItems] = useState<T[]>([]);
+  const [loading, setLoading] = useState(false);
+  const debounced = useDebounced(value, 250);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  // Fetch suggestions whenever the debounced value changes AND the box
+  // is open. Don't fetch when closed — saves bandwidth and keeps the
+  // user from triggering reqs while just typing in a closed dropdown.
+  useEffect(() => {
+    if (!open) return;
+    if (debounced.length < minChars) {
+      setItems([]);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    fetcher(debounced)
+      .then((rows) => {
+        if (!cancelled) setItems(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setItems([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [debounced, open, fetcher, minChars]);
+
+  // Close on click outside.
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (!wrapperRef.current) return;
+      if (!wrapperRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
+
+  return (
+    <div className="relative" ref={wrapperRef}>
+      <input
+        className={className}
+        value={value}
+        onChange={(e) => {
+          onChange(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        placeholder={placeholder}
+        autoComplete="off"
+      />
+      {open && (loading || items.length > 0) && (
+        <div className="absolute z-10 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-md shadow-lg max-h-72 overflow-auto">
+          {loading && (
+            <div className="px-3 py-2 text-xs text-gray-500">Searching…</div>
+          )}
+          {!loading && items.length === 0 && (
+            <div className="px-3 py-2 text-xs text-gray-500">No matches</div>
+          )}
+          {items.map((it, i) => (
+            <button
+              type="button"
+              key={i}
+              onMouseDown={(e) => {
+                // mouseDown fires before the input's blur, so the
+                // selection lands BEFORE the dropdown auto-closes
+                // — avoiding the classic "click vanishes" flicker.
+                e.preventDefault();
+                onPick(it);
+                setOpen(false);
+              }}
+              className="block w-full text-left px-3 py-2 text-sm hover:bg-gray-100 border-b border-gray-100 last:border-0"
+            >
+              {renderItem(it)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -144,6 +287,101 @@ function QuoteBuilder() {
   const filename = suggestedFilename(data);
   const canGenerate = data.products.some((p) => p.name && p.price);
 
+  // ---- Autocomplete fetchers ----
+  // Each fetcher hits one of the /api/* routes. JSON shape matches
+  // CustomerSuggestion / ProductSuggestion above. Errors swallow to
+  // an empty list — the UI just shows 'No matches' instead of crashing.
+  const fetchCustomers = useCallback(
+    async (q: string): Promise<CustomerSuggestion[]> => {
+      try {
+        const r = await fetch(
+          `/api/customers?q=${encodeURIComponent(q)}`,
+          { cache: "no-store" },
+        );
+        if (!r.ok) return [];
+        const j = (await r.json()) as { customers?: CustomerSuggestion[] };
+        return j.customers || [];
+      } catch {
+        return [];
+      }
+    },
+    [],
+  );
+
+  // Cache the products-for-customer call by customer name. Same
+  // customer typically shows up on multiple product rows — we don't
+  // want to re-fetch for each row. 30s TTL is plenty since the
+  // server-side cache also dedupes.
+  const productCacheRef = useRef<Map<string, { ts: number; items: ProductSuggestion[] }>>(new Map());
+  const fetchProductsForCustomer = useCallback(
+    async (q: string): Promise<ProductSuggestion[]> => {
+      const customerName = data.companyName.trim();
+      if (!customerName) return [];
+      const cached = productCacheRef.current.get(customerName);
+      const now = Date.now();
+      let items: ProductSuggestion[];
+      if (cached && now - cached.ts < 30_000) {
+        items = cached.items;
+      } else {
+        try {
+          const r = await fetch(
+            `/api/customer-products?name=${encodeURIComponent(customerName)}`,
+            { cache: "no-store" },
+          );
+          if (!r.ok) return [];
+          const j = (await r.json()) as { products?: ProductSuggestion[] };
+          items = j.products || [];
+          productCacheRef.current.set(customerName, { ts: now, items });
+        } catch {
+          return [];
+        }
+      }
+      // Client-side filter by the typed-in product name (server returns
+      // up to 25 candidates regardless of the user's query).
+      const ql = q.trim().toLowerCase();
+      if (!ql) return items.slice(0, 12);
+      return items
+        .filter(
+          (p) =>
+            p.name.toLowerCase().includes(ql) ||
+            p.code.toLowerCase().includes(ql),
+        )
+        .slice(0, 12);
+    },
+    [data.companyName],
+  );
+
+  function pickCustomer(c: CustomerSuggestion) {
+    // Fill company name + we leave the customer address blank (FSL
+    // doesn't have addresses — rep types it). Bump 'no products yet'
+    // out of productCacheRef so the next product autocomplete fetches
+    // the fresh customer's products.
+    productCacheRef.current.delete(data.companyName);
+    setData((d) => ({
+      ...d,
+      companyName: c.name,
+      // If the rep hasn't typed a quotation title yet, suggest one
+      // based on the customer's typical sales rep activity.
+    }));
+  }
+
+  function pickProductForRow(i: number, p: ProductSuggestion) {
+    // Extract price digits + currency from the FSL R&D Price string.
+    // Examples seen in the wild: '4.53', 'USD 4.53', 'SGD 6.20',
+    // '$4.50' — strip everything non-numeric/dot.
+    const m = p.rdPrice.match(/[0-9]+(?:\.[0-9]+)?/);
+    const price = m ? m[0] : "";
+    const currencyMatch = p.rdPrice.toUpperCase().match(/USD|SGD/);
+    const currency: Product["currency"] =
+      currencyMatch?.[0] === "SGD" ? "SGD" : "USD";
+    patchProduct(i, {
+      name: p.name || p.code,
+      code: p.code,
+      price,
+      currency,
+    });
+  }
+
   // On-click PDF generation. Imports the heavy modules lazily so the
   // initial page load stays small. Any failure (broken input, OOM,
   // network issue fetching logos) lands in `error` state and shows
@@ -201,12 +439,25 @@ function QuoteBuilder() {
       <section className="bg-white rounded-lg border border-gray-200 p-4 sm:p-5 mb-4">
         <h2 className="text-base font-semibold text-gray-800 mb-3">Customer details</h2>
 
-        <Field label="Company name" hint="e.g. HURNG FUR FOODS FACTORY CO., LTD">
-          <input
-            className="border rounded-md px-3 py-2 text-sm"
+        <Field
+          label="Company name"
+          hint="Start typing — I'll suggest customers from your past samples."
+        >
+          <Autocomplete<CustomerSuggestion>
             value={data.companyName}
-            onChange={(e) => patch("companyName", e.target.value)}
+            onChange={(s) => patch("companyName", s)}
+            onPick={pickCustomer}
             placeholder="HURNG FUR FOODS FACTORY CO., LTD"
+            fetcher={fetchCustomers}
+            renderItem={(c) => (
+              <div className="flex justify-between gap-3 items-baseline">
+                <span className="font-medium">{c.name}</span>
+                <span className="text-xs text-gray-500 whitespace-nowrap">
+                  {c.country ? `${c.country} · ` : ""}
+                  {c.productCount} product{c.productCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            )}
           />
         </Field>
 
@@ -265,12 +516,36 @@ function QuoteBuilder() {
             className="grid grid-cols-12 gap-2 items-end mb-3 pb-3 border-b border-gray-100 last:border-0 last:pb-0 last:mb-0"
           >
             <div className="col-span-12 sm:col-span-4">
-              <label className="text-xs font-medium text-gray-600">Product name</label>
-              <input
-                className="border rounded-md px-2 py-1.5 text-sm w-full"
+              <label className="text-xs font-medium text-gray-600">
+                Product name
+                {data.companyName ? (
+                  <span className="ml-1 text-[10px] text-gray-400">
+                    (suggesting from {data.companyName})
+                  </span>
+                ) : null}
+              </label>
+              <Autocomplete<ProductSuggestion>
                 value={p.name}
-                onChange={(e) => patchProduct(i, { name: e.target.value })}
+                onChange={(s) => patchProduct(i, { name: s })}
+                onPick={(pr) => pickProductForRow(i, pr)}
                 placeholder="SOUR CHILLI SEASONING"
+                fetcher={fetchProductsForCustomer}
+                className="border rounded-md px-2 py-1.5 text-sm w-full"
+                minChars={0}
+                renderItem={(pr) => (
+                  <div className="flex justify-between gap-3 items-baseline">
+                    <span className="flex-1 truncate">
+                      <span className="font-medium">{pr.name || pr.code}</span>
+                      <span className="ml-2 text-xs text-gray-500">
+                        {pr.code}
+                      </span>
+                    </span>
+                    <span className="text-xs text-gray-500 whitespace-nowrap">
+                      {pr.rdPrice ? `${pr.rdPrice} · ` : ""}
+                      {pr.count}×
+                    </span>
+                  </div>
+                )}
               />
             </div>
             <div className="col-span-6 sm:col-span-2">

@@ -804,10 +804,14 @@ function QuoteBuilder() {
             </select>
           </Field>
 
-          <Field label="Price basis (incoterm)">
+          <Field label="Shipping Incoterms">
             <select
               className="w-full border rounded-md px-3 py-2 text-sm bg-white"
-              value={data.incoterm}
+              value={
+                // Migrate legacy 'EXWORK' (older drafts in localStorage)
+                // to the new short 'EXW' so the select shows a value.
+                data.incoterm === "EXWORK" ? "EXW" : data.incoterm
+              }
               onChange={(e) => patch("incoterm", e.target.value)}
             >
               {INCOTERM_OPTIONS.map((o) => (

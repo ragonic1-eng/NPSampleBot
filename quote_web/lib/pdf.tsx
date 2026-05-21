@@ -243,9 +243,9 @@ export function QuotePDF({ data, origin }: QuotePDFProps) {
           </Text>
         ) : null}
         <Text style={styles.remarkLine}>
-          Price contain{" "}
+          <Text style={styles.remarkBold}>Shipping Incoterms: </Text>
           <Text style={styles.remarkBold}>{data.incoterm || "CFR"}</Text>
-          {" "}to{" "}
+          {" to "}
           <Text style={styles.remarkBold}>{data.port || "the destination port"}</Text>.
         </Text>
         <Text style={styles.remarkLine}>

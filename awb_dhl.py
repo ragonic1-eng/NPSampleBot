@@ -547,12 +547,21 @@ def _row_to_shipment(raw: dict) -> Shipment | None:
         log.info("DHL: skipping row with no customer name (awb=%s)", awb)
         return None
 
+    # Address block — everything after the company name line. Typically
+    # contact person + street + city/country, joined with newlines so
+    # the quote_web form can drop it straight into the address textarea.
+    # The contact person on line 2 is harmless noise the rep can edit
+    # out; keeping it costs less than guessing wrong on which line is
+    # the start of the actual postal address.
+    ship_to_address = "\n".join(lines[1:]) if len(lines) > 1 else ""
+
     return Shipment(
         carrier="DHL",
         awb=awb,
         recipient_name=customer,
         recipient_country=country,
         ship_date=ship_date,
+        ship_to_address=ship_to_address,
     )
 
 

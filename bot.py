@@ -640,11 +640,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_syncawb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Manual AWB sync — ragonic-only. Runs once, posts the result.
 
-    /syncawb           → full run, writes matches + push 'AWB Update' to group
+    /syncawb           → full run (last 14 days), write + push to group
     /syncawb dry       → preview run, no writes, no group post
-    /syncawb quiet     → full run, write matches, DON'T post to group (admin
-                         reply only — useful when re-running just to backfill
-                         without spamming the chat)
+    /syncawb quiet     → full run, write but DON'T post to group (useful
+                         when re-running just to backfill without spam)
+    /syncawb 365       → deep backfill — scrape the last 365 days of DHL/
+                         FedEx history. Slower (~5-30min depending on
+                         carrier history). Quiet by default. Max 730.
     """
     if not await _authorized(update):
         return
@@ -654,16 +656,37 @@ async def cmd_syncawb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = [a.lower() for a in (ctx.args or [])]
     dry_run = any(a in ("dry", "preview", "test") for a in args)
     quiet = any(a in ("quiet", "nopost", "silent") for a in args)
-    mode = "preview" if dry_run else ("live (quiet)" if quiet else "live + push")
+    # V1.17.x — accept a numeric arg as days_back so reps can trigger a
+    # deep backfill (e.g. `/syncawb 365` to scrape the last year of DHL
+    # ship-to addresses into FSL col L). Capped at 730 days to avoid
+    # accidental scrapes back to the dawn of MyDHL+. Backfills default
+    # to quiet — a 30-minute scrape shouldn't push a noisy group update.
+    days_back = 14
+    custom_days = False
+    for a in args:
+        try:
+            n = int(a)
+            if n > 0:
+                days_back = min(n, 730)
+                custom_days = True
+                break
+        except ValueError:
+            continue
+    if custom_days and days_back > 30:
+        quiet = True  # backfills don't push to chat by default
+    mode_parts = [f"{days_back}d window"]
+    mode_parts.append("preview" if dry_run else ("live, quiet" if quiet else "live + push"))
+    mode = " · ".join(mode_parts)
     await send(
         update,
         f"📦 <b>Running AWB sync</b> ({mode})…\n\n"
         "<i>Fetching from DHL + FedEx, matching against the 3 FSL tabs, "
-        "then writing to col K. This may take ~30s.</i>",
+        f"then writing AWB to col K + address to col L. May take "
+        f"{'~30s' if days_back <= 30 else '5-30min on deep backfills'}.</i>",
         with_footer=False,
     )
     try:
-        result = await awb_sync.run_awb_sync(days_back=14, dry_run=dry_run)
+        result = await awb_sync.run_awb_sync(days_back=days_back, dry_run=dry_run)
     except Exception as e:  # noqa: BLE001
         await send(update, f"⚠️ AWB sync crashed: <code>{h(e)}</code>")
         log.exception("/syncawb crashed")

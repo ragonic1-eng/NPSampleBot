@@ -100,9 +100,25 @@ const styles = StyleSheet.create({
   // the Page's flex column — so on short quotations it sits anchored
   // at the bottom-left instead of floating just below the remarks.
   // 6mm of bottom padding keeps it clear of the page margin edge.
+  //
+  // Inner row layout: signature text on the left (flex:1), company
+  // stamp on the right (1cm × 1cm). Bottom-aligned so the stamp sits
+  // level with the last line of the signature regardless of how many
+  // lines the rep's signature block has.
   sigBlock: {
     marginTop: "auto",
     paddingBottom: 6 * 2.835,
+    flexDirection: "row",
+    alignItems: "flex-end",
+  },
+  sigText: {
+    flex: 1,
+  },
+  // 1cm = 28.35 pt (the 2.835 factor used elsewhere is mm → pt).
+  stamp: {
+    width: 1 * 28.35,
+    height: 1 * 28.35,
+    marginLeft: 8,
   },
   sigLine:  { fontSize: 10, marginBottom: 1 },
   sigName:  { fontSize: 10, fontFamily: "Helvetica-Bold", marginTop: 6, marginBottom: 1 },
@@ -258,14 +274,19 @@ export function QuotePDF({ data, origin }: QuotePDFProps) {
           </Text>
         ) : null}
 
-        {/* Signature */}
+        {/* Signature + company stamp. Stamp lives at /np_stamp.png in
+            public/ — kept as a separate asset so reps can update it
+            independently of code. */}
         <View style={styles.sigBlock}>
-          <Text style={styles.sigLine}>Your Faithfully,</Text>
-          <Text style={styles.sigName}>{sigInfo.fullName}</Text>
-          <Text style={styles.sigLine}>N. P. Foods (Singapore) Pte Ltd</Text>
-          <Text style={styles.sigLine}>Hp: {sigInfo.hp}</Text>
-          <Text style={styles.sigLine}>Tel: +65 6756 2777</Text>
-          <Text style={styles.sigLine}>Fax: +65 6756 2555</Text>
+          <View style={styles.sigText}>
+            <Text style={styles.sigLine}>Your Faithfully,</Text>
+            <Text style={styles.sigName}>{sigInfo.fullName}</Text>
+            <Text style={styles.sigLine}>N. P. Foods (Singapore) Pte Ltd</Text>
+            <Text style={styles.sigLine}>Hp: {sigInfo.hp}</Text>
+            <Text style={styles.sigLine}>Tel: +65 6756 2777</Text>
+            <Text style={styles.sigLine}>Fax: +65 6756 2555</Text>
+          </View>
+          <Image style={styles.stamp} src={`${origin}/np_stamp.png`} />
         </View>
       </Page>
     </Document>

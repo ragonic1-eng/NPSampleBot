@@ -254,19 +254,32 @@ def build_updates_for_tab(
                 continue
             if semantic_match_awbs is not None:
                 semantic_match_awbs.add(s.awb)
-            # Re-runs shouldn't trample manually-filled AWBs.
-            if (fsl.get("AWB") or "").strip():
+            # Decide what's writable on this row. AWB is one-shot (we
+            # never overwrite an existing AWB — could be manually typed
+            # or set by an earlier run). Customer Address is opportunistic:
+            # we fill it if empty even when AWB is already present, so
+            # historical rows that pre-date the address feature still
+            # benefit from later DHL ship-to scrapes.
+            awb_empty = not (fsl.get("AWB") or "").strip()
+            addr_empty = not (fsl.get("Customer Address") or "").strip()
+            if not awb_empty and not addr_empty:
+                # Both cells already populated — nothing for us to do.
+                continue
+            if not awb_empty and addr_empty and not s.ship_to_address:
+                # AWB already set, no new address to contribute — skip.
                 continue
             out.append(MatchUpdate(
                 tab=tab,
                 row_number=row_num,
-                awb=s.awb,
+                # Empty AWB on the update tells write_awb_updates to leave
+                # the K cell alone. Address still gets written.
+                awb=s.awb if awb_empty else "",
                 carrier=s.carrier,
                 customer=fsl.get("Customer Name", ""),
                 fsl_date_iso=fsl.get("Sample Date Out", ""),
                 sales=fsl.get("Sales", ""),
                 country=fsl.get("Country", ""),
-                address=s.ship_to_address,
+                address=s.ship_to_address if addr_empty else "",
             ))
             seen_rows.add(row_num)
     return out

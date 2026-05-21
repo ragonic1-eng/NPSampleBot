@@ -630,9 +630,14 @@ def write_awb_updates(tab: str, updates: list[tuple[int, str, str]]) -> int:
             addr = ""
         else:
             r, awb, addr = u
-        if not (awb or "").strip():
+        awb_clean = (awb or "").strip()
+        addr_clean = (addr or "").strip()
+        # Keep the row if EITHER cell needs writing. Empty awb here is
+        # a deliberate signal from the matcher ("AWB already filled, but
+        # please write the address") — see build_updates_for_tab.
+        if not awb_clean and not addr_clean:
             continue
-        clean.append((r, awb, (addr or "").strip()))
+        clean.append((r, awb_clean, addr_clean))
     if not clean:
         return 0
     sh = _open_seasoning_master()
@@ -644,7 +649,8 @@ def write_awb_updates(tab: str, updates: list[tuple[int, str, str]]) -> int:
     addr_col = _col_letter(FSL_COL_ADDR + 1)  # "L"
     body: list[dict] = []
     for row, awb, addr in clean:
-        body.append({"range": f"{awb_col}{row}", "values": [[awb]]})
+        if awb:
+            body.append({"range": f"{awb_col}{row}", "values": [[awb]]})
         if addr:
             body.append({"range": f"{addr_col}{row}", "values": [[addr]]})
     ws.batch_update(body, value_input_option="USER_ENTERED")

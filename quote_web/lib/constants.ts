@@ -62,7 +62,6 @@ export type Product = {
   code: string;
   currency: Currency;
   price: string;
-  moq: string;
 };
 
 export type QuoteData = {
@@ -72,6 +71,9 @@ export type QuoteData = {
   quotationTitle: string;
   extraComment: string;
   products: Product[];
+  // MOQ applies to the whole order, not per-product — a single value
+  // entered once on the form, rendered as a merged cell on the PDF.
+  moq: string;
   packagingSize: string;
   paymentTerm: string;
   incoterm: string;
@@ -81,7 +83,7 @@ export type QuoteData = {
 };
 
 export function blankProduct(): Product {
-  return { name: "", code: "", currency: "USD", price: "", moq: "" };
+  return { name: "", code: "", currency: "USD", price: "" };
 }
 
 export function blankQuote(salesPerson = ""): QuoteData {
@@ -92,6 +94,7 @@ export function blankQuote(salesPerson = ""): QuoteData {
     quotationTitle: "",
     extraComment: "",
     products: [blankProduct()],
+    moq: "",
     packagingSize: PACKAGING_OPTIONS[0],
     paymentTerm: PAYMENT_OPTIONS[1], // TT 30 DAYS — most common default
     incoterm: "CFR",

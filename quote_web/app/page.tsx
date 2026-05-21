@@ -667,7 +667,7 @@ function QuoteBuilder() {
             key={i}
             className="grid grid-cols-12 gap-2 items-end mb-3 pb-3 border-b border-gray-100 last:border-0 last:pb-0 last:mb-0"
           >
-            <div className="col-span-12 sm:col-span-4">
+            <div className="col-span-12 sm:col-span-5">
               <label className="text-xs font-medium text-gray-600">
                 Product name
                 {data.companyName ? (
@@ -733,7 +733,7 @@ function QuoteBuilder() {
                 ))}
               </select>
             </div>
-            <div className="col-span-3 sm:col-span-2">
+            <div className="col-span-3 sm:col-span-3">
               <label className="text-xs font-medium text-gray-600">Price / Kg</label>
               <input
                 className="border rounded-md px-2 py-1.5 text-sm w-full"
@@ -741,15 +741,6 @@ function QuoteBuilder() {
                 onChange={(e) => patchProduct(i, { price: e.target.value })}
                 placeholder="5.50"
                 inputMode="decimal"
-              />
-            </div>
-            <div className="col-span-12 sm:col-span-2">
-              <label className="text-xs font-medium text-gray-600">MOQ</label>
-              <input
-                className="w-full border rounded-md px-2 py-1.5 text-sm"
-                value={p.moq}
-                onChange={(e) => patchProduct(i, { moq: e.target.value })}
-                placeholder="1000 Kgs"
               />
             </div>
             <div className="col-span-12 flex justify-end">
@@ -826,6 +817,18 @@ function QuoteBuilder() {
               value={data.port}
               onChange={(e) => patch("port", e.target.value)}
               placeholder="Keelung Port"
+            />
+          </Field>
+
+          <Field
+            label="MOQ"
+            hint="Applies to the whole order — prints as one merged cell on the right of the product table."
+          >
+            <input
+              className="w-full border rounded-md px-3 py-2 text-sm"
+              value={data.moq}
+              onChange={(e) => patch("moq", e.target.value)}
+              placeholder="1000 Kgs"
             />
           </Field>
         </div>

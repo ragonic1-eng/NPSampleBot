@@ -87,10 +87,23 @@ const styles = StyleSheet.create({
     borderWidth: 0.5,
     textAlign: "center",
   },
+  // Header row widths (sum = 100%).
   colName: { width: "37%" },
   colCode: { width: "23%" },
   colPrice: { width: "22%" },
   colMoq: { width: "18%" },
+
+  // Body splits into a left section (Name+Code+Price, 82%) where the
+  // product rows live, and a right section (MOQ, 18%) which is a
+  // SINGLE merged cell spanning the height of all product rows.
+  tableBody:     { flexDirection: "row" },
+  tableBodyLeft: { width: "82%" },
+  // Inner widths are scaled to the 82% left section: 37/82, 23/82, 22/82.
+  colNameInner:  { width: "45.122%" },
+  colCodeInner:  { width: "28.049%" },
+  colPriceInner: { width: "26.829%" },
+  // Merged MOQ cell — vertically centers the single MOQ value.
+  moqMerged:     { justifyContent: "center" },
 
   // ---- Remarks.
   remarkLine: { fontSize: 11, marginBottom: 1.5 * 2.835 },
@@ -200,7 +213,9 @@ export function QuotePDF({ data, origin }: QuotePDFProps) {
             ))}
         </View>
 
-        {/* Product table */}
+        {/* Product table. The MOQ column is a single merged cell on
+            the right — MOQ applies to the order as a whole, not per
+            product line, so it's authored once on the form. */}
         {data.products.length > 0 ? (
           <View style={styles.table}>
             <View style={styles.tableRow}>
@@ -209,14 +224,20 @@ export function QuotePDF({ data, origin }: QuotePDFProps) {
               <Text style={[styles.tableHeaderCell, styles.colPrice]}>Price</Text>
               <Text style={[styles.tableHeaderCell, styles.colMoq]}>MOQ</Text>
             </View>
-            {data.products.map((p, i) => (
-              <View style={styles.tableRow} key={`p-${i}`}>
-                <Text style={[styles.tableCell, styles.colName]}>{p.name}</Text>
-                <Text style={[styles.tableCell, styles.colCode]}>{p.code}</Text>
-                <Text style={[styles.tableCell, styles.colPrice]}>{priceLabel(p)}</Text>
-                <Text style={[styles.tableCell, styles.colMoq]}>{p.moq}</Text>
+            <View style={styles.tableBody}>
+              <View style={styles.tableBodyLeft}>
+                {data.products.map((p, i) => (
+                  <View style={styles.tableRow} key={`p-${i}`}>
+                    <Text style={[styles.tableCell, styles.colNameInner]}>{p.name}</Text>
+                    <Text style={[styles.tableCell, styles.colCodeInner]}>{p.code}</Text>
+                    <Text style={[styles.tableCell, styles.colPriceInner]}>{priceLabel(p)}</Text>
+                  </View>
+                ))}
               </View>
-            ))}
+              <View style={[styles.tableCell, styles.colMoq, styles.moqMerged]}>
+                <Text>{data.moq}</Text>
+              </View>
+            </View>
           </View>
         ) : null}
 

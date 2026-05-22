@@ -558,6 +558,85 @@ def load_customer_aliases() -> dict[str, str]:
     return result
 
 
+# ---------- Unmatched AWBs (V1.17.x — persistent, drives digest footer) ----------
+
+TAB_UNMATCHED_AWBS = "Unmatched AWBs"
+UNMATCHED_AWB_HEADER = [
+    "AWB", "Carrier", "Recipient Name (carrier label)",
+    "Ship Date", "Last Updated UTC",
+]
+
+
+def write_unmatched_awbs(rows: list[dict]) -> int:
+    """Overwrite the 'Unmatched AWBs' OPS tab with this run's unmatched list.
+
+    `rows` is a list of dicts with keys: awb, carrier, recipient_name,
+    ship_date (str or date). The tab gets cleared + re-headered + re-filled
+    in one batch so a partial write can't leave it inconsistent. Returns
+    the number of data rows written (0 when there are none — header is
+    still set so the digest reader sees a valid empty tab).
+
+    Why persist instead of holding in-memory: the in-memory cache in
+    awb_sync is reset on every bot restart AND on every failed sync run.
+    The daily digest at 18:00 SGT was silently dropping the "AWBs not in
+    FSL" footer whenever the 17:30 sync got rate-limited. Writing to a
+    sheet means the digest always has SOMETHING to show, even if it's
+    yesterday's data (clearly time-stamped so reps know).
+    """
+    from datetime import datetime as _dt, timezone as _tz, date as _date
+    sh = _open_ops()
+    try:
+        ws = sh.worksheet(TAB_UNMATCHED_AWBS)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(
+            title=TAB_UNMATCHED_AWBS,
+            rows=max(50, len(rows) + 10),
+            cols=len(UNMATCHED_AWB_HEADER),
+        )
+    # Always clear + rewrite header so a schema change self-heals.
+    ws.clear()
+    now_utc = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+    body: list[list[str]] = [UNMATCHED_AWB_HEADER]
+    for r in rows:
+        ship_date = r.get("ship_date", "")
+        if isinstance(ship_date, _date):
+            ship_date = ship_date.strftime("%Y-%m-%d")
+        body.append([
+            str(r.get("awb", "")),
+            str(r.get("carrier", "")),
+            str(r.get("recipient_name", "")),
+            str(ship_date or ""),
+            now_utc,
+        ])
+    ws.update(values=body, range_name="A1")
+    return len(rows)
+
+
+def load_unmatched_awbs() -> list[dict]:
+    """Read persisted unmatched AWBs from the OPS tab. Returns [] when the
+    tab doesn't exist or has only the header. Each dict has the same shape
+    as the input to `write_unmatched_awbs`. Used by the daily digest to
+    surface the 'AWBs not in FSL' footer reliably."""
+    sh = _open_ops()
+    try:
+        ws = sh.worksheet(TAB_UNMATCHED_AWBS)
+    except gspread.WorksheetNotFound:
+        return []
+    rows = ws.get_all_values()
+    out: list[dict] = []
+    for r in rows[1:]:
+        if not r or not (r[0] or "").strip():
+            continue
+        out.append({
+            "awb": (r[0] or "").strip(),
+            "carrier": (r[1] or "").strip() if len(r) > 1 else "",
+            "recipient_name": (r[2] or "").strip() if len(r) > 2 else "",
+            "ship_date": (r[3] or "").strip() if len(r) > 3 else "",
+            "last_updated_utc": (r[4] or "").strip() if len(r) > 4 else "",
+        })
+    return out
+
+
 # ---------- AWB column updates (V1.16.0 — driven by awb_sync.py) ----------
 
 def ensure_awb_column(tab: str = FSL_TAB) -> bool:

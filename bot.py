@@ -6793,30 +6793,70 @@ async def _build_daily_digest_body() -> tuple[str, int]:
         )
 
     # Unmatched AWBs — carrier records (DHL/FedEx) we have that
-    # didn't link to any FSL row in this run. User wants these
-    # surfaced so no AWB stays silently orphaned. Sourced from the
-    # most recent awb_sync run (cached at module level — set by the
-    # 17:30 sync ~30 min before this digest).
-    unmatched = awb_sync.get_last_unmatched_shipments()
-    if unmatched:
+    # didn't link to any FSL row. User wants these surfaced so no
+    # AWB stays silently orphaned.
+    #
+    # V1.17.x — read from the OPS "Unmatched AWBs" tab (persisted by
+    # awb_sync). Falls back to the in-memory cache from the current
+    # process if the sheet is empty (covers the cold-boot case where
+    # the digest fires before the first sync has happened in this
+    # process). Persisting means a failed sync run doesn't silently
+    # erase yesterday's footer — the list stays visible until the
+    # next SUCCESSFUL sync rewrites the tab.
+    unmatched_rows: list[dict] = []
+    try:
+        unmatched_rows = await asyncio.to_thread(sheets.load_unmatched_awbs)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not read persisted unmatched AWBs: %s", e)
+    if not unmatched_rows:
+        for s in awb_sync.get_last_unmatched_shipments():
+            unmatched_rows.append({
+                "awb": s.awb, "carrier": s.carrier,
+                "recipient_name": s.recipient_name,
+                "ship_date": s.ship_date.strftime("%Y-%m-%d") if s.ship_date else "",
+                "last_updated_utc": "",
+            })
+
+    if unmatched_rows:
         lines.append("")
         lines.append("━━━━━━━━━━━━━━")
+        # Pull a freshness stamp from any row (they all have the same
+        # last_updated_utc). Helps reps spot a stale list when a sync
+        # has been failing repeatedly.
+        stamp = next(
+            (r.get("last_updated_utc", "") for r in unmatched_rows
+             if r.get("last_updated_utc")),
+            "",
+        )
+        stamp_str = f" · refreshed {h(stamp)}" if stamp else ""
         lines.append(
-            f"⚠️ <b>AWBs not in FSL</b> ({len(unmatched)}) — "
+            f"⚠️ <b>AWBs not in FSL</b> ({len(unmatched_rows)}){stamp_str} — "
             "add the customer to the FSL, type HAND CARRY, "
             "or set an alias in <i>AWB Customer Aliases</i>:"
         )
-        # Sort by date descending so the most recent shipments are
-        # first — reps usually act on the latest gaps first.
+        # Sort by ship date descending (most recent first). String dates
+        # sort correctly as YYYY-MM-DD.
         unmatched_sorted = sorted(
-            unmatched, key=lambda s: s.ship_date, reverse=True,
+            unmatched_rows,
+            key=lambda r: str(r.get("ship_date") or ""),
+            reverse=True,
         )
-        for s in unmatched_sorted:
-            d = s.ship_date.strftime("%d %b") if s.ship_date else "?"
+        for r in unmatched_sorted:
+            sd = str(r.get("ship_date") or "")
+            d_display = "?"
+            if sd:
+                try:
+                    from datetime import date as _date
+                    parts = sd.split("-")
+                    if len(parts) == 3:
+                        d = _date(int(parts[0]), int(parts[1]), int(parts[2]))
+                        d_display = d.strftime("%d %b")
+                except Exception:  # noqa: BLE001
+                    d_display = sd
             lines.append(
-                f"   • {h(s.recipient_name)} — "
-                f"<code>{h(s.awb)}</code> "
-                f"<i>({h(s.carrier)} · {h(d)})</i>"
+                f"   • {h(r.get('recipient_name', ''))} — "
+                f"<code>{h(r.get('awb', ''))}</code> "
+                f"<i>({h(r.get('carrier', ''))} · {h(d_display)})</i>"
             )
 
     return "\n".join(lines), total

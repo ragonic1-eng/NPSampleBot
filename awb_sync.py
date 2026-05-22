@@ -484,6 +484,31 @@ async def run_awb_sync(
     global _LAST_RESULT
     _LAST_RESULT = result
 
+    # V1.17.x — persist the unmatched list to a sheet so the daily digest
+    # can surface it even if a future sync fails (e.g. DHL rate-limited).
+    # The in-memory _LAST_RESULT alone is fragile: a single failed sync
+    # leaves it empty and the 18:00 digest silently drops the footer.
+    # Skip persistence on dry_run so previews don't clobber real state.
+    if not dry_run:
+        try:
+            await asyncio.to_thread(
+                sheets.write_unmatched_awbs,
+                [
+                    {
+                        "awb": s.awb, "carrier": s.carrier,
+                        "recipient_name": s.recipient_name,
+                        "ship_date": s.ship_date,
+                    }
+                    for s in result.unmatched_shipments
+                ],
+            )
+            log.info(
+                "Persisted %d unmatched AWB(s) to OPS:%s",
+                len(result.unmatched_shipments), sheets.TAB_UNMATCHED_AWBS,
+            )
+        except Exception as e:  # noqa: BLE001 — never block the sync result
+            log.warning("Failed to persist unmatched AWBs: %s", e)
+
     return result
 
 

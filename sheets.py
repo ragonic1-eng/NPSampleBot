@@ -568,48 +568,95 @@ UNMATCHED_AWB_HEADER = [
 
 
 def write_unmatched_awbs(rows: list[dict]) -> int:
-    """Overwrite the 'Unmatched AWBs' OPS tab with this run's unmatched list.
+    """MERGE this run's unmatched list with the existing OPS tab content.
 
     `rows` is a list of dicts with keys: awb, carrier, recipient_name,
-    ship_date (str or date). The tab gets cleared + re-headered + re-filled
-    in one batch so a partial write can't leave it inconsistent. Returns
-    the number of data rows written (0 when there are none — header is
-    still set so the digest reader sees a valid empty tab).
+    ship_date (str or date). Existing rows in the tab are preserved
+    UNLESS the same AWB appears in `rows` (in which case the newer
+    entry wins — refresh stamp + any updated metadata). Reps can also
+    MANUALLY append rows to the tab (e.g. FedEx shipments the scraper
+    can't see) and those stay across sync runs.
 
-    Why persist instead of holding in-memory: the in-memory cache in
-    awb_sync is reset on every bot restart AND on every failed sync run.
-    The daily digest at 18:00 SGT was silently dropping the "AWBs not in
-    FSL" footer whenever the 17:30 sync got rate-limited. Writing to a
-    sheet means the digest always has SOMETHING to show, even if it's
-    yesterday's data (clearly time-stamped so reps know).
+    Why merge instead of overwrite: the bot's twice-daily DHL scrape
+    only sees the last ~5 weeks of shipments. If today's sync finds
+    only 2 unmatched (because DHL was rate-limited, or all recent
+    shipments matched FSL), an overwrite would wipe yesterday's 30+
+    unresolved entries — exactly the list reps need to triage. Merge
+    preserves the rolling triage list.
+
+    Returns the total number of rows written (including merged-in
+    historicals + new entries).
     """
     from datetime import datetime as _dt, timezone as _tz, date as _date
     sh = _open_ops()
     try:
         ws = sh.worksheet(TAB_UNMATCHED_AWBS)
+        existing_values = ws.get_all_values()
+        # Skip header row when parsing existing data.
+        existing_rows: list[dict] = []
+        for r in existing_values[1:]:
+            if not r or not (r[0] or "").strip():
+                continue
+            existing_rows.append({
+                "awb": (r[0] or "").strip(),
+                "carrier": (r[1] or "").strip() if len(r) > 1 else "",
+                "recipient_name": (r[2] or "").strip() if len(r) > 2 else "",
+                "ship_date": (r[3] or "").strip() if len(r) > 3 else "",
+                "last_updated_utc": (r[4] or "").strip() if len(r) > 4 else "",
+            })
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(
             title=TAB_UNMATCHED_AWBS,
-            rows=max(50, len(rows) + 10),
+            rows=max(200, len(rows) + 50),
             cols=len(UNMATCHED_AWB_HEADER),
         )
-    # Always clear + rewrite header so a schema change self-heals.
-    ws.clear()
+        existing_rows = []
+
     now_utc = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
-    body: list[list[str]] = [UNMATCHED_AWB_HEADER]
-    for r in rows:
+
+    # Normalise an incoming row to the dict shape we store on the sheet.
+    def _to_sheet_row(r: dict) -> dict:
         ship_date = r.get("ship_date", "")
         if isinstance(ship_date, _date):
             ship_date = ship_date.strftime("%Y-%m-%d")
+        return {
+            "awb": str(r.get("awb", "")).strip(),
+            "carrier": str(r.get("carrier", "")).strip(),
+            "recipient_name": str(r.get("recipient_name", "")).strip(),
+            "ship_date": str(ship_date or ""),
+            "last_updated_utc": now_utc,
+        }
+
+    # Merge by AWB. Newer wins.
+    by_awb: dict[str, dict] = {}
+    for r in existing_rows:
+        awb = (r.get("awb") or "").strip()
+        if awb:
+            by_awb[awb] = r
+    for r in rows:
+        norm = _to_sheet_row(r)
+        if norm["awb"]:
+            by_awb[norm["awb"]] = norm
+
+    # Sort by ship_date desc (newest first) for readability in the sheet.
+    merged = sorted(
+        by_awb.values(),
+        key=lambda r: str(r.get("ship_date") or ""),
+        reverse=True,
+    )
+
+    ws.clear()
+    body: list[list[str]] = [UNMATCHED_AWB_HEADER]
+    for r in merged:
         body.append([
-            str(r.get("awb", "")),
-            str(r.get("carrier", "")),
-            str(r.get("recipient_name", "")),
-            str(ship_date or ""),
-            now_utc,
+            r.get("awb", ""),
+            r.get("carrier", ""),
+            r.get("recipient_name", ""),
+            r.get("ship_date", ""),
+            r.get("last_updated_utc", ""),
         ])
     ws.update(values=body, range_name="A1")
-    return len(rows)
+    return len(merged)
 
 
 def load_unmatched_awbs() -> list[dict]:

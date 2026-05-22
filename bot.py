@@ -6662,10 +6662,76 @@ async def _build_daily_digest_body() -> tuple[str, int]:
     sales_totals: dict[str, int] = {}
     customer_keys: set[str] = set()
 
+    # V1.17.x — Carrier vs FSL coverage summary. Sales sees this and
+    # immediately knows whether the carriers + FSL agree. Big mismatches
+    # (e.g. 19 FSL samples but 0 carrier shipments visible) signal a
+    # scrape gap they need to investigate (FedEx Akamai block, DHL rate
+    # limit, etc.) or AWBs they should fill in manually.
+    fsl_with_awb = 0
+    fsl_hand_carry = 0
+    fsl_no_awb = 0
+    for label, _, _, _ in region_specs:
+        for r in by_region.get(label, []):
+            awb_val = (r.get("AWB") or "").strip()
+            if not awb_val:
+                fsl_no_awb += 1
+            elif "HAND" in awb_val.upper() and "CARRY" in awb_val.upper():
+                fsl_hand_carry += 1
+            elif "HC" == awb_val.upper() or "HANDCARRY" == awb_val.upper():
+                fsl_hand_carry += 1
+            else:
+                fsl_with_awb += 1
+
+    # Carrier-side counts from the most recent sync run. Filter by
+    # today's ship_date so we count today's carrier activity, not the
+    # whole 14-day rolling window. _LAST_RESULT is in-memory and may
+    # be None / stale on a fresh boot — we degrade to "—" gracefully.
+    from datetime import date as _date
+    dhl_today_total = 0
+    dhl_today_matched = 0
+    fedex_today_total = 0
+    sync_result = getattr(awb_sync, "_LAST_RESULT", None)
+    if sync_result is not None:
+        for s in (sync_result.unmatched_shipments or []):
+            if s.ship_date == today and s.carrier == "DHL":
+                dhl_today_total += 1
+            elif s.ship_date == today and s.carrier == "FedEx":
+                fedex_today_total += 1
+        for u in (sync_result.applied_updates or []):
+            m_date = None
+            try:
+                m_date = _date.fromisoformat(u.fsl_date_iso) if u.fsl_date_iso else None
+            except Exception:  # noqa: BLE001
+                m_date = None
+            if m_date == today and u.carrier == "DHL":
+                dhl_today_total += 1
+                dhl_today_matched += 1
+            elif m_date == today and u.carrier == "FedEx":
+                fedex_today_total += 1
+    dhl_unmatched_today = dhl_today_total - dhl_today_matched
+    dhl_str = (
+        f"DHL {dhl_today_total} ({dhl_today_matched} matched · "
+        f"{dhl_unmatched_today} unmatched)"
+        if sync_result is not None else "DHL —"
+    )
+    fedex_str = (
+        f"FedEx {fedex_today_total}"
+        if fedex_today_total > 0
+        else "FedEx scrape unavailable"
+    )
+
+    coverage_parts = [dhl_str, fedex_str]
+    if fsl_hand_carry > 0:
+        coverage_parts.append(f"🚗 {fsl_hand_carry} hand-carry")
+    if fsl_no_awb > 0:
+        coverage_parts.append(f"⏳ {fsl_no_awb} awaiting AWB")
+    coverage_line = "📦 <i>Today: " + " · ".join(coverage_parts) + "</i>"
+
     lines = [
         f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>",
         f"<i>{total} sample{'s' if total != 1 else ''} across all "
         "3 factories.</i>",
+        coverage_line,
     ]
     for label, flag, _tab, show_country in region_specs:
         bucket = by_region.get(label, [])

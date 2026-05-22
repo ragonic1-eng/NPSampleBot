@@ -4104,6 +4104,29 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    # Defensive: when a user types /sampleupdate (or any slash command)
+    # as a REPLY to a previous ForceReply prompt — e.g. the 'Find your
+    # last sample' prompt opened by clicking "My samples (me only)" —
+    # some Telegram clients (web especially) deliver the message
+    # WITHOUT a bot_command entity. PTB's filters.COMMAND then returns
+    # False, the message falls through to on_text, and the flag-based
+    # lastsample-reply handler treats the literal '/sampleupdate' as
+    # a search keyword → "No product found... has /sampleupdate in..."
+    #
+    # We side-step this by short-circuiting anything that looks like a
+    # slash-command at column 0. If CommandHandler didn't catch it,
+    # the right behavior is "do nothing" — never search for /xxx.
+    # Also clear the awaiting_lastsample_query flag so the user's
+    # NEXT real text input starts a fresh search, not a stale one.
+    if text.startswith("/"):
+        ctx.user_data.pop("awaiting_lastsample_query", None)
+        log.info(
+            "on_text: ignoring slash-prefixed text %r (looks like a command "
+            "that PTB didn't tag — most often a reply to a ForceReply prompt)",
+            text[:40],
+        )
+        return
+
     # Bulk-paste flow text states (await_paste, ask_budget_amt) run with no
     # active Draft — check those FIRST before the "no draft" guard.
     if await _handle_bulk_text(update, ctx, text):

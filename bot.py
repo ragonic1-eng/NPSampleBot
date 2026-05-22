@@ -6662,76 +6662,10 @@ async def _build_daily_digest_body() -> tuple[str, int]:
     sales_totals: dict[str, int] = {}
     customer_keys: set[str] = set()
 
-    # V1.17.x — Carrier vs FSL coverage summary. Sales sees this and
-    # immediately knows whether the carriers + FSL agree. Big mismatches
-    # (e.g. 19 FSL samples but 0 carrier shipments visible) signal a
-    # scrape gap they need to investigate (FedEx Akamai block, DHL rate
-    # limit, etc.) or AWBs they should fill in manually.
-    fsl_with_awb = 0
-    fsl_hand_carry = 0
-    fsl_no_awb = 0
-    for label, _, _, _ in region_specs:
-        for r in by_region.get(label, []):
-            awb_val = (r.get("AWB") or "").strip()
-            if not awb_val:
-                fsl_no_awb += 1
-            elif "HAND" in awb_val.upper() and "CARRY" in awb_val.upper():
-                fsl_hand_carry += 1
-            elif "HC" == awb_val.upper() or "HANDCARRY" == awb_val.upper():
-                fsl_hand_carry += 1
-            else:
-                fsl_with_awb += 1
-
-    # Carrier-side counts from the most recent sync run. Filter by
-    # today's ship_date so we count today's carrier activity, not the
-    # whole 14-day rolling window. _LAST_RESULT is in-memory and may
-    # be None / stale on a fresh boot — we degrade to "—" gracefully.
-    from datetime import date as _date
-    dhl_today_total = 0
-    dhl_today_matched = 0
-    fedex_today_total = 0
-    sync_result = getattr(awb_sync, "_LAST_RESULT", None)
-    if sync_result is not None:
-        for s in (sync_result.unmatched_shipments or []):
-            if s.ship_date == today and s.carrier == "DHL":
-                dhl_today_total += 1
-            elif s.ship_date == today and s.carrier == "FedEx":
-                fedex_today_total += 1
-        for u in (sync_result.applied_updates or []):
-            m_date = None
-            try:
-                m_date = _date.fromisoformat(u.fsl_date_iso) if u.fsl_date_iso else None
-            except Exception:  # noqa: BLE001
-                m_date = None
-            if m_date == today and u.carrier == "DHL":
-                dhl_today_total += 1
-                dhl_today_matched += 1
-            elif m_date == today and u.carrier == "FedEx":
-                fedex_today_total += 1
-    dhl_unmatched_today = dhl_today_total - dhl_today_matched
-    dhl_str = (
-        f"DHL {dhl_today_total} ({dhl_today_matched} matched · "
-        f"{dhl_unmatched_today} unmatched)"
-        if sync_result is not None else "DHL —"
-    )
-    fedex_str = (
-        f"FedEx {fedex_today_total}"
-        if fedex_today_total > 0
-        else "FedEx scrape unavailable"
-    )
-
-    coverage_parts = [dhl_str, fedex_str]
-    if fsl_hand_carry > 0:
-        coverage_parts.append(f"🚗 {fsl_hand_carry} hand-carry")
-    if fsl_no_awb > 0:
-        coverage_parts.append(f"⏳ {fsl_no_awb} awaiting AWB")
-    coverage_line = "📦 <i>Today: " + " · ".join(coverage_parts) + "</i>"
-
     lines = [
         f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>",
         f"<i>{total} sample{'s' if total != 1 else ''} across all "
         "3 factories.</i>",
-        coverage_line,
     ]
     for label, flag, _tab, show_country in region_specs:
         bucket = by_region.get(label, [])
@@ -6838,6 +6772,45 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                 else:
                     lines.append("       AWB Number: —")
 
+    # Unknown-receiver block — carrier records (DHL/FedEx) the bot
+    # couldn't match to any FSL customer. Sales can self-identify these
+    # at a glance and either add the customer to FSL or set an alias.
+    # Appears BEFORE the top-sender divider so the actionable block
+    # sits closer to the regional sections it relates to.
+    #
+    # V1.17.x — read from the OPS "Unmatched AWBs" tab (persisted by
+    # awb_sync). Falls back to in-memory cache for the cold-boot case.
+    unmatched_rows: list[dict] = []
+    try:
+        unmatched_rows = await asyncio.to_thread(sheets.load_unmatched_awbs)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not read persisted unmatched AWBs: %s", e)
+    if not unmatched_rows:
+        for s in awb_sync.get_last_unmatched_shipments():
+            unmatched_rows.append({
+                "awb": s.awb, "carrier": s.carrier,
+                "recipient_name": s.recipient_name,
+                "ship_date": s.ship_date.strftime("%Y-%m-%d") if s.ship_date else "",
+                "last_updated_utc": "",
+            })
+
+    if unmatched_rows:
+        lines.append("")
+        lines.append(
+            "<b>UNKNOWN RECEIVER</b> "
+            "<i>(Data from DHL &amp; FEDEX that i can't identify)</i>"
+        )
+        # Sort by ship date desc — newest first, easiest to triage.
+        unmatched_sorted = sorted(
+            unmatched_rows,
+            key=lambda r: str(r.get("ship_date") or ""),
+            reverse=True,
+        )
+        for r in unmatched_sorted:
+            lines.append("")
+            lines.append(f"{h(r.get('recipient_name', ''))}")
+            lines.append(f"AWB: <code>{h(r.get('awb', ''))}</code>")
+
     # Footer summary — at-a-glance "who did the most today."
     if sales_totals:
         # Sort by descending count, then alphabetical ASC for tie-break.
@@ -6857,73 +6830,6 @@ async def _build_daily_digest_body() -> tuple[str, int]:
             f"({sales_totals[top_sender]}) · "
             f"Customers: {len(customer_keys)}"
         )
-
-    # Unmatched AWBs — carrier records (DHL/FedEx) we have that
-    # didn't link to any FSL row. User wants these surfaced so no
-    # AWB stays silently orphaned.
-    #
-    # V1.17.x — read from the OPS "Unmatched AWBs" tab (persisted by
-    # awb_sync). Falls back to the in-memory cache from the current
-    # process if the sheet is empty (covers the cold-boot case where
-    # the digest fires before the first sync has happened in this
-    # process). Persisting means a failed sync run doesn't silently
-    # erase yesterday's footer — the list stays visible until the
-    # next SUCCESSFUL sync rewrites the tab.
-    unmatched_rows: list[dict] = []
-    try:
-        unmatched_rows = await asyncio.to_thread(sheets.load_unmatched_awbs)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Could not read persisted unmatched AWBs: %s", e)
-    if not unmatched_rows:
-        for s in awb_sync.get_last_unmatched_shipments():
-            unmatched_rows.append({
-                "awb": s.awb, "carrier": s.carrier,
-                "recipient_name": s.recipient_name,
-                "ship_date": s.ship_date.strftime("%Y-%m-%d") if s.ship_date else "",
-                "last_updated_utc": "",
-            })
-
-    if unmatched_rows:
-        lines.append("")
-        lines.append("━━━━━━━━━━━━━━")
-        # Pull a freshness stamp from any row (they all have the same
-        # last_updated_utc). Helps reps spot a stale list when a sync
-        # has been failing repeatedly.
-        stamp = next(
-            (r.get("last_updated_utc", "") for r in unmatched_rows
-             if r.get("last_updated_utc")),
-            "",
-        )
-        stamp_str = f" · refreshed {h(stamp)}" if stamp else ""
-        lines.append(
-            f"⚠️ <b>AWBs not in FSL</b> ({len(unmatched_rows)}){stamp_str} — "
-            "add the customer to the FSL, type HAND CARRY, "
-            "or set an alias in <i>AWB Customer Aliases</i>:"
-        )
-        # Sort by ship date descending (most recent first). String dates
-        # sort correctly as YYYY-MM-DD.
-        unmatched_sorted = sorted(
-            unmatched_rows,
-            key=lambda r: str(r.get("ship_date") or ""),
-            reverse=True,
-        )
-        for r in unmatched_sorted:
-            sd = str(r.get("ship_date") or "")
-            d_display = "?"
-            if sd:
-                try:
-                    from datetime import date as _date
-                    parts = sd.split("-")
-                    if len(parts) == 3:
-                        d = _date(int(parts[0]), int(parts[1]), int(parts[2]))
-                        d_display = d.strftime("%d %b")
-                except Exception:  # noqa: BLE001
-                    d_display = sd
-            lines.append(
-                f"   • {h(r.get('recipient_name', ''))} — "
-                f"<code>{h(r.get('awb', ''))}</code> "
-                f"<i>({h(r.get('carrier', ''))} · {h(d_display)})</i>"
-            )
 
     return "\n".join(lines), total
 

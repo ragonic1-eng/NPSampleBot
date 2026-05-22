@@ -6846,25 +6846,13 @@ async def _build_daily_digest_body() -> tuple[str, int]:
             lines.append(f"{h(r.get('recipient_name', ''))}")
             lines.append(f"AWB: <code>{h(r.get('awb', ''))}</code>")
 
-    # Footer summary — at-a-glance "who did the most today."
-    if sales_totals:
-        # Sort by descending count, then alphabetical ASC for tie-break.
-        # The naive max(..., key=(count, name.lower())) picked the
-        # alphabetically LATEST name on ties (max prefers the larger
-        # tuple, and 'eric' > 'alex'), which felt random to readers.
-        # min with the negated-count key gives "highest count, earliest
-        # name" deterministically.
-        top_sender = min(
-            sales_totals,
-            key=lambda k: (-sales_totals[k], k.lower()),
-        )
-        lines.append("")
-        lines.append("━━━━━━━━━━━━━━")
-        lines.append(
-            f"📊 Top sender: <b>{h(top_sender)}</b> "
-            f"({sales_totals[top_sender]}) · "
-            f"Customers: {len(customer_keys)}"
-        )
+    # V1.17.x — User flagged that the 'Top sender / Customers' summary
+    # was admin-internal stats noise on the group digest. Removed.
+    # Version footer added inline so it appears on the group post too
+    # (the cron-fired _send_digest_to_chat path doesn't go through
+    # send(), which is where /sampleupdate's preview gets it for free).
+    lines.append("")
+    lines.append(f"<i>{config.BOT_VERSION}</i>")
 
     return "\n".join(lines), total
 

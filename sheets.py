@@ -228,6 +228,12 @@ FSL_HEADER = [
     # quotation builder, this value pre-populates the address textarea.
     # Latest shipment wins (overwrites on each match).
     "Customer Address",
+    # V1.17.x — when this row was first appended to FSL by the
+    # MMS→FSL sync. Stored as "YYYY-MM-DD HH:MM UTC" string. Helps reps
+    # answer "did the bot sync this row before tonight's digest fired?"
+    # without having to dig into Railway logs. Auto-populated by
+    # append_fsl_rows so existing callers don't need to know about it.
+    "Ingested At UTC",
 ]
 
 # Code-prefix → tab routing. Used by /pp's FSL fallback and by the sync
@@ -265,7 +271,8 @@ FSL_COL_TASTE = 7
 FSL_COL_CATEGORY = 8
 FSL_COL_RD_PRICE = 9
 FSL_COL_AWB = 10
-FSL_COL_ADDR = 11  # V1.17.0 — Customer Address (col L), filled by AWB sync from DHL ship-to
+FSL_COL_ADDR = 11      # V1.17.0 — Customer Address (col L), filled by AWB sync from DHL ship-to
+FSL_COL_INGESTED = 12  # V1.17.x — Ingested At UTC (col M), stamped by append_fsl_rows
 
 
 def _open_seasoning_master():
@@ -454,9 +461,23 @@ def append_fsl_rows(rows: list[list[str]], tab: str = FSL_TAB) -> int:
 
     # Pad each row up to the full FSL_HEADER width so callers from before
     # V1.16.0 (which still produce 10-element rows) keep working.
+    # V1.17.x — also stamp the Ingested At UTC column with the current
+    # timestamp so reps can see when each row was first synced from MMS.
+    # Empty existing value is auto-filled; an explicit one passed by the
+    # caller is preserved (e.g. for historical-data scripts that know
+    # the true ingestion time).
+    from datetime import datetime as _dt, timezone as _tz
     width = len(FSL_HEADER)
-    padded = [list(r) + [""] * (width - len(r)) if len(r) < width else list(r)
-              for r in rows]
+    now_stamp = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+    padded: list[list[str]] = []
+    for r in rows:
+        row = list(r) + [""] * max(0, width - len(r))
+        # Trim oversized rows (shouldn't happen, defensive).
+        if len(row) > width:
+            row = row[:width]
+        if not (row[FSL_COL_INGESTED] or "").strip():
+            row[FSL_COL_INGESTED] = now_stamp
+        padded.append(row)
 
     # Find the first empty row at the bottom of the existing data.
     existing = ws.get_all_values()

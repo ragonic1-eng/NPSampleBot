@@ -6817,6 +6817,18 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                 "last_updated_utc": "",
             })
 
+    # V1.17.x — TODAY-only filter for the digest. The OPS tab keeps a
+    # rolling backlog of every unresolved unmatched AWB (so reps can
+    # triage anytime), but the 6pm digest is about "samples sent
+    # today" — so only today's carrier AWBs without an FSL match
+    # belong in the UNKNOWN RECEIVER section. Sales explicitly
+    # flagged that older entries pollute the daily message.
+    today_iso = today.strftime("%Y-%m-%d")
+    unmatched_rows = [
+        r for r in unmatched_rows
+        if str(r.get("ship_date") or "").strip() == today_iso
+    ]
+
     if unmatched_rows:
         lines.append("")
         lines.append(

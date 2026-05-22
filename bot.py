@@ -6922,6 +6922,12 @@ async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     formatting and aggregation logic. Uses _send_digest_to_chat so
     busy-day digests that exceed Telegram's 4096-char cap get split
     into multiple messages instead of failing silently.
+
+    V1.17.x — runs an inline MMS → FSL sync FIRST so the digest body
+    is built against the freshest possible state. The 17:40 cron sync
+    is still the primary path, but inlining means a failure of that
+    cron (DHL rate limit, MMS3 outage, etc.) doesn't silently leave
+    the 18:00 digest missing today's sample submissions.
     """
     if not config.DAILY_DIGEST_CHAT_ID:
         log.info("daily_digest: DAILY_DIGEST_CHAT_ID not set — skipping")
@@ -6933,6 +6939,16 @@ async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("daily_digest: DAILY_DIGEST_CHAT_ID is not a valid int: %r",
                     config.DAILY_DIGEST_CHAT_ID)
         return
+
+    # Inline MMS→FSL sync so the digest never builds from stale FSL.
+    try:
+        import sync_engine
+        sync_result = await asyncio.to_thread(
+            sync_engine.run_mms_to_fsl_sync, True,
+        )
+        log.info("daily_digest: inline MMS sync result: %s", sync_result)
+    except Exception as e:  # noqa: BLE001 — never block the digest on sync
+        log.warning("daily_digest: inline MMS sync failed (continuing): %s", e)
 
     body, total = await _build_daily_digest_body()
 
@@ -7002,7 +7018,19 @@ async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     if not _is_update_sample_owner(user):
         await send(update, "🔒 Admin-only command.")
         return
-    await send(update, "📋 Building today's digest…")
+    await send(update, "📋 Building today's digest… <i>(running MMS→FSL sync first for fresh data — takes ~30-60s)</i>")
+    # V1.17.x — inline MMS sync before building the digest body so the
+    # preview/post is always against fresh FSL. Mirrors the cron path
+    # in _daily_sample_digest_job.
+    try:
+        import sync_engine
+        sync_result = await asyncio.to_thread(
+            sync_engine.run_mms_to_fsl_sync, True,
+        )
+        log.info("cmd_sampleupdate: inline MMS sync result: %s", sync_result)
+    except Exception as e:  # noqa: BLE001
+        log.warning("cmd_sampleupdate: inline MMS sync failed (continuing): %s", e)
+        await send(update, f"⚠️ MMS sync had an issue — digest will reflect last-known FSL state: <code>{h(str(e))}</code>")
     try:
         body, total = await _build_daily_digest_body()
     except Exception as e:  # noqa: BLE001

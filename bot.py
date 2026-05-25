@@ -6829,12 +6829,19 @@ async def _build_daily_digest_body() -> tuple[str, int]:
         if str(r.get("ship_date") or "").strip() == today_iso
     ]
 
-    if unmatched_rows:
-        lines.append("")
-        lines.append(
-            "<b>UNKNOWN RECEIVER</b> "
-            "<i>(Data from DHL &amp; FEDEX that i can't identify)</i>"
-        )
+    # Always render the section, even when there's nothing to surface.
+    # User wants the header visible so the absence is explicit ("None")
+    # rather than ambiguous (header missing → maybe the bot forgot, or
+    # maybe scrape failed). With this layout the message is consistent
+    # day-to-day and reps know zero-state by reading "None" once.
+    lines.append("")
+    lines.append(
+        "<b>UNKNOWN RECEIVER</b> "
+        "<i>(Data from DHL &amp; FEDEX that i can't identify)</i>"
+    )
+    if not unmatched_rows:
+        lines.append("None")
+    else:
         # Sort by ship date desc — newest first, easiest to triage.
         unmatched_sorted = sorted(
             unmatched_rows,

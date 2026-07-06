@@ -84,6 +84,18 @@ class SampleRow:
         except ValueError:
             return None
 
+    def sample_request_date_as_date(self) -> dt.date | None:
+        """v0.28.35 (2026-05-20) — Parse the REQUEST date (when the
+        sample was submitted in MMS, vs sample_date_out which is when
+        it was physically dispatched). Used by the new request-date
+        sync path so the Sample Master Google Sheet can also surface
+        REQUESTED but not yet dispatched samples."""
+        s = (self.sample_request_date or "").strip()
+        try:
+            return dt.datetime.strptime(s, "%d/%b/%Y").date()
+        except ValueError:
+            return None
+
 
 # ---------- Login ----------
 
@@ -449,6 +461,173 @@ def search_samples(
         _fmt_date(date_from), _fmt_date(date_to),
     )
     return filtered
+
+
+def search_samples_by_request_date(
+    session: requests.Session, date_from: dt.date, date_to: dt.date
+) -> list[SampleRow]:
+    """v0.28.35 (2026-05-20) — Variant of search_samples() that filters
+    by REQUEST DATE instead of Sample Date Out, AND includes unshipped
+    samples (noship=true). This catches every MMS submission regardless
+    of dispatch status — pending, in-queue, cancelled, dispatched, the
+    lot.
+
+    USER 2026-05-20 reported: 'I checked mms Sample Submission List
+    from Feb to May Ying has requested 82 request' but the bot's sheet
+    showed only 8. Cause: the original search_samples() filters by
+    Sample Date Out + noship=false, which only catches DISPATCHED
+    samples. This new function captures the full REQUEST list.
+
+    Writes to a SEPARATE set of tabs in the Google Sheet so it never
+    pollutes the existing dispatched-only data that the analyst / YoY
+    chart / weekly action list rely on. See sync_engine.py's
+    run_mms_to_submissions_sync() entry point.
+
+    Same DWR-RPC shape as search_samples(); only the date-field names
+    and the noship flag differ.
+    """
+    common = {
+        "country": "", "code": "", "requestFrom": "", "nextActionBy": "",
+        # Filter by REQUEST date (was empty in dispatched-only path)
+        "fromMonth": _month_code(date_from),
+        "fromYear": str(date_from.year),
+        "toMonth": _month_code(date_to),
+        "toYear": str(date_to.year),
+        # Leave OUT date params empty so MMS doesn't double-filter
+        "outFromMonth": "", "outFromYear": "",
+        "outToMonth": "", "outToYear": "",
+        "customer_id": "", "customer_name": "",
+    }
+
+    # Step 1: POST command=find to run the search.
+    session.post(
+        SEARCH_URL,
+        data={**common, "command": "find"},
+        headers={**HEADERS_BASE, "Referer": SEARCH_URL,
+                 "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=60,
+    )
+
+    # Step 2: DWR RPC loadItemList. MMS ver 6.06.151 (2026-07-06): noship=true
+    # now returns ONLY-unshipped (it used to mean include-unshipped). false
+    # returns everything -- shipped AND pending -- which is what we want.
+    ssid = _script_session_id()
+    dwr_body = "\n".join([
+        "callCount=1",
+        "windowName=",
+        "page=/mms3/master/sampleSubmissionSearch.do",
+        "httpSessionId=",
+        f"scriptSessionId={ssid}",
+        "c0-scriptName=sampleDwr",
+        "c0-methodName=loadItemList",
+        "c0-id=0",
+        "c0-param0=Object_SampleSubmissionSearchDto:{"
+        "country:string:,"
+        "requestFrom:string:,"
+        "nextActionBy:string:,"
+        f"fromMonth:string:{_month_code(date_from)},"
+        f"fromYear:string:{date_from.year},"
+        f"toMonth:string:{_month_code(date_to)},"
+        f"toYear:string:{date_to.year},"
+        "outFromMonth:string:,"
+        "outFromYear:string:,"
+        "outToMonth:string:,"
+        "outToYear:string:,"
+        "customerId:string:,"
+        "prodCode:string:,"
+        "code:string:,"
+        "tmpCustomerName:string:,"
+        "prodName:string:,"
+        "noship:string:false"  # ver 6.06.151: false = everything (true = only unshipped)
+        "}",
+        "batchId=0",
+    ]) + "\n"
+    resp = session.post(
+        DWR_URL,
+        data=dwr_body,
+        headers={
+            **HEADERS_BASE,
+            "Content-Type": "text/plain",
+            "Referer": SEARCH_URL,
+        },
+        timeout=180,
+    )
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+
+    dtos = _extract_sample_dtos(resp.text)
+    rows = [_dto_to_sample_row(d) for d in dtos]
+
+    # Client-side day-precision filter, by REQUEST date this time.
+    # Rows with no request date are kept (better to over-include than
+    # silently drop — calling sync writes them with empty date and
+    # the analyst can decide).
+    filtered: list[SampleRow] = []
+    for r in rows:
+        d = r.sample_request_date_as_date()
+        if d is None:
+            filtered.append(r)
+            continue
+        if date_from <= d <= date_to:
+            filtered.append(r)
+
+    log.info(
+        "MMS (request-date): fetched %d DTOs (%d after date filter) for %s..%s",
+        len(rows), len(filtered),
+        _fmt_date(date_from), _fmt_date(date_to),
+    )
+    return filtered
+
+
+def fetch_all_samples_by_request_date(
+    session: requests.Session, date_from: dt.date, date_to: dt.date
+) -> list[SampleRow]:
+    """Chunked variant of fetch_all_samples() that uses request-date
+    filtering. Same per-chunk retry + dedup + per-chunk-fatal-soft
+    error handling as the dispatched-date path."""
+    out: list[SampleRow] = []
+    seen: set[tuple[str, str]] = set()
+    failed_chunks: list[tuple[dt.date, dt.date, str]] = []
+    for a, b in monthly_chunks(date_from, date_to, months_per_chunk=3):
+        chunk: list[SampleRow] | None = None
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                chunk = search_samples_by_request_date(session, a, b)
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt == 0:
+                    log.warning(
+                        "Request-date chunk %s..%s attempt 1 failed: %s — retrying once",
+                        _fmt_date(a), _fmt_date(b), e,
+                    )
+                    continue
+        if chunk is None:
+            log.error(
+                "Request-date chunk %s..%s permanently failed: %s",
+                _fmt_date(a), _fmt_date(b), last_err,
+            )
+            failed_chunks.append((a, b, str(last_err)))
+            continue
+        if len(chunk) >= 995:
+            log.warning(
+                "Request-date chunk %s..%s returned %d rows (near 1000 cap) — "
+                "reduce months_per_chunk if this keeps happening.",
+                _fmt_date(a), _fmt_date(b), len(chunk),
+            )
+        for r in chunk:
+            key = (r.sample_request_code, r.product_code)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+    if failed_chunks:
+        log.warning(
+            "fetch_all_samples_by_request_date: %d chunks failed — recovered %d rows",
+            len(failed_chunks), len(out),
+        )
+    return out
 
 
 def monthly_chunks(

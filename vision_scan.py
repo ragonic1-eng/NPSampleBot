@@ -375,11 +375,53 @@ def _get_rapidocr():
     return _rapidocr_engine
 
 
+def _rapidocr_run(eng, arr) -> str:
+    """One RapidOCR pass over a BGR array → newline-joined text."""
+    result = eng(arr)
+    # v3.x returns a RapidOCROutput with .txts; v1.x returned
+    # ([[box, text, score], ...], elapse). Handle both.
+    txts = getattr(result, "txts", None)
+    if txts is None and isinstance(result, tuple):
+        rows = result[0] or []
+        txts = [r[1] for r in rows if len(r) > 1]
+    return "\n".join(txts or [])
+
+
+# Tile the image once its long edge passes this, so small print gets a
+# proportionally bigger share of the detector's fixed input size.
+_TILE_MIN_LONG_EDGE = 1400
+_TILE_OVERLAP = 0.18  # fraction — keeps a code that straddles a seam intact
+
+# Cap the working image before OCR. A modern phone file is ~4000px; scanning
+# that plus its tiles measured 29 s on a fast desktop CPU, and Railway's is
+# slower — enough to risk the 75 s scan watchdog. The detector resizes its
+# input to ~736px internally anyway, so downscaling to 2400 costs no
+# detection quality, and the tiles still hand recognition crops well above
+# what Telegram's 1280px photo path can offer.
+#
+# Measured (7-sachet test scene, desktop i7): 29.0 s -> 22.3 s, same 7/7
+# codes. Still the slow path, but it only applies to file sends — a 1280px
+# Telegram photo is under _TILE_MIN_LONG_EDGE, so it never tiles and stays
+# ~1.3 s. That's the intended trade: photos fast, files thorough. The
+# watchdog's ~12 s "still reading…" note covers the wait.
+_MAX_WORK_EDGE = 2400
+
+
 def _rapidocr_extract(img_bytes: bytes) -> list[str]:
     """Scene-text OCR via RapidOCR (PP-OCR ONNX models). Free, local.
 
     Feeds the original colour photo — RapidOCR's DB detector handles
     angle / clutter / lighting itself, so no preprocessing needed.
+
+    V1.17.3 — big images are ALSO scanned as overlapping tiles. Why: the
+    detector resizes its input to a fixed side (~736px) before looking for
+    text. On a wide shot of several sachets that shrinks each printed code
+    to a few pixels and it finds nothing — which is exactly the "clear in my
+    gallery, unreadable to the bot" complaint. Cropping to quadrants first
+    means each quadrant gets the full detector budget, so the same code
+    arrives ~2x larger. Tiles overlap so a code on a seam still lands whole
+    inside at least one tile. The full-frame pass still runs first (it's the
+    cheapest and usually enough); tiles only add codes it missed.
     """
     eng = _get_rapidocr()
     if eng is None:
@@ -391,15 +433,32 @@ def _rapidocr_extract(img_bytes: bytes) -> list[str]:
         from PIL import Image
 
         img = Image.open(_io.BytesIO(img_bytes)).convert("RGB")
+        # Bound the work (see _MAX_WORK_EDGE) so a 4000px file can't stall
+        # the scan on Railway's slower CPU.
+        if max(img.size) > _MAX_WORK_EDGE:
+            scale = _MAX_WORK_EDGE / max(img.size)
+            img = img.resize(
+                (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+                Image.LANCZOS,
+            )
         arr = np.asarray(img)[:, :, ::-1]  # RGB → BGR (OpenCV convention)
-        result = eng(arr)
-        # v3.x returns a RapidOCROutput with .txts; v1.x returned
-        # ([[box, text, score], ...], elapse). Handle both.
-        txts = getattr(result, "txts", None)
-        if txts is None and isinstance(result, tuple):
-            rows = result[0] or []
-            txts = [r[1] for r in rows if len(r) > 1]
-        text = "\n".join(txts or [])
+        texts = [_rapidocr_run(eng, arr)]
+
+        h, w = arr.shape[:2]
+        if max(w, h) >= _TILE_MIN_LONG_EDGE:
+            ox, oy = int(w * _TILE_OVERLAP), int(h * _TILE_OVERLAP)
+            mx, my = w // 2, h // 2
+            for x0, y0, x1, y1 in (
+                (0, 0, mx + ox, my + oy),
+                (max(0, mx - ox), 0, w, my + oy),
+                (0, max(0, my - oy), mx + ox, h),
+                (max(0, mx - ox), max(0, my - oy), w, h),
+            ):
+                try:
+                    texts.append(_rapidocr_run(eng, arr[y0:y1, x0:x1]))
+                except Exception as e:  # noqa: BLE001 — one bad tile is fine
+                    log.debug("RapidOCR tile failed: %s", e)
+        text = "\n".join(texts)
     except Exception as e:  # noqa: BLE001
         log.info("RapidOCR failed: %s", e)
         return []

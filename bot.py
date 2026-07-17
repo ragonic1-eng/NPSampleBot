@@ -1647,12 +1647,26 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📷 <b>Scan a product photo</b>\n\n"
         "<b>📎 Reply to this message</b> with a photo of one or more "
         "product code labels (<code>S-XXXXX-XX</code>). I'll read them and "
-        "pull the price for each.",
+        "pull the price for each.\n\n"
+        "💡 <b>Codes tiny or far away? Send it as a FILE</b> "
+        "(📎 → <i>File</i>) — Telegram shrinks normal photos to ~1280px and "
+        "small print stops being readable. As a file I get your "
+        "full-resolution original.",
     )
 
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle a photo upload — OCR for product codes, then auto-/pp each one.
+
+    Accepts BOTH:
+      • a normal photo  — Telegram re-encodes these and caps the long edge
+        at ~1280px. A crisp 4000px gallery original arrives downsampled, and
+        on a wide shot of several sachets each printed code lands ~20px tall
+        — far too small to read. This is THE usual cause of "couldn't spot a
+        product code" on a photo that looks perfectly sharp in the gallery.
+      • an image sent as a FILE/document (V1.17.3) — Telegram passes those
+        through UNCOMPRESSED, so we get the rep's full-resolution original
+        and small codes stay legible.
 
     GATED: only fires if the user explicitly opted into a scan, via either:
       a) ctx.user_data["awaiting_scan_photo"] flag (set by /scan or the
@@ -1667,7 +1681,14 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _authorized(update):
         return
     msg = update.effective_message
-    if not msg or not msg.photo:
+    if not msg:
+        return
+    # An image sent as a file arrives as a document, not a photo.
+    doc = getattr(msg, "document", None)
+    doc_is_image = bool(
+        doc and (doc.mime_type or "").lower().startswith("image/")
+    )
+    if not msg.photo and not doc_is_image:
         return
     has_flag = bool(ctx.user_data.pop("awaiting_scan_photo", None))
     replied = msg.reply_to_message
@@ -1703,13 +1724,20 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        photo = msg.photo[-1]  # largest size for best OCR
-        tg_file = await ctx.bot.get_file(photo.file_id)
+        if doc_is_image:
+            # Sent as a FILE — Telegram stores it byte-for-byte, so this is
+            # the rep's untouched original. Best possible input for OCR.
+            src_id, was_compressed = doc.file_id, False
+        else:
+            # Sent as a PHOTO — [-1] is the largest of Telegram's re-encoded
+            # sizes, still capped near 1280px on the long edge.
+            src_id, was_compressed = msg.photo[-1].file_id, True
+        tg_file = await ctx.bot.get_file(src_id)
         buf = await tg_file.download_as_bytearray()
     except Exception as e:  # noqa: BLE001
         log.exception("Photo download failed")
         await _cleanup()
-        await send(update, f"😕 Couldn't read that photo: {h(str(e))}")
+        await send(update, f"😕 Couldn't read that photo: {_friendly_fetch_error(e)}")
         return
 
     # Build the catalog set (uppercase) once, used by the self-healer.
@@ -1768,12 +1796,50 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _cleanup()
 
     if not result.codes:
-        await send(
-            update,
-            "🙈 Couldn't spot a product code in that photo.\n"
-            "Try again with better lighting or a closer crop — codes look like "
-            "<code>S-XXXXX-XX</code> or <code>S-XXXXXX</code>.",
-        )
+        # V1.17.3 — explain WHY, using the resolution we actually received.
+        # The usual culprit isn't lighting: Telegram re-encodes photos down
+        # to ~1280px, so a wide shot of several sachets leaves each code a
+        # handful of pixels tall. Sending the same image as a FILE bypasses
+        # that entirely, so lead with the fix that actually works.
+        dims = ""
+        try:
+            import io as _io
+
+            from PIL import Image as _Image
+
+            with _Image.open(_io.BytesIO(bytes(buf))) as _im:
+                w, hgt = _im.size
+            dims = f" (I received {w}×{hgt}px)"
+        except Exception:  # noqa: BLE001 — diagnostics only
+            pass
+
+        bits = [f"🙈 Couldn't spot a product code in that photo{dims}."]
+        if was_compressed:
+            bits += [
+                "",
+                "📉 <b>Telegram shrank it.</b> Photos get re-encoded to about "
+                "1280px wide, so small printed codes turn to mush — even "
+                "though the original looks sharp in your gallery.",
+                "",
+                "✅ <b>Best fix — send it as a file:</b>",
+                "   <i>Attach (📎) → File → pick the photo</i>",
+                "   (on iPhone: 📎 → File → Browse → Photos)",
+                "That sends your <b>full-resolution original</b>, which I can "
+                "actually read.",
+                "",
+                "📷 <b>Or:</b> photograph <b>fewer sachets up close</b> — one "
+                "or two per shot beats seven in one frame.",
+            ]
+        else:
+            bits += [
+                "",
+                "I got your full-resolution file, so the codes may be too "
+                "small or blurry in frame. Try a <b>closer shot of fewer "
+                "sachets</b>, or type the code instead.",
+            ]
+        bits += ["", "<i>Codes look like <code>S-XXXXX-XX</code> or "
+                     "<code>S-XXXXXX</code>. You can also just type one.</i>"]
+        await send(update, "\n".join(bits))
         return
 
     # Build a summary so the user sees what we detected (and any auto-corrections).
@@ -5958,6 +6024,10 @@ async def _handle_menu_callback(update, ctx, action: str):
             "<b>📎 Reply to this message</b> with a photo of one or more "
             "product code labels (<code>S-XXXXX-XX</code>). I'll read them "
             "and pull the price for each.\n\n"
+            "💡 <b>Codes small or far away? Send it as a FILE</b> "
+            "(📎 → <i>File</i>) instead of a photo — Telegram shrinks normal "
+            "photos to ~1280px and small print becomes unreadable. As a file "
+            "I get your full-resolution original.\n\n"
             "<i>Why reply? In group chats, Telegram's privacy mode hides "
             "non-reply messages from bots. In a DM you can just send the photo.</i>",
         )
@@ -8148,6 +8218,11 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    # V1.17.3 — images sent as a FILE arrive as documents, not photos, and
+    # Telegram does NOT re-encode them. That's the only way to get the rep's
+    # full-resolution original, which is what makes small printed codes
+    # readable. Same handler; on_photo detects which one it got.
+    app.add_handler(MessageHandler(filters.Document.IMAGE, on_photo))
     # V1.13.8 — voice messages route through Groq Whisper → /pp.
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_error_handler(on_error)

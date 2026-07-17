@@ -13,17 +13,25 @@ form share one repo and one git history.
    - **Root Directory:** `quote_web`  ← important, the project is in a subfolder
    - Leave Build & Output Settings on the defaults.
 4. Click **Deploy**. First deploy takes ~2 minutes.
-5. When it's green, copy the production URL (looks like
-   `https://np-quote-web.vercel.app`).
-6. Paste that URL into the bot's `.env` file:
+5. When it's green, copy the production URL.
 
-   ```
-   QUOTE_WEB_URL=https://np-quote-web.vercel.app
+   The **live deployment is https://quoteweb-blue.vercel.app** — that's what
+   the bot points at today.
+
+6. Tell the bot about it by editing **`QUOTE_WEB_URL` in `config.py`**:
+
+   ```python
+   QUOTE_WEB_URL = "https://quoteweb-blue.vercel.app"
    ```
 
-   On Railway: add the same env var under the bot project's Variables tab,
-   then restart the bot. Once it sees the URL, `/quote` will start handing
-   out clickable links.
+   ⚠️ **Do NOT set a `QUOTE_WEB_URL` env var on Railway — it is ignored.**
+   It used to be honoured, and that caused a real outage: a stale variable
+   left over from the retired `np-quote-web.vercel.app` deployment (now a
+   404) silently overrode the correct value in code, so reps were handed a
+   dead link with nothing in the repo to explain why. Since the URL is
+   public and only changes when the app is redeployed, it now lives in
+   `config.py` only — one place, no dashboard step to forget. Any leftover
+   Railway variable is harmless; delete it whenever convenient.
 
 ## Run locally
 

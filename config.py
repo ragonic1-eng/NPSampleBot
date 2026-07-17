@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.17.3"
+BOT_VERSION = "V1.17.4"
 
 # DHL Express + FedEx login credentials used by awb_sync to scrape recent
 # shipments. NEVER commit values to .env — set them on Railway's
@@ -21,13 +21,18 @@ FEDEX_PASS = os.getenv("FEDEX_PASS", "").strip()
 # opens this URL with their sales name pre-filled via ?sales= — quote_web/
 # app/page.tsx reads that param and pre-selects the signatory.
 #
-# V1.17.2 — live deployment baked in as the default so the feature works
-# without any Railway dashboard step. It's a public URL, not a secret (same
-# pattern as CUSTOMER_MASTER_SHEET_ID). Set the QUOTE_WEB_URL env var on
-# Railway to point at a different deployment without a code change.
-QUOTE_WEB_URL = os.getenv(
-    "QUOTE_WEB_URL", "https://quoteweb-blue.vercel.app"
-).strip().rstrip("/")
+# V1.17.4 — this is now the SINGLE SOURCE OF TRUTH and the QUOTE_WEB_URL env
+# var is deliberately NOT read any more. Why: Railway still carries a
+# QUOTE_WEB_URL pointing at the retired np-quote-web.vercel.app deployment
+# (now a hard 404), and because an env var beats a code default, that stale
+# value silently overrode V1.17.2 and kept handing reps a dead link. The URL
+# is public, not a secret, and only ever changes when the app is redeployed
+# — i.e. alongside a code change anyway — so config is the right home for it
+# and there's no dashboard step to forget.
+#
+# Deleting the stale Railway variable is harmless but no longer necessary;
+# it is simply ignored. To move to a new deployment, edit this line.
+QUOTE_WEB_URL = "https://quoteweb-blue.vercel.app"
 
 # Margin added to MMS raw_material_cost before showing it to the user (and
 # before logging to the Query audit tab). Covers handling / overhead so

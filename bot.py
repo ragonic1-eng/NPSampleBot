@@ -461,24 +461,30 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     #   • added "🔎 Search seasonings" — region-aware browse-only search
     #     that lets reps explore the SG / ID / TH sample history without
     #     raising a sample request
-    # V1.13.15 — simplified menu. 'Raise a sample request' hidden (still
-    # accessible via /new for power users) and Scan + Enter-a-code merged
-    # into one 'Look up product code' button that accepts either typed
-    # codes or a product photo. Reps overwhelmingly use this bot to look
-    # things up, so the menu now leads with that.
+    # V1.17.x — typing-first menu. The smart router auto-detects typed
+    # codes / customer / rep / product words, so the old '💲 Look up
+    # product code' button (which only armed a typing flag) is gone;
+    # 📷 Scan takes its slot because photos are the one input that still
+    # needs a button (group-chat privacy mode requires the reply gate).
+    # menu:lookup and menu:code handlers stay registered so buttons on
+    # old messages keep working.
     menu = [
         [("🔎 Search seasonings", "menu:search")],
-        [("💲 Look up product code", "menu:lookup")],
+        [("📷 Scan a product photo", "menu:scan")],
         [("📄 Build a quotation", "menu:quote")],
-        [("👤 My samples (me only)", "menu:lastsample")],
-        [("🌐 All reps' samples", "menu:alllastsample")],
+        [("👤 My samples", "menu:lastsample"),
+         ("🌐 All reps'", "menu:alllastsample")],
     ]
     # MMS → Full Sample Listing sync is now automated weekly via the
     # JobQueue (see main()). No manual Telegram trigger.
     await send(
         update,
-        "👋 <b>Hi! I help you look up product prices and search seasonings.</b>\n\n"
-        "<i>Tap a button below — or type /help anytime to see what each command does.</i>",
+        "👋 <b>Just type — I auto-detect what you mean:</b>\n"
+        "  • code <code>S-668U1</code> → 💲 price\n"
+        "  • customer name → 📦 samples sent to them\n"
+        "  • rep name (<i>Alex</i>) → 👔 samples they sent\n"
+        "  • product words (<i>cheese bbq</i>) → 🔎 matches\n\n"
+        "<i>Buttons for photos &amp; browsing · /help for all commands.</i>",
         kb(menu),
     )
 
@@ -587,6 +593,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>📚 NPSampleBot — commands</b>",
         "",
         "<b>Sample requests</b>",
+        "💡 <b>Just type — no menu needed.</b> I auto-detect what you mean:",
+        "  • a code (<code>S-668U1</code>) → price",
+        "  • a customer name → samples sent to them",
+        "  • a rep's name (e.g. <i>Alex</i>) → samples they sent",
+        "  • product words (<i>cheese bbq</i>) → matching products",
+        "",
         "/start — main menu",
         "/bulk — paste a multi-seasoning email, I split it for you",
         "/samples — review the requests you've raised",
@@ -605,6 +617,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # whole message (which dropped /help into the generic error fallback).
         "/pp &lt;code&gt; — fetch price (Code · Name · R&amp;D Price · Raw Material Cost)",
         "/scan — send a photo, I OCR codes and run /pp on each",
+        "🎤 Voice — just send a voice message saying the code (<i>'S dash 668 U 1'</i>)",
         "/lastsample [keyword] — most recent sample <b>you</b> sent (e.g. <code>/lastsample asian thai</code>)",
         "/alllastsample [keyword] — most recent sample <b>any rep</b> sent — shared visibility across the team",
         "",
@@ -1070,20 +1083,29 @@ async def _load_lastsample_rows(scope: str, mms_name: str = "") -> list[dict]:
     "no match".
     """
     region_tabs = (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB)
-    rows: list[dict] = []
+
+    # The three tabs load CONCURRENTLY (independent network reads; the
+    # sheets-layer cache makes repeats instant, concurrency cuts the cold
+    # path to the slowest single tab instead of the sum). Per-tab failures
+    # are tracked; a single tab failing degrades gracefully.
     failures: list[str] = []
-    for tab in region_tabs:
+
+    async def _one_tab(tab: str) -> list[dict]:
         try:
             if scope == "all":
-                part = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
-            else:
-                part = await asyncio.to_thread(
-                    sheets.load_fsl_rows_for_sales, mms_name, tab,
-                )
-            rows.extend(part)
+                return await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
+            return await asyncio.to_thread(
+                sheets.load_fsl_rows_for_sales, mms_name, tab,
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("_load_lastsample_rows: tab %r read failed: %s", tab, e)
             failures.append(f"{tab}: {type(e).__name__}")
+            return []
+
+    parts = await asyncio.gather(*(_one_tab(t) for t in region_tabs))
+    rows: list[dict] = []
+    for part in parts:
+        rows.extend(part)
     # If ALL tabs failed we deliberately raise so the search handler can
     # tell the user 'Sheets is rate-limited, try again in a minute'
     # instead of showing 'no match'.
@@ -1198,6 +1220,89 @@ def _dedupe_codes(codes: list[str], cap: int = PP_BATCH_CAP_USER) -> list[str]:
     return out
 
 
+async def _await_with_status(
+    aw,
+    on_status,
+    *,
+    slow_after: float = 10.0,
+    busy_after: float = 30.0,
+    hard_timeout: float = 90.0,
+    slow_text: str = "⏳ Taking longer than usual — still working…",
+    busy_text: str = "😮‍💨 The server seems slow or busy — still trying…",
+):
+    """Await `aw` but keep the user informed when it drags (V1.17.x).
+
+    The rule this enforces: the user must never stare at a silent loader
+    for more than ~30 seconds. Timeline:
+        slow_after   → on_status(slow_text)    (~10s: "taking longer…")
+        busy_after   → on_status(busy_text)    (~30s: "server busy…")
+        hard_timeout → TimeoutError            (caller sends the give-up
+                                                message + retry button)
+
+    `on_status` is an async callable receiving the status text — callers
+    pass something that edits their loader message (or sends a new one).
+    Status failures are swallowed; the work itself is never interrupted
+    by a messaging error. On hard timeout the task is cancelled — a
+    threaded requests call keeps running in the background until its own
+    socket timeout, but its result is discarded.
+    """
+    task = asyncio.ensure_future(aw)
+    elapsed = 0.0
+    for at, text in ((slow_after, slow_text), (busy_after, busy_text)):
+        remaining = at - elapsed
+        if remaining > 0:
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+            if done:
+                return task.result()
+            elapsed = at
+        try:
+            await on_status(text)
+        except Exception:  # noqa: BLE001 — status is best-effort
+            pass
+    done, _ = await asyncio.wait({task}, timeout=max(0.0, hard_timeout - elapsed))
+    if done:
+        return task.result()
+    task.cancel()
+    raise TimeoutError(f"no response after {int(hard_timeout)} seconds")
+
+
+def _friendly_fetch_error(e: Exception) -> str:
+    """Translate connection-ish exceptions into plain rep language.
+
+    Reps see 'ConnectionError(MaxRetryError…)' as gibberish; tell them
+    what actually matters — server unreachable / busy / timed out — and
+    that retrying shortly is the fix.
+    """
+    blob = f"{type(e).__name__} {e}".lower()
+    if "timeout" in blob or "timed out" in blob:
+        return "the server took too long to respond (timeout) — it may be busy. Try again in a minute."
+    if "connection" in blob or "getaddrinfo" in blob or "name resolution" in blob or "unreachable" in blob:
+        return "I can't reach the server right now (connection problem) — it may be down or the network is flaky. Try again shortly."
+    if "502" in blob or "503" in blob or "504" in blob or "bad gateway" in blob:
+        return "the server is temporarily overloaded — try again in a minute."
+    return h(str(e))
+
+
+async def _close_catalog_codes(code: str, limit: int = 3) -> list[str]:
+    """Near-miss catalog codes for a code that wasn't found anywhere.
+
+    Backed by matcher.close_code_matches (edit distance ≤2, same prefix).
+    Sheet errors just mean no suggestions — never let this helper break
+    the not-found reply it decorates.
+    """
+    try:
+        seasonings = await asyncio.to_thread(sheets.load_seasonings)
+        catalog = {
+            str(s.get("code", "")).strip().upper()
+            for s in seasonings
+            if s.get("code")
+        }
+        return [c for c, _d in matcher.close_code_matches(code, catalog, limit=limit)]
+    except Exception as e:  # noqa: BLE001
+        log.debug("close-code suggestions failed for %s: %s", code, e)
+        return []
+
+
 async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
     """Fetch /pp for each code, edit-in-place loader, audit-log every result.
 
@@ -1242,11 +1347,26 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-        async def _replace(text: str) -> None:
+        async def _replace(text: str, markup=None) -> None:
             try:
-                await placeholder.edit_text(text, parse_mode=ParseMode.HTML)
+                await placeholder.edit_text(
+                    text, parse_mode=ParseMode.HTML, reply_markup=markup
+                )
             except Exception:  # noqa: BLE001 — message may be too old to edit
-                await chat.send_message(text, parse_mode=ParseMode.HTML)
+                await chat.send_message(
+                    text, parse_mode=ParseMode.HTML, reply_markup=markup
+                )
+
+        # V1.17.x — single-code lookups get two bonus buttons under the
+        # price: jump straight to the last sample of THIS code (own /
+        # any rep). Batch pastes stay button-free — they're price sweeps.
+        def _price_kb():
+            if len(codes) != 1:
+                return None
+            return kb([
+                [("📦 My last sample of this code", f"lsx:s:{code}")],
+                [("🌐 Any rep's last sample", f"lsx:a:{code}")],
+            ])
 
         # Helper: render an FSL-only reply (3 lines, no RMC). Used both
         # when MMS doesn't have the variant and when MMS returned a
@@ -1269,7 +1389,7 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
                 f"<b>Name:</b> {h(fsl_name)}\n"
                 f"<b>R&amp;D Price:</b> {fsl_price_display}"
             )
-            await _replace(body)
+            await _replace(body, markup=_price_kb())
             _audit(
                 query=asked_code,
                 result="Found (FSL)",
@@ -1280,12 +1400,52 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             )
 
         try:
-            product = await asyncio.to_thread(client.fetch_product, code)
+            # V1.17.x — watchdog keeps the rep informed: status update at
+            # ~10s and ~30s, hard give-up at 90s. No more silent stares at
+            # "Grab a tea" while MMS hangs.
+            product = await _await_with_status(
+                asyncio.to_thread(client.fetch_product, code),
+                on_status=_replace,
+                slow_text=(
+                    f"⏳ Still loading <code>{h(code)}</code>… "
+                    "MMS is a bit slow right now."
+                ),
+                busy_text=(
+                    f"😮‍💨 The MMS server seems <b>busy or slow</b> — still "
+                    f"trying <code>{h(code)}</code>. I'll give up at 90 seconds…"
+                ),
+            )
+        except TimeoutError:
+            await _replace(
+                f"🔌 MMS didn't answer after <b>90 seconds</b> for "
+                f"<code>{h(code)}</code> — the server may be down or busy.\n"
+                "Please try again in a minute.",
+                markup=kb([[(f"🔄 Retry {code}", f"pp:{code}")],
+                           [("🏠 Main menu", "menu:home")]]),
+            )
+            _audit(query=code, result="Timeout", error="MMS no response in 90s")
+            continue
         except mms_product.ProductNotFound:
             # MMS has no record at all. Try FSL by exact code before giving up.
             fsl_row = await asyncio.to_thread(sheets.find_fsl_product_by_code, code)
             if fsl_row:
                 await _reply_from_fsl(code, fsl_row)
+                continue
+            # V1.17.x — smarter not-found: suggest near-miss catalog codes
+            # (one mistyped / misread character away) as tap-to-retry buttons.
+            close = await _close_catalog_codes(code)
+            if close:
+                await _replace(
+                    f"😕 No product found for <code>{h(code)}</code>.\n\n"
+                    "🤔 <b>Did you mean one of these?</b> Closest codes in "
+                    "the catalog — tap to try:",
+                    markup=kb(
+                        [[(f"🔁 {c}", f"pp:{c}")] for c in close]
+                        + [[("🔎 Search seasonings", "menu:search"),
+                            ("🏠 Main menu", "menu:home")]]
+                    ),
+                )
+                _audit(query=code, result="Not Found")
                 continue
             await _replace(f"😕 No product found for <code>{h(code)}</code>.")
             _audit(query=code, result="Not Found")
@@ -1293,14 +1453,18 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         except mms_product.MMSError as e:
             log.warning("MMS error for %s: %s", code, e)
             await _replace(
-                f"😬 MMS error for <code>{h(code)}</code>: {h(str(e))}"
+                f"😬 MMS error for <code>{h(code)}</code>: {h(str(e))}\n"
+                "<i>Usually temporary — try again in a minute.</i>",
+                markup=kb([[(f"🔄 Retry {code}", f"pp:{code}")]]),
             )
             _audit(query=code, result="MMS Error", error=str(e))
             continue
         except Exception as e:  # noqa: BLE001
             log.exception("Unexpected /pp error for %s", code)
             await _replace(
-                f"😵 Couldn't fetch <code>{h(code)}</code>: {h(str(e))}"
+                f"😵 Couldn't fetch <code>{h(code)}</code>: "
+                f"{_friendly_fetch_error(e)}",
+                markup=kb([[(f"🔄 Retry {code}", f"pp:{code}")]]),
             )
             _audit(query=code, result="Error", error=str(e))
             continue
@@ -1397,7 +1561,7 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             f"<b>R&amp;D Price:</b> {rd_line}\n"
             f"<b>Raw Material Cost:</b> {rmc_line}"
         )
-        await _replace(body)
+        await _replace(body, markup=_price_kb())
         # For audit, log the FSL fallback as a numeric only if it parses
         # cleanly to a float — non-USD currency text isn't comparable, so
         # leave it None there.
@@ -1418,14 +1582,17 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
 
     # V1.12.5: 'what next' footer. The price reply for each code is an
     # edited placeholder, not a fresh message, so without this footer the
-    # rep is left staring at a price with no obvious action. Three quick
-    # CTAs cover the common next steps.
+    # rep is left staring at a price with no obvious action.
+    # V1.17.x — typing-first: the old '✏️ Look up another code' button
+    # only armed a typing flag; the smart router made it redundant, so
+    # the footer now TEACHES typing and keeps just the two taps that do
+    # something typing can't.
     try:
         await update.effective_chat.send_message(
-            "Done. What next?",
+            "✅ Done — <i>type another code, a customer, or a rep name "
+            "anytime.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb([
-                [("✏️ Look up another code", "menu:code")],
                 [("📷 Scan a photo", "menu:scan"),
                  ("🏠 Main menu", "menu:home")],
             ]),
@@ -1557,12 +1724,43 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.warning("Catalog load failed for scan: %s", e)
         catalog_codes = set()
 
+    async def _notice_status(text: str) -> None:
+        try:
+            await notice.edit_text(text, parse_mode=ParseMode.HTML)
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
-        result = await vision_scan.scan_image(bytes(buf), catalog_codes)
+        # V1.17.x — watchdog: status update at ~12s and ~30s, give up at
+        # 75s, so a hung OCR/vision call never leaves the rep in silence.
+        result = await _await_with_status(
+            vision_scan.scan_image(bytes(buf), catalog_codes),
+            on_status=_notice_status,
+            slow_after=12,
+            busy_after=30,
+            hard_timeout=75,
+            slow_text=(
+                "🔍 Still reading your photo… double-checking the "
+                "characters with AI vision."
+            ),
+            busy_text=(
+                "😮‍💨 The vision service is slow right now — still "
+                "working on your photo (giving up at 75s)…"
+            ),
+        )
+    except TimeoutError:
+        await _cleanup()
+        await send(
+            update,
+            "🔌 Photo reading timed out after <b>75 seconds</b> — the "
+            "vision service may be busy. Please send the photo again in "
+            "a minute.",
+        )
+        return
     except Exception as e:  # noqa: BLE001
         log.exception("OCR failed")
         await _cleanup()
-        await send(update, f"😵 OCR failed: {h(str(e))}")
+        await send(update, f"😵 OCR failed: {_friendly_fetch_error(e)}")
         return
 
     # OCR done — drop the loading notice AND the user's original photo so
@@ -1590,8 +1788,22 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"\n⚠️ Not in catalog (will still try MMS): "
             + ", ".join(f"<code>{h(c)}</code>" for c in result.unmatched)
         )
+    # V1.17.x — near-miss suggestions for codes we couldn't confidently
+    # heal (ties / implausible edits). Shown as tap-to-lookup buttons so
+    # a misread never dead-ends the rep.
+    sugg_buttons: list[list[tuple[str, str]]] = []
+    for raw_code, cands in result.suggestions.items():
+        if not cands:
+            continue
+        lines.append(
+            f"🤔 <code>{h(raw_code)}</code> is close to: "
+            + ", ".join(f"<code>{h(c)}</code>" for c in cands[:3])
+            + " — tap below to check one."
+        )
+        for c in cands[:3]:
+            sugg_buttons.append([(f"🔁 {c}", f"pp:{c}")])
     lines.append("\n☕ Grab a tea. Loading…")
-    await send(update, "\n".join(lines))
+    await send(update, "\n".join(lines), kb(sugg_buttons) if sugg_buttons else None)
 
     # Cap at 5 to match the /pp ceiling and avoid spamming MMS.
     unique = _dedupe_codes(result.codes, cap=_pp_cap_for(update.effective_user))
@@ -2279,17 +2491,58 @@ async def _run_seasoning_search(
         )
         return
 
+    # V1.17.x — watchdog: transient status notes at ~10s / ~30s, hard
+    # give-up at 90s. Notes are deleted once the data arrives.
+    _status_msgs: list = []
+
+    async def _search_status(text: str) -> None:
+        try:
+            _status_msgs.append(
+                await update.effective_chat.send_message(
+                    text, parse_mode=ParseMode.HTML
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
-        rows = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
-    except Exception as e:  # noqa: BLE001
-        log.exception("seasoning_search: read failed for %s", tab)
+        rows = await _await_with_status(
+            asyncio.to_thread(sheets.load_fsl_rows_all, tab),
+            on_status=_search_status,
+            slow_text=(
+                f"⏳ Fetching the {label} sample list… Google Sheets is "
+                "a bit slow right now."
+            ),
+            busy_text=(
+                "😮‍💨 Google Sheets seems <b>busy</b> — still trying "
+                "(I'll give up at 90 seconds)…"
+            ),
+        )
+    except TimeoutError:
         await send(
             update,
-            f"😕 Couldn't read {label} sample list: {h(str(e))}",
+            f"🔌 Couldn't fetch the {label} sample list within "
+            "<b>90 seconds</b> — Google Sheets may be down or busy. "
+            "Please try again in a minute.",
             kb([[("🔎 Search again", "menu:search"),
                  ("🏠 Main menu", "menu:home")]]),
         )
         return
+    except Exception as e:  # noqa: BLE001
+        log.exception("seasoning_search: read failed for %s", tab)
+        await send(
+            update,
+            f"😕 Couldn't read {label} sample list: {_friendly_fetch_error(e)}",
+            kb([[("🔎 Search again", "menu:search"),
+                 ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+    finally:
+        for _m in _status_msgs:
+            try:
+                await _m.delete()
+            except Exception:  # noqa: BLE001
+                pass
 
     if not rows:
         await send(
@@ -2619,11 +2872,41 @@ async def _run_seasoning_search(
         bits.append("<i>  • Drop the price filter if you set one</i>")
         bits.append("<i>  • If you have a code, paste it directly — "
                     "auto-routes regardless of region</i>")
+        # V1.17.x — cross-domain suggestion: maybe the rep typed a
+        # CUSTOMER, not a product. Probe the customer master and offer
+        # tap-through to that customer's recent samples. Best-effort.
+        cust_buttons: list[list[tuple[str, str]]] = []
+        try:
+            master = await asyncio.to_thread(sheets.load_merged_customers)
+            cust_hits = matcher.top_customer_master(
+                cleaned or query, master, limit=3
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("search no-match customer probe failed: %s", e)
+            cust_hits = []
+        if cust_hits:
+            bits.append("")
+            bits.append(
+                "👤 <i>Or did you mean a customer? Tap to see their "
+                "recent samples:</i>"
+            )
+            for c in cust_hits:
+                cname = (c.get("name") or "").strip()
+                if not cname:
+                    continue
+                btn_label = f"👤 {cname}"
+                if len(btn_label) > 40:
+                    btn_label = btn_label[:38] + "…"
+                payload = cname.encode("utf-8")[:55].decode(
+                    "utf-8", errors="ignore"
+                )
+                cust_buttons.append([(btn_label, f"lsd:c:{payload}")])
         await send(
             update,
             "\n".join(bits),
-            kb([[("🔎 Search again", "menu:search"),
-                 ("🏠 Main menu", "menu:home")]]),
+            kb(cust_buttons
+               + [[("🔎 Search again", "menu:search"),
+                   ("🏠 Main menu", "menu:home")]]),
         )
         return
 
@@ -2964,8 +3247,43 @@ async def _run_lastsample_search(
     # Jakarta tabs so J-code queries are visible to /alllastsample +
     # /lastsample. _load_lastsample_rows handles the per-tab read errors
     # internally (a single tab failing degrades gracefully).
+    # V1.17.x — watchdog: transient status notes at ~10s / ~30s, hard
+    # give-up at 90s. Notes are deleted once the data arrives.
+    _ls_status_msgs: list = []
+
+    async def _ls_status(text: str) -> None:
+        try:
+            _ls_status_msgs.append(
+                await update.effective_chat.send_message(
+                    text, parse_mode=ParseMode.HTML
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
-        rows = await _load_lastsample_rows(scope, mms_name)
+        rows = await _await_with_status(
+            _load_lastsample_rows(scope, mms_name),
+            on_status=_ls_status,
+            slow_text=(
+                "⏳ Fetching the sample listing… Google Sheets is a bit "
+                "slow right now."
+            ),
+            busy_text=(
+                "😮‍💨 Google Sheets seems <b>busy</b> — still trying "
+                "(I'll give up at 90 seconds)…"
+            ),
+        )
+    except TimeoutError:
+        await send(
+            update,
+            "🔌 Couldn't fetch the sample listing within <b>90 seconds</b> "
+            "— Google Sheets may be down or busy. Please try again in a "
+            "minute.",
+            _last_kb(scope),
+        )
+        _re_arm(prev)
+        return
     except Exception as e:  # noqa: BLE001
         log.exception("lastsample: FSL read failed")
         # Detect the common rate-limit case and show a friendlier message
@@ -2983,10 +3301,16 @@ async def _run_lastsample_search(
                 "after a short wait will succeed.</i>"
             )
         else:
-            msg = f"😕 Couldn't read Full Sample Listing: <code>{h(err_text)}</code>"
+            msg = f"😕 Couldn't read Full Sample Listing: {_friendly_fetch_error(e)}"
         await send(update, msg, _last_kb(scope))
         _re_arm(prev)
         return
+    finally:
+        for _m in _ls_status_msgs:
+            try:
+                await _m.delete()
+            except Exception:  # noqa: BLE001
+                pass
 
     if not rows:
         whose = "any rep" if scope == "all" else f"<b>{h(mms_name)}</b>"
@@ -3577,6 +3901,309 @@ async def _show_customer_samples(
     await send(update, "\n".join(lines), kb(btn_rows))
 
 
+# --------------- V1.17.x: universal smart text router ---------------
+#
+# "Type anything" UX: a plain message with no active flow is identified
+# and routed instead of dead-ending at 'no active draft':
+#   • product code            → /pp price lookup
+#   • sales-rep name (Alex…)  → that rep's recent samples
+#   • customer/company name   → samples sent to that company (all reps)
+#   • product keywords        → catalog matches with tap-to-price buttons
+# Ambiguous input shows one compact message with all plausible readings
+# as buttons — one tap to resolve, no menu digging.
+
+# Filler words reps naturally type around a name ("samples for alex",
+# "show me datong"). Stripped before identification probes.
+_ROUTE_FILLER_RE = re.compile(
+    r"\b(?:sample|samples|for|show|me|sent|send|by|to|of|the|please|list|"
+    r"from|what|did|out|last|latest|recent|find|search|lookup|look|up)\b",
+    re.IGNORECASE,
+)
+
+
+def _route_strip_fillers(text: str) -> str:
+    stripped = _ROUTE_FILLER_RE.sub(" ", text)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    return stripped or text.strip()
+
+
+async def _active_rep_names() -> list[str]:
+    """Distinct MMS Names of active rows on the Authorized Users tab."""
+    try:
+        users = await asyncio.to_thread(sheets.load_users)
+    except Exception as e:  # noqa: BLE001
+        log.debug("rep-name probe: load_users failed: %s", e)
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in users:
+        active = str(sheets._row_get_loose(row, "Active")).strip().lower()
+        if active not in {"y", "yes", "true", "1"}:
+            continue
+        name = str(sheets._row_get_loose(row, "MMS Name")).strip()
+        key = " ".join(name.lower().split())
+        if name and key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names
+
+
+def _match_rep_names(text: str, rep_names: list[str]) -> tuple[list[str], bool]:
+    """Match typed text against rep MMS names.
+
+    Returns (matches, strong). Strong = exact full-name or exact
+    first-name match ("alex" → "Alex Tan") — safe to route directly.
+    Fuzzy (WRatio ≥ 85) hits are weak: offered as buttons only.
+    """
+    from rapidfuzz import fuzz
+
+    q = " ".join((text or "").lower().split())
+    if len(q) < 3:
+        return [], False
+    strong: list[str] = []
+    weak: list[str] = []
+    for name in rep_names:
+        n = " ".join(name.lower().split())
+        if q == n or q == n.split(" ")[0]:
+            strong.append(name)
+            continue
+        if fuzz.WRatio(q, n) >= 85:
+            weak.append(name)
+    if strong:
+        return strong, True
+    return weak, False
+
+
+async def _show_rep_samples(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    rep_name: str,
+    page: int = 0,
+) -> None:
+    """Render a 10-sample page of ``rep_name``'s sent samples, newest first.
+
+    Mirrors _show_customer_samples: pagination state fully encoded in the
+    callback (rppg:<page>:<rep_hash>) so it survives worker switches.
+    """
+    try:
+        rows = await _load_lastsample_rows("self", rep_name)
+    except Exception as e:  # noqa: BLE001
+        log.exception("rep view: FSL read failed")
+        await send(
+            update,
+            f"😕 Couldn't read Full Sample Listing: {_friendly_fetch_error(e)}",
+        )
+        return
+
+    if not rows:
+        await send(
+            update,
+            f"📭 I don't see any samples sent by <b>{h(rep_name)}</b> in "
+            "Full Sample Listing yet.",
+            kb([[("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    from datetime import date as _date
+    SENTINEL = _date(1900, 1, 1)
+    rows.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
+
+    total = len(rows)
+    total_pages = max(1, (total + _CUST_PAGE_SIZE - 1) // _CUST_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    start = page * _CUST_PAGE_SIZE
+    end = min(start + _CUST_PAGE_SIZE, total)
+    page_rows = rows[start:end]
+
+    rep_pref_currency = await _user_pref_currency(update)
+
+    page_marker = (
+        f"  <i>(page {page + 1} of {total_pages}, "
+        f"showing {start + 1}–{end} of {total})</i>"
+        if total_pages > 1
+        else f"  <i>({total} total)</i>"
+    )
+    lines = [f"👔 <b>Samples sent by {h(rep_name)}:</b>{page_marker}", ""]
+    for i, r in enumerate(page_rows, start + 1):
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        cust = (r.get("Customer Name") or "—").strip() or "—"
+        name = r.get("Product Name") or "—"
+        code = r.get("Product Code") or "—"
+        price_raw = (r.get("R&D Price") or "").strip()
+        price = _format_price_for_currency(price_raw, rep_pref_currency) if price_raw else "—"
+        lines.append(
+            f" {i}. {h(date_str)} · <b>{h(cust)}</b> · {h(name)} · "
+            f"<code>{h(code)}</code> · {h(price)}"
+        )
+
+    sync_footer = await _last_sync_footer()
+    if sync_footer:
+        lines.append("")
+        lines.append(f"<i>{sync_footer}</i>")
+
+    rep_hash = _cust_hash(rep_name)
+    pnav: list[tuple[str, str]] = []
+    if page > 0:
+        if page > 1:
+            pnav.append(("⏮ First", f"rppg:0:{rep_hash}"))
+        pnav.append(("◀ Prev", f"rppg:{page - 1}:{rep_hash}"))
+    if end < total:
+        next_count = min(_CUST_PAGE_SIZE, total - end)
+        pnav.append((f"Next {next_count} ▶", f"rppg:{page + 1}:{rep_hash}"))
+
+    btn_rows = []
+    if pnav:
+        btn_rows.append(pnav)
+    btn_rows.append([("🏠 Main menu", "menu:home")])
+    await send(update, "\n".join(lines), kb(btn_rows))
+
+
+async def _rep_name_from_hash(target_hash: str) -> str | None:
+    """Resolve a rppg:/rep: callback hash back to an MMS name — stateless."""
+    for name in await _active_rep_names():
+        if _cust_hash(name) == target_hash:
+            return name
+    return None
+
+
+async def _smart_route_text(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    header: str | None = None,
+) -> None:
+    """Identify what the rep typed and route it — no menu taps needed.
+
+    Order of identification:
+      1. Product code(s) anywhere in the text → /pp each.
+      2. Exact rep name (and no equally-strong customer reading) → that
+         rep's recent samples immediately.
+      3. Strong customer-master match (score ≥ 90, no rep conflict) →
+         all-scope customer search (shows samples to that company).
+      4. Anything else that got probe hits → ONE compact message with
+         every plausible reading as buttons (rep / customer / product).
+      5. Nothing hit at all → all-scope FSL search (product+customer,
+         existing disambiguation) as the final net.
+    """
+    # 1) Embedded codes win outright ("price for S-668U1 please").
+    codes = _PP_CODE_RE.findall(text)
+    if codes:
+        unique = _dedupe_codes(codes, cap=_pp_cap_for(update.effective_user))
+        await _run_pp_for_codes(update, unique)
+        return
+
+    try:
+        await update.effective_chat.send_action("typing")
+    except Exception:  # noqa: BLE001
+        pass
+
+    probe = _route_strip_fillers(text)
+
+    # --- probes: three independent cached sheets, loaded CONCURRENTLY so
+    # the cold path costs one round-trip, not three (V1.17.x perf pass).
+    async def _cust_probe() -> list[dict]:
+        try:
+            master = await asyncio.to_thread(sheets.load_merged_customers)
+            return matcher.top_customer_master(probe, master, limit=3)
+        except Exception as e:  # noqa: BLE001
+            log.warning("smart route: customer probe failed: %s", e)
+            return []
+
+    async def _prod_probe() -> list[dict]:
+        try:
+            seasonings = await asyncio.to_thread(sheets.load_seasonings)
+            return matcher.top_seasonings(probe, seasonings, limit=3)
+        except Exception as e:  # noqa: BLE001
+            log.warning("smart route: product probe failed: %s", e)
+            return []
+
+    rep_names, cust_hits, prod_hits = await asyncio.gather(
+        _active_rep_names(), _cust_probe(), _prod_probe()
+    )
+    rep_hits, rep_strong = _match_rep_names(probe, rep_names)
+    cust_strong = bool(cust_hits) and cust_hits[0].get("score", 0) >= 90
+
+    # 2) Unambiguous rep → straight to their samples.
+    if rep_strong and len(rep_hits) == 1 and not cust_strong:
+        await _show_rep_samples(update, ctx, rep_hits[0])
+        return
+
+    # 3) Unambiguous customer → straight to their sample history.
+    if cust_strong and not rep_hits and not prod_hits:
+        await _run_lastsample_search(
+            update, ctx, mms_name="", query=cust_hits[0]["name"],
+            prev="", mode="customer", scope="all",
+        )
+        # The lastsample engine re-arms its sticky "next text refines this
+        # search" flag. For ROUTER-initiated searches that would hijack the
+        # rep's next message (typing 'alex' after a customer lookup must
+        # show Alex's samples, not refine the old search) — disarm it so
+        # every bare text goes back through identification.
+        ctx.user_data.pop("awaiting_lastsample_query", None)
+        return
+
+    # 4) Mixed / weak signals → one compact disambiguation message.
+    if rep_hits or cust_hits or prod_hits:
+        lines = [header or f"🤔 <b>{h(text)}</b> — here's what I found:"]
+        buttons: list[list[tuple[str, str]]] = []
+
+        if rep_hits:
+            lines.append("")
+            lines.append("👔 <b>Sales rep</b> — tap for their sent samples:")
+            for name in rep_hits[:3]:
+                label = f"👔 {name}"
+                if len(label) > 40:
+                    label = label[:38] + "…"
+                buttons.append([(label, f"rep:{_cust_hash(name)}")])
+
+        if cust_hits:
+            lines.append("")
+            lines.append("🏢 <b>Customer</b> — tap to see samples sent to them:")
+            for c in cust_hits:
+                cname = (c.get("name") or "").strip()
+                if not cname:
+                    continue
+                label = f"🏢 {cname}"
+                if len(label) > 40:
+                    label = label[:38] + "…"
+                # lsdall:c: = existing all-scope customer search callback.
+                payload = cname.encode("utf-8")[:52].decode("utf-8", errors="ignore")
+                buttons.append([(label, f"lsdall:c:{payload}")])
+
+        if prod_hits:
+            lines.append("")
+            lines.append("🥫 <b>Product</b> — tap for the price:")
+            for i, s in enumerate(prod_hits, 1):
+                p_code = str(s.get("code") or "").strip().upper()
+                price = s.get("price") or "—"
+                lines.append(
+                    f"  {i}. <b>{h(s['name'])}</b>\n"
+                    f"      <code>{h(p_code or '—')}</code> · {h(str(price))}"
+                )
+                if p_code:
+                    label = f"{i}. {p_code} · {s['name']}"
+                    if len(label) > 40:
+                        label = label[:38] + "…"
+                    buttons.append([(label, f"pp:{p_code}")])
+
+        buttons.append([("🔎 Region search", "menu:search"),
+                        ("🏠 Main menu", "menu:home")])
+        await send(update, "\n".join(lines), kb(buttons))
+        return
+
+    # 5) Final net: all-scope FSL search (its auto mode has product vs
+    # customer disambiguation and honest no-match messaging built in).
+    ctx.user_data["lastsample_scope"] = "all"
+    ctx.user_data["lastsample_active_query"] = ""
+    await _run_lastsample_search(
+        update, ctx, mms_name="", query=probe, prev="", mode="auto", scope="all",
+    )
+    # Same disarm as step 3 — router-initiated searches must not capture
+    # the rep's next message; identification runs fresh every time.
+    ctx.user_data.pop("awaiting_lastsample_query", None)
+
+
 async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Diagnostic: bypasses auth, directly reports what the bot can read
     from the Authorized Users tab. Used to debug 'not authorized' problems."""
@@ -3653,6 +4280,11 @@ async def cmd_reload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.to_thread(sheets.load_customer_master),
             asyncio.to_thread(sheets.load_customers),
             asyncio.to_thread(sheets.load_users),
+            # V1.17.x — FSL rows cache is cleared by invalidate_caches
+            # too; re-warm all three region tabs concurrently.
+            *(asyncio.to_thread(sheets.load_fsl_rows_all, t)
+              for t in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB,
+                        sheets.BANGKOK_FSL_TAB)),
         )
     except Exception as e:  # noqa: BLE001
         log.warning("reload warmup failed: %s", e)
@@ -4096,6 +4728,24 @@ _QUESTIONS = {
 
 # --------------------------- text handler ---------------------------
 
+async def _code_entry_text_fallback(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    """V1.17.x — smarter search when code-entry text isn't a code.
+
+    Delegates to the universal smart router with a context-aware header,
+    so the Look-up flow understands rep names, customer names, and product
+    keywords exactly like bare chat text does.
+    """
+    await _smart_route_text(
+        update, ctx, text,
+        header=(
+            f"🤔 <b>{h(text)}</b> isn't a product code — so I searched it "
+            "as text instead:"
+        ),
+    )
+
+
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await _authorized(update):
         return
@@ -4286,13 +4936,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if has_code_flag or is_code_reply:
         codes = _PP_CODE_RE.findall(text)
         if not codes:
-            await send(
-                update,
-                "🤔 That doesn't look like a product code (expected something "
-                "like <code>S-668U1</code> or <code>S-62RG3-19</code>). Tap "
-                "<i>Enter a code</i> on the main menu to try again.",
-                kb([[("🏠 Main menu", "menu:home")]]),
-            )
+            # V1.17.x — smarter search: don't dead-end. Treat the text as
+            # keywords and probe products + customers, then suggest.
+            await _code_entry_text_fallback(update, ctx, text)
             return
         unique = _dedupe_codes(codes, cap=_pp_cap_for(update.effective_user))
         await _run_pp_for_codes(update, unique)
@@ -4307,15 +4953,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "Tap below to start fresh:",
                 kb([[("➕ New request", "menu:new"), ("🏠 Main menu", "menu:home")]]),
             )
-        else:
-            await send(
-                update,
-                "🤔 <b>I don't have an active draft for you.</b>\n\n"
-                "<i>This sometimes happens after a bot update — your in-progress "
-                "draft gets reset when the bot redeploys.</i>\n\n"
-                "Tap below to start a new one:",
-                kb([[("➕ New request", "menu:new"), ("🏠 Main menu", "menu:home")]]),
-            )
+            return
+        # V1.17.x — universal smart router. No flow claimed this text, so
+        # instead of the old 'no active draft' dead-end, identify what the
+        # rep typed (code / rep name / customer / product keywords) and
+        # route it. Typing IS the interface now; menus are the fallback.
+        await _smart_route_text(update, ctx, text)
         return
     d.touch()
 
@@ -4532,7 +5175,46 @@ async def _handle_seasoning_text(update, ctx, d: state.Draft, text: str):
         )
         return
 
-    # Step 3: not found anywhere.
+    # Step 3: not found anywhere. V1.17.x — before giving up, offer
+    # near-miss catalog codes (one mistyped character away) as candidates
+    # the rep can pick directly into the draft.
+    close_entries: list[dict] = []
+    if seasonings:
+        catalog = {
+            str(s.get("code", "")).strip().upper()
+            for s in seasonings
+            if s.get("code")
+        }
+        for c, _d in matcher.close_code_matches(code, catalog, limit=3):
+            m = matcher.find_by_code(c, seasonings)
+            if m:
+                close_entries.append(m)
+    if close_entries:
+        ctx.user_data["seasoning_candidates"] = close_entries[:5]
+        ctx.user_data["seasoning_query"] = code
+        lines = [
+            f"🤷 <code>{h(code)}</code> isn't in any catalog — "
+            "<b>did you mean one of these?</b>",
+            "",
+        ]
+        buttons = []
+        for i, c in enumerate(close_entries[:5]):
+            cat = c.get("category") or ""
+            cat_str = f" · <i>{h(cat)}</i>" if cat else ""
+            price = c.get("price") or "—"
+            lines.append(
+                f"<b>{i+1}. {h(c['name'])}</b>{cat_str}\n"
+                f"    code <code>{h(c.get('code') or '—')}</code> · {h(str(price))}"
+            )
+            label = f"{i+1}. {c.get('code', '')} · {c['name']}"
+            if len(label) > 40:
+                label = label[:38] + "…"
+            buttons.append([(label, f"ssn:{i}")])
+        buttons.append([("🔄 Different code", "ssn:reset")])
+        buttons.append(nav_row(include_back=False))
+        await send(update, "\n".join(lines), kb(buttons))
+        return
+
     await send(
         update,
         f"🤷 Couldn't find <code>{h(code)}</code> in any catalog.\n\n"
@@ -4623,6 +5305,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Handle before the no-draft guard.
     if data.startswith("again:"):
         await _handle_again(update, ctx, data.split(":", 1)[1])
+        return
+
+    # V1.17.x — tap-to-lookup a suggested code ("did you mean" buttons on
+    # not-found replies, photo-scan suggestions, retry buttons on errors).
+    # Stateless — the code rides in the callback payload, so it works
+    # across workers and long after the original message. Lives BEFORE the
+    # no-draft guard since these buttons appear outside draft flows.
+    if data.startswith("pp:"):
+        sugg_code = data.split(":", 1)[1].strip().upper()
+        if sugg_code and _PP_CODE_RE.fullmatch(sugg_code):
+            await _run_pp_for_codes(update, [sugg_code])
         return
 
     # /lastsample "Find another" button. Two flavours:
@@ -4733,6 +5426,72 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         await _show_customer_samples(update, ctx, mms, chosen, scope=cs_scope)
+        return
+
+    # V1.17.x — "last sample of this code" buttons under a /pp price
+    # reply. Callback format: lsx:<s|a>:<code>
+    #   s → the tapping rep's own samples (resolves their MMS Name)
+    #   a → any rep's samples (all-scope)
+    # Stateless: the code rides in the payload. Runs the lastsample
+    # search in product mode so the code is matched against Product Code.
+    if data.startswith("lsx:"):
+        lsx_parts = data.split(":", 2)
+        if len(lsx_parts) < 3:
+            return
+        lsx_scope = "all" if lsx_parts[1] == "a" else "self"
+        lsx_code = lsx_parts[2].strip().upper()
+        if not lsx_code:
+            return
+        lsx_mms = ""
+        if lsx_scope == "self":
+            lsx_mms = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
+                sheets.get_user_mms_name,
+                update.effective_user.id, update.effective_user.username,
+            )
+            if not lsx_mms:
+                await send(
+                    update,
+                    "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
+                    "on the <i>Authorized Users</i> tab, then try again.",
+                )
+                return
+            ctx.user_data["lastsample_mms_name"] = lsx_mms
+        ctx.user_data["lastsample_scope"] = lsx_scope
+        await _run_lastsample_search(
+            update, ctx, lsx_mms, lsx_code, prev="", mode="product", scope=lsx_scope,
+        )
+        # Same disarm as the smart router: a button-initiated search must
+        # not capture the rep's next typed message.
+        ctx.user_data.pop("awaiting_lastsample_query", None)
+        return
+
+    # V1.17.x — smart-router rep pick + pagination. Stateless: the rep is
+    # identified by md5[:10] hash of their MMS Name, re-derived from the
+    # Authorized Users tab on whichever worker handles the click.
+    #   rep:<hash>          → first page of that rep's sent samples
+    #   rppg:<page>:<hash>  → pagination within the rep view
+    if data.startswith("rep:") or data.startswith("rppg:"):
+        if data.startswith("rep:"):
+            rep_hash, rep_page = data.split(":", 1)[1].strip(), 0
+        else:
+            parts = data.split(":", 2)
+            if len(parts) < 3:
+                return
+            try:
+                rep_page = int(parts[1])
+            except ValueError:
+                return
+            rep_hash = parts[2].strip()
+        rep_name = await _rep_name_from_hash(rep_hash)
+        if not rep_name:
+            await send(
+                update,
+                "🤔 Couldn't match that rep in the latest Authorized Users "
+                "list — they may have been renamed. Please type the name again.",
+                kb([[("🏠 Main menu", "menu:home")]]),
+            )
+            return
+        await _show_rep_samples(update, ctx, rep_name, page=rep_page)
         return
 
     # /lastsample customer pagination — user tapped First / Prev / Next on
@@ -6525,8 +7284,27 @@ async def _handle_bulk_text(update, ctx, text: str) -> bool:
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error: %s", ctx.error)
     if isinstance(update, Update) and update.effective_chat:
+        # V1.17.x — say WHAT went wrong in rep language, not just
+        # "something went wrong". Network / rate-limit problems get their
+        # own wording so reps know retrying is the fix (not a bug report).
+        err = ctx.error
+        from telegram.error import NetworkError, RetryAfter, TimedOut
+        if isinstance(err, RetryAfter):
+            wait_s = int(getattr(err, "retry_after", 5) or 5)
+            msg = (
+                f"🐢 Telegram is rate-limiting me — please wait "
+                f"~{wait_s} seconds and try again."
+            )
+        elif isinstance(err, (NetworkError, TimedOut)):
+            msg = (
+                "📶 Network hiccup — I lost the connection for a moment. "
+                "Your last action may not have gone through; please try "
+                "it again."
+            )
+        else:
+            msg = "⚠️ Something went wrong. Please try again or /cancel."
         try:
-            await send(update, "⚠️ Something went wrong. Please try again or /cancel.")
+            await send(update, msg)
         except Exception:  # noqa: BLE001
             pass
 
@@ -7344,11 +8122,28 @@ def main():
 
     # Compose post_init: install Telegram command menu AND schedule the
     # weekly MMS → Full Sample Listing sync via JobQueue.
+    async def _warm_fsl_tabs() -> None:
+        # V1.17.x — background warm of the three FSL region tabs so the
+        # first search / lastsample / smart-route after a deploy hits the
+        # rows cache instead of three cold Google API reads. Runs AFTER
+        # the bot is live (never delays startup); failures are harmless —
+        # caches refill lazily on first use.
+        try:
+            await asyncio.gather(
+                *(asyncio.to_thread(sheets.load_fsl_rows_all, t)
+                  for t in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB,
+                            sheets.BANGKOK_FSL_TAB))
+            )
+            log.info("FSL tabs pre-warmed")
+        except Exception as e:  # noqa: BLE001
+            log.warning("FSL warmup failed (will lazy-load): %s", e)
+
     async def _post_init(application: Application) -> None:
         await _install_commands(application)
         await _schedule_weekly_mms_sync(application)
         await _schedule_daily_digest(application)
         await _schedule_awb_sync(application)
+        asyncio.create_task(_warm_fsl_tabs())
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

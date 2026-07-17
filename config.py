@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.16.0"
+BOT_VERSION = "V1.17.0"
 
 # DHL Express + FedEx login credentials used by awb_sync to scrape recent
 # shipments. NEVER commit values to .env — set them on Railway's
@@ -45,6 +45,12 @@ CUSTOMER_MASTER_SHEET_ID = os.getenv(
 CUSTOMER_MASTER_WORKSHEET_NAME = os.getenv("CUSTOMER_MASTER_WORKSHEET_NAME", "Sheet1")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+# V1.17.x — emergency kill-switch for the RapidOCR engine. Set to 1 on
+# Railway if the OCR models ever cause memory pressure; the bot then uses
+# the Tesseract → Haiku path exactly as before. No redeploy needed beyond
+# the env-var change.
+DISABLE_RAPIDOCR = os.getenv("DISABLE_RAPIDOCR", "").strip().lower() in ("1", "true", "yes")
 
 # Groq Whisper — handsfree voice → /pp code lookup. Voice messages get
 # downloaded, transcribed by Groq's whisper-large-v3-turbo (free tier

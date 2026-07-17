@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from rapidfuzz import fuzz, process, utils
+from rapidfuzz.distance import Levenshtein
 
 import re
 
@@ -343,6 +344,44 @@ def find_codes_matching(
                 _add(s)
 
     return matches
+
+
+def close_code_matches(
+    code: str,
+    catalog_codes: set[str] | list[str],
+    limit: int = 3,
+    max_distance: int = 2,
+) -> list[tuple[str, int]]:
+    """Rank catalog codes by edit distance to a mistyped/misread code.
+
+    Used for "did you mean" suggestions when a typed or OCR'd code isn't
+    found anywhere. Guardrails:
+      • candidate must share the same prefix letter (S-/J-/B-/T-) — the
+        prefix routes to a factory, so cross-prefix guesses mislead
+      • length may differ by at most 1 (misreads add/drop one char at most)
+      • Levenshtein distance ≤ ``max_distance``
+
+    Returns [(catalog_code, distance), ...] closest-first, then
+    alphabetical for deterministic ordering on ties.
+    """
+    q = (code or "").strip().upper()
+    if len(q) < 3 or "-" not in q:
+        return []
+    prefix = q.split("-", 1)[0]
+    out: list[tuple[str, int]] = []
+    for c in catalog_codes:
+        cu = str(c).strip().upper()
+        if not cu or cu == q:
+            continue
+        if cu.split("-", 1)[0] != prefix:
+            continue
+        if abs(len(cu) - len(q)) > 1:
+            continue
+        d = Levenshtein.distance(q, cu, score_cutoff=max_distance)
+        if d <= max_distance:
+            out.append((cu, d))
+    out.sort(key=lambda t: (t[1], t[0]))
+    return out[:limit]
 
 
 def top_companies(query: str, customers: list[dict[str, str]], limit: int = 3) -> list[dict[str, str]]:

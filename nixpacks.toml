@@ -8,9 +8,16 @@
 # xrandr/gbm/pango/cairo/asound + a font package or it segfaults on
 # launch. fonts-liberation is the smallest font set that DHL/FedEx
 # don't render as boxes.
+#
+# libgl1 + libglib2.0-0: runtime deps of opencv (pulled in by RapidOCR,
+# the primary OCR engine). Without them `import cv2` fails on the slim
+# Railway image and the bot silently falls back to Tesseract.
 [phases.setup]
 aptPkgs = [
     "tesseract-ocr",
+    # --- opencv (RapidOCR) runtime deps ---
+    "libgl1",
+    "libglib2.0-0",
     # --- chromium runtime deps ---
     "libnss3",
     "libnspr4",

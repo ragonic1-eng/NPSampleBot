@@ -1083,6 +1083,7 @@ def invalidate_caches() -> None:
     _customer_master_cache = None
     _customers_cache = None
     _samples_cache = None
+    _invalidate_fsl_cache()
 
 
 def _norm_tg_id(v) -> str:
@@ -1184,31 +1185,17 @@ def find_fsl_product_by_code(code: str) -> dict | None:
     if not code_upper:
         return None
     # Route by prefix: J- → Jakarta tab, otherwise → main FSL tab.
+    # Reads through load_fsl_rows_all's 90s TTL cache — /pp fallbacks no
+    # longer burn a full-tab network read per code.
     tab = fsl_tab_for_code(code_upper)
-    sh = _open_seasoning_master()
-    try:
-        ws = sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        return None
-    values = ws.get_all_values()
-    if len(values) < 2:
-        return None
-    matches: list[dict] = []
-    for r in values[1:]:
-        if len(r) <= FSL_COL_CODE:
-            continue
-        row_code = (r[FSL_COL_CODE] or "").strip().upper()
-        if row_code != code_upper:
-            continue
-        padded = r + [""] * (len(FSL_HEADER) - len(r))
-        row = {hdr: restore_mangled_unicode(padded[i]) for i, hdr in enumerate(FSL_HEADER)}
-        row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
-        matches.append(row)
+    matches = [
+        row for row in load_fsl_rows_all(tab)
+        if (row.get("Product Code") or "").strip().upper() == code_upper
+    ]
     if not matches:
         return None
     SENTINEL = _d.date(1900, 1, 1)
-    matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
-    return matches[0]
+    return max(matches, key=lambda r: r.get("_date") or SENTINEL)
 
 
 # 90-second TTL cache for the read-heavy FSL paths. /lastsample and
@@ -1231,7 +1218,7 @@ def _invalidate_fsl_cache() -> None:
 def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
     """Return every row from the target FSL tab, regardless of Sales rep.
 
-    Admin-only path: /alllastsample uses this to search across all reps,
+    Used by /alllastsample and the region search to look across all reps,
     in contrast to load_fsl_rows_for_sales() which scopes to one rep.
     Each row includes a parsed ``_date`` for sorting.
 

@@ -157,6 +157,10 @@ class ScanResult:
     raw_codes: list[str]                # exactly what OCR returned (uppercased)
     corrections: dict[str, str]         # raw → corrected, only when changed
     unmatched: list[str]                # codes we couldn't validate against catalog
+    # Per-engine outcome, e.g. ["rapidocr: 0 codes", "tesseract: unavailable",
+    # "haiku: no API key"]. Railway's logs aren't readable from here, so a
+    # failed scan has to be able to explain ITSELF to the rep.
+    attempts: list[str] = field(default_factory=list)
     source: str = "none"                # "rapidocr" | "tesseract" | "haiku" | "<local>+haiku" | "none"
     tokens_in: int = 0
     tokens_out: int = 0
@@ -360,19 +364,66 @@ _rapidocr_engine = None
 _rapidocr_unavailable = False
 
 
+# Why RapidOCR isn't usable, if it isn't — surfaced by engine_status() and in
+# a failed scan's report. Previously this was swallowed into a log line we
+# can't read from here, so a silent fall back to Tesseract (which is poor at
+# scene text) looked identical to "the photo was bad".
+_rapidocr_error: str = ""
+
+
 def _get_rapidocr():
-    global _rapidocr_engine, _rapidocr_unavailable
-    if _rapidocr_unavailable or config.DISABLE_RAPIDOCR:
+    global _rapidocr_engine, _rapidocr_unavailable, _rapidocr_error
+    if config.DISABLE_RAPIDOCR:
+        _rapidocr_error = "disabled via DISABLE_RAPIDOCR"
+        return None
+    if _rapidocr_unavailable:
         return None
     if _rapidocr_engine is None:
         try:
             from rapidocr import RapidOCR  # v2/v3 package name
             _rapidocr_engine = RapidOCR()
+            _rapidocr_error = ""
         except Exception as e:  # noqa: BLE001 — ImportError, model download failure, …
-            log.info("RapidOCR unavailable (%s); using Tesseract path", e)
+            _rapidocr_error = f"{type(e).__name__}: {e}"[:160]
+            log.warning(
+                "RapidOCR unavailable (%s); falling back to Tesseract, which is "
+                "much weaker on photos", _rapidocr_error,
+            )
             _rapidocr_unavailable = True
             return None
     return _rapidocr_engine
+
+
+def engine_status() -> dict[str, str]:
+    """Which OCR engines can actually run right now, and why not if they can't.
+
+    Used by /diag and by the failed-scan report. Cheap: RapidOCR init is
+    cached, and the Anthropic check is just a key/import test.
+    """
+    out: dict[str, str] = {}
+
+    if config.DISABLE_RAPIDOCR:
+        out["rapidocr"] = "OFF (DISABLE_RAPIDOCR set)"
+    elif _get_rapidocr() is not None:
+        out["rapidocr"] = "ready"
+    else:
+        out["rapidocr"] = f"UNAVAILABLE — {_rapidocr_error or 'unknown'}"
+
+    try:
+        import pytesseract
+        from PIL import Image  # noqa: F401
+        pytesseract.get_tesseract_version()
+        out["tesseract"] = "ready"
+    except Exception as e:  # noqa: BLE001
+        out["tesseract"] = f"UNAVAILABLE — {type(e).__name__}: {e}"[:120]
+
+    if not config.ANTHROPIC_API_KEY:
+        out["haiku_vision"] = "OFF (no ANTHROPIC_API_KEY)"
+    elif _client() is None:
+        out["haiku_vision"] = "UNAVAILABLE — client init failed"
+    else:
+        out["haiku_vision"] = "ready"
+    return out
 
 
 def _rapidocr_run(eng, arr) -> str:
@@ -627,21 +678,32 @@ async def scan_image(
     seasoning master sheet. Pass an empty set to skip self-healing.
     """
     catalog_codes = catalog_codes or set()
+    attempts: list[str] = []
 
     # 1) Free path — RapidOCR (scene-text detection) then Tesseract.
-    raw_codes = await asyncio.to_thread(_rapidocr_extract, img_bytes)
+    if _get_rapidocr() is None:
+        attempts.append(f"rapidocr: unavailable ({_rapidocr_error or 'off'})")
+        raw_codes = []
+    else:
+        raw_codes = await asyncio.to_thread(_rapidocr_extract, img_bytes)
+        attempts.append(f"rapidocr: {len(raw_codes)} code(s)")
     source = "rapidocr" if raw_codes else "none"
     if not raw_codes:
         raw_codes = await asyncio.to_thread(_tesseract_extract, img_bytes)
+        attempts.append(f"tesseract: {len(raw_codes)} code(s)")
         if raw_codes:
             source = "tesseract"
     tin = tout = 0
 
     # 2) Paid fallback — Haiku, only if local OCR returned nothing
     if not raw_codes:
-        raw_codes, tin, tout = await asyncio.to_thread(_haiku_extract, img_bytes)
-        if raw_codes:
-            source = "haiku"
+        if not config.ANTHROPIC_API_KEY:
+            attempts.append("haiku: skipped (no ANTHROPIC_API_KEY)")
+        else:
+            raw_codes, tin, tout = await asyncio.to_thread(_haiku_extract, img_bytes)
+            attempts.append(f"haiku: {len(raw_codes)} code(s)")
+            if raw_codes:
+                source = "haiku"
 
     final, corrections, unmatched, suggestions = _heal_against_catalog(
         raw_codes, catalog_codes
@@ -674,4 +736,5 @@ async def scan_image(
         tokens_in=tin,
         tokens_out=tout,
         suggestions=suggestions,
+        attempts=attempts,
     )

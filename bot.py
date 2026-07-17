@@ -28,7 +28,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1698,7 +1698,13 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         and getattr(replied.from_user, "is_bot", False)
         and "Scan a product photo" in (replied.text or "")
     )
-    if not (has_flag or is_scan_reply):
+    # V1.17.5 — in a DM, just scan it. Sending the bot a photo of a label has
+    # exactly one plausible meaning, so demanding a button tap or a reply
+    # first was pure friction (the same reasoning that made bare typed text
+    # auto-route). The gate still applies in GROUPS, where every holiday snap
+    # would otherwise trigger an OCR run and a wall of replies.
+    is_private = (update.effective_chat.type == ChatType.PRIVATE)
+    if not (has_flag or is_scan_reply or is_private):
         return
 
     chat = update.effective_chat
@@ -1839,6 +1845,15 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]
         bits += ["", "<i>Codes look like <code>S-XXXXX-XX</code> or "
                      "<code>S-XXXXXX</code>. You can also just type one.</i>"]
+        # V1.17.5 — show which engines ran and what each returned. Railway's
+        # logs aren't reachable from the dev box, so without this a scan that
+        # found nothing because an OCR engine failed to load looks exactly
+        # like a scan that found nothing because the photo was poor.
+        if result.attempts:
+            bits += [
+                "",
+                "<i>🔧 OCR engines: " + h(" · ".join(result.attempts)) + "</i>",
+            ]
         await send(update, "\n".join(bits))
         return
 
@@ -4287,6 +4302,18 @@ async def cmd_diag(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"SA JSON env: <code>{'SET' if sa_json else 'MISSING'} (len={len(sa_json)})</code>",
         f"OPS_SHEET_ID: <code>{h(config.OPS_SHEET_ID[:12] + '…' if config.OPS_SHEET_ID else 'MISSING')}</code>",
     ]
+
+    # V1.17.5 — OCR engine health. Answers "why did /scan find nothing?"
+    # without needing Railway log access: if RapidOCR failed to load, the
+    # bot silently drops to Tesseract, which is poor on photos.
+    try:
+        lines.append("")
+        lines.append("<b>📷 OCR engines</b>")
+        for name, status in vision_scan.engine_status().items():
+            icon = "✅" if status == "ready" else "❌"
+            lines.append(f"{icon} {name}: <code>{h(status)}</code>")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"❌ engine check failed: <code>{h(str(e)[:200])}</code>")
 
     try:
         users = await asyncio.to_thread(sheets.load_users, True)

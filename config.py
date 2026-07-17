@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.17.1"
+BOT_VERSION = "V1.17.2"
 
 # DHL Express + FedEx login credentials used by awb_sync to scrape recent
 # shipments. NEVER commit values to .env — set them on Railway's
@@ -17,11 +17,17 @@ FEDEX_USER = os.getenv("FEDEX_USER", "").strip()
 FEDEX_PASS = os.getenv("FEDEX_PASS", "").strip()
 
 # Public URL of the Vercel-hosted quotation builder web app (no trailing
-# slash). When set, /quote and the 📄 menu button hand the rep a clickable
-# button that opens this URL with their sales name pre-filled via ?sales=.
-# Empty value = the URL isn't configured yet; the bot will tell the rep
-# to ask the admin to set it.
-QUOTE_WEB_URL = os.getenv("QUOTE_WEB_URL", "").strip().rstrip("/")
+# slash). /quote and the 📄 menu button hand the rep a clickable button that
+# opens this URL with their sales name pre-filled via ?sales= — quote_web/
+# app/page.tsx reads that param and pre-selects the signatory.
+#
+# V1.17.2 — live deployment baked in as the default so the feature works
+# without any Railway dashboard step. It's a public URL, not a secret (same
+# pattern as CUSTOMER_MASTER_SHEET_ID). Set the QUOTE_WEB_URL env var on
+# Railway to point at a different deployment without a code change.
+QUOTE_WEB_URL = os.getenv(
+    "QUOTE_WEB_URL", "https://quoteweb-blue.vercel.app"
+).strip().rstrip("/")
 
 # Margin added to MMS raw_material_cost before showing it to the user (and
 # before logging to the Query audit tab). Covers handling / overhead so

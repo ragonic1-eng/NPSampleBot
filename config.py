@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.17.0"
+BOT_VERSION = "V1.17.1"
 
 # DHL Express + FedEx login credentials used by awb_sync to scrape recent
 # shipments. NEVER commit values to .env — set them on Railway's
@@ -72,7 +72,11 @@ DAILY_DIGEST_CHAT_ID = os.getenv("DAILY_DIGEST_CHAT_ID", "").strip()
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+# V1.17.1 — local_llm.py runs the taste/category enrichment on the PC's CPU
+# for $0 instead of paying Haiku. qwen3.5:4b is the current best speed/quality
+# pick for CPU-only inference (~3.4 GB, no GPU needed). Was "llama3.1", which
+# was never pulled on this machine — the old default would have 404'd.
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:4b")
 
 DRAFT_TIMEOUT_MINUTES = int(os.getenv("DRAFT_TIMEOUT_MINUTES", "30"))
 

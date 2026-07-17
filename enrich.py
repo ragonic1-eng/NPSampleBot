@@ -244,27 +244,11 @@ def _ask_haiku_country(client, customer_name: str) -> str:
         return ""
 
 
-# ---------- Taste describe (~20 keywords) ----------
-
-_TASTE_PROMPT = """\
-You're tagging a seasoning product for an internal search index. Given the
-product code and name, output ~20 comma-separated KEYWORDS a sales rep would
-realistically type when looking for this flavour profile.
-
-Product code: {code}
-Product name: {name}
-
-Rules:
-  - Lowercase only.
-  - Single words or short multi-word phrases (≤3 words each).
-  - Mix of: flavour notes, heat level, cuisine/region, dish association,
-    ingredient cues.
-  - Don't repeat the literal product name. Don't include the product code.
-  - No marketing fluff.
-  - ~20 keywords; 18–22 fine.
-  - Output STRICT JSON only:
-    {{"keywords": ["kw1", "kw2", ...]}}
-"""
+# ---------- Taste describe (house-style blurb) ----------
+#
+# The prompt itself now lives in local_llm.py, which few-shots the model with
+# REAL rows from the sheet — that transfers the house style ("savoury aged
+# cheese — creamy umami profile") far better than a written spec could.
 
 
 def resolve_taste(
@@ -275,12 +259,18 @@ def resolve_taste(
     haiku_client=None,
     fsl_map: dict[str, str] | None = None,
 ) -> str:
-    """Resolve taste keywords cheapest-first.
+    """Resolve the taste blurb — free paths only (V1.17.1: no Anthropic).
 
     Order:
-      1. fsl_map  — already in Full Sample Listing (free, persistent)
-      2. taste_cache — on-disk JSON (free, lost on Railway redeploy)
-      3. Haiku   — paid; only when both caches miss
+      1. fsl_map     — already in Full Sample Listing (free, persistent)
+      2. taste_cache — on-disk JSON (free; lost on Railway redeploy)
+      3. local_llm   — Ollama on the local PC (free); unreachable from
+                       Railway, which is fine: the cell stays blank and a
+                       later local batch run fills it into the sheet, after
+                       which step 1 serves it forever.
+
+    ``haiku_client`` is accepted and ignored — kept so existing callers
+    (sync_engine, the backfill scripts) keep working unchanged.
     """
     if not code:
         return ""
@@ -289,65 +279,31 @@ def resolve_taste(
         return fsl_map[upper]
     if upper in taste_cache and taste_cache[upper]:
         return taste_cache[upper]
-    if haiku_client is None:
+    blurb = _ask_local_taste(name)
+    if blurb:
+        taste_cache[upper] = blurb
+        _save_json(TASTE_CACHE_PATH, taste_cache)
+    return blurb
+
+
+def _ask_local_taste(name: str) -> str:
+    """Free local generation. Returns "" when Ollama isn't reachable."""
+    if not name:
         return ""
-    kws = _ask_haiku_taste(haiku_client, code, name)
-    taste_cache[upper] = kws
-    _save_json(TASTE_CACHE_PATH, taste_cache)
-    return kws
-
-
-def _ask_haiku_taste(client, code: str, name: str) -> str:
     try:
-        msg = client.messages.create(
-            model="claude-haiku-4-5", max_tokens=300,
-            messages=[{"role": "user", "content": _TASTE_PROMPT.format(code=code, name=name)}],
-        )
-        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
-        s, e = text.find("{"), text.rfind("}")
-        if s == -1 or e == -1:
-            return ""
-        kws = json.loads(text[s : e + 1]).get("keywords", [])
-        cleaned: list[str] = []
-        for k in kws:
-            if not isinstance(k, str):
-                continue
-            kk = k.strip().lower()
-            if kk and kk not in cleaned:
-                cleaned.append(kk)
-        return ", ".join(cleaned)
+        import local_llm
+        return local_llm.describe_taste(name)
     except Exception as ex:  # noqa: BLE001
-        log.warning("enrich.taste Haiku failed for %s: %s", code, ex)
+        log.warning("enrich.taste local_llm failed for %r: %s", name, ex)
         return ""
 
 
 # ---------- Category (one of 6 strings) ----------
-
-_CATEGORY_PROMPT = """\
-You're classifying a seasoning product into ONE of exactly six categories
-used by NP Foods:
-
-  - Snack
-  - Noodle & Instant Soup
-  - Sauces & Mixes
-  - Marinades
-  - Oil
-  - Beverage
-
-Rules:
-  - Pick exactly ONE category from the list above. Output it verbatim.
-  - "Snack" = powdered seasonings dusted on chips/popcorn/biscuits/pellets.
-  - "Noodle & Instant Soup" = noodle/ramen/instant-soup flavourings.
-  - "Sauces & Mixes" = wet sauces, dipping sauces, dry mixes.
-  - "Marinades" = grilling/BBQ/chicken/meat marinades.
-  - "Oil" = chilli oil, infused oils, cooking oils.
-  - "Beverage" = drink mixes/powders.
-
-Product code: {code}
-Product name: {name}
-
-Output STRICT JSON only: {{"category": "<one of the six>"}}
-"""
+#
+# Prompt lives in local_llm.py. Note the hard-won detail encoded there: the
+# model MUST be told ~78% of this catalogue is "Snack" (powder dusted on
+# chips). Without that context a general model reads "BBQ SEASONING" and
+# answers "Sauces & Mixes" — measured 8% accuracy vs 92% with it.
 
 
 def resolve_category(
@@ -361,11 +317,15 @@ def resolve_category(
 ) -> str:
     """Resolve category cheapest-first.
 
-    Order:
+    Order (V1.17.1: no Anthropic — free paths only):
       1. tab_map        — the 6 authoritative category tabs (free)
       2. fsl_map        — past FSL row for this code (free, persistent)
-      3. category_cache — on-disk JSON (free, lost on Railway redeploy)
-      4. Haiku          — paid; only when all caches miss
+      3. category_cache — on-disk JSON (free; lost on Railway redeploy)
+      4. local_llm      — Ollama on the local PC (free); unreachable from
+                          Railway, so the cell stays blank there until a
+                          local batch run fills it into the sheet.
+
+    ``haiku_client`` is accepted and ignored — kept for caller compatibility.
     """
     if not code:
         return ""
@@ -376,33 +336,22 @@ def resolve_category(
         return fsl_map[upper]
     if upper in category_cache and category_cache[upper] in CATEGORIES:
         return category_cache[upper]
-    if haiku_client is None:
-        return ""
-    cat = _ask_haiku_category(haiku_client, code, name)
-    category_cache[upper] = cat
-    _save_json(CATEGORY_CACHE_PATH, category_cache)
+    cat = _ask_local_category(name)
+    if cat:
+        category_cache[upper] = cat
+        _save_json(CATEGORY_CACHE_PATH, category_cache)
     return cat
 
 
-def _ask_haiku_category(client, code: str, name: str) -> str:
-    try:
-        msg = client.messages.create(
-            model="claude-haiku-4-5", max_tokens=80,
-            messages=[{"role": "user", "content": _CATEGORY_PROMPT.format(code=code, name=name)}],
-        )
-        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
-        s, e = text.find("{"), text.rfind("}")
-        if s == -1 or e == -1:
-            return ""
-        cat = str(json.loads(text[s : e + 1]).get("category", "")).strip()
-        if cat in CATEGORIES:
-            return cat
-        for valid in CATEGORIES:
-            if cat.lower() == valid.lower():
-                return valid
+def _ask_local_category(name: str) -> str:
+    """Free local classification. Returns "" when Ollama isn't reachable."""
+    if not name:
         return ""
+    try:
+        import local_llm
+        return local_llm.classify_category(name)
     except Exception as ex:  # noqa: BLE001
-        log.warning("enrich.category Haiku failed for %s: %s", code, ex)
+        log.warning("enrich.category local_llm failed for %r: %s", name, ex)
         return ""
 
 

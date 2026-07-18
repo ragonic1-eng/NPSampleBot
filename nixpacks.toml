@@ -65,5 +65,16 @@ aptPkgs = [
 [phases.build]
 cmds = [
     "python -m playwright install chromium",
+    # RapidOCR pulls the DESKTOP opencv-python, which links X11/GL libs the
+    # slim server image lacks — the root cause of the recurring
+    # "libGL.so.1 / libxcb.so.1 not found" RapidOCR failures. opencv-python-
+    # headless is the same library built WITHOUT any GUI/X11 dependency,
+    # made for headless servers exactly like Railway. Swap to it once, and
+    # the whole class of missing-.so errors disappears. Clean uninstall of
+    # every opencv variant first (they share the cv2/ dir, so a partial mix
+    # is worse than none), then install headless only; warm_ocr_models.py
+    # right after both fetches the models AND verifies cv2 imports cleanly.
+    "pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless opencv-contrib-python-headless || true",
+    "pip install opencv-python-headless",
     "python warm_ocr_models.py || true",
 ]

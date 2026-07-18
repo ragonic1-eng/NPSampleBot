@@ -16,3 +16,10 @@ playwright==1.49.0
 # DISABLE_RAPIDOCR=1) — the bot falls back to Tesseract.
 rapidocr==3.9.1
 onnxruntime==1.20.1
+# RapidOCR's transitive dep is the DESKTOP opencv-python, which links X11/GL
+# libs a headless server (Railway) doesn't have — the cause of the recurring
+# "libGL.so.1 / libxcb.so.1 not found" failures. Pin the headless build (same
+# cv2 API, no GUI deps) so it's installed too; the nixpacks build phase then
+# removes the desktop one, leaving cv2 = headless. Verified: RapidOCR reads
+# fine with headless.
+opencv-python-headless==5.0.0.93

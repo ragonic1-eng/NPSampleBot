@@ -9,15 +9,30 @@
 # launch. fonts-liberation is the smallest font set that DHL/FedEx
 # don't render as boxes.
 #
-# libgl1 + libglib2.0-0: runtime deps of opencv (pulled in by RapidOCR,
-# the primary OCR engine). Without them `import cv2` fails on the slim
-# Railway image and the bot silently falls back to Tesseract.
+# opencv (pulled in by RapidOCR, the primary OCR engine) links against a
+# handful of X11/GL shared libraries that the slim Railway image doesn't
+# ship. Missing ANY one makes `import cv2` raise ImportError, RapidOCR then
+# silently drops out, and scans fall back to the weak Tesseract path. We hit
+# them one at a time across deploys (first libGL, then libxcb.so.1), so this
+# is now the COMPLETE documented set for opencv-python on headless Debian —
+# libgl1, glib, libsm6, libxext6, libxrender1, libxcb1, libxi6, libxrandr2,
+# libxfixes3 — to end the whack-a-mole. (libxcb.so.1 → libxcb1 was the one
+# that surfaced in a live /scan diag on V1.17.6.)
 [phases.setup]
 aptPkgs = [
     "tesseract-ocr",
-    # --- opencv (RapidOCR) runtime deps ---
+    # --- opencv (RapidOCR) runtime deps: complete X11/GL set ---
     "libgl1",
     "libglib2.0-0",
+    "libsm6",
+    "libxext6",
+    "libxrender1",
+    "libxcb1",
+    "libxi6",
+    "libxrandr2",
+    "libxfixes3",
+    # onnxruntime (RapidOCR's inference backend) links OpenMP.
+    "libgomp1",
     # --- chromium runtime deps ---
     "libnss3",
     "libnspr4",

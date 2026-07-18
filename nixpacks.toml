@@ -39,5 +39,16 @@ aptPkgs = [
 # After pip install we still need to fetch the Chromium binary itself
 # — pip only installs the python bindings. Skip the system-deps step
 # (we handle those above) so this stays fast on rebuilds.
+#
+# We ALSO warm the RapidOCR model cache at BUILD time. RapidOCR downloads
+# ~20 MB of ONNX models on first use; if that first use is a rep's scan on a
+# container with slow/absent outbound network, init fails or times out and
+# the bot silently drops to Tesseract. `python warm_ocr_models.py` forces the
+# download now, into the image, so the first real scan is instant and can't
+# fail on a network hiccup. It's best-effort (`|| true`) so a transient
+# registry outage never breaks the whole deploy.
 [phases.build]
-cmds = ["python -m playwright install chromium"]
+cmds = [
+    "python -m playwright install chromium",
+    "python warm_ocr_models.py || true",
+]

@@ -516,32 +516,93 @@ def _rapidocr_extract(img_bytes: bytes) -> list[str]:
     return _extract_codes(text)
 
 
+_TESS_WHITELIST = (
+    "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz0123456789-"
+)
+
+
+def _tesseract_preprocess(img):
+    """Grayscale → autocontrast → sharpen, upscaled so small print is legible.
+
+    Tesseract wants characters roughly 30px tall; phone photos of small
+    printed codes are far below that, so we upscale generously (long edge
+    to ~2000px) rather than the old ~800px floor.
+    """
+    from PIL import Image, ImageOps, ImageFilter
+
+    g = img.convert("L")
+    g = ImageOps.autocontrast(g, cutoff=2)
+    g = g.filter(ImageFilter.SHARPEN)
+    long_edge = max(g.size)
+    if long_edge < 2000:
+        scale = min(4.0, 2000 / long_edge)
+        g = g.resize(
+            (max(1, int(g.width * scale)), max(1, int(g.height * scale))),
+            Image.LANCZOS,
+        )
+    return g
+
+
+def _tesseract_read(pytesseract, img) -> str:
+    """Run Tesseract in two page-segmentation modes and concat the text.
+
+    PSM 11 (sparse) finds scattered labels across a multi-sachet shot; PSM 6
+    (uniform block) reads a single tight crop better. Trying both and letting
+    _extract_codes dedupe costs little and catches codes one mode misses.
+    """
+    out = []
+    for psm in (11, 6):
+        try:
+            out.append(pytesseract.image_to_string(
+                img, config=f"--psm {psm} {_TESS_WHITELIST}"))
+        except Exception as e:  # noqa: BLE001 — one mode failing is fine
+            log.debug("Tesseract psm %d failed: %s", psm, e)
+    return "\n".join(out)
+
+
 def _tesseract_extract(img_bytes: bytes) -> list[str]:
-    """Local Tesseract OCR — free. Returns codes or [] if unavailable / nothing useful."""
+    """Local Tesseract OCR — free, and now a genuine standalone fallback.
+
+    V1.17.6 — hardened so the free path still works when RapidOCR is
+    unavailable (e.g. its models failed to load on Railway) AND there's no
+    Anthropic key. The old version did a single sparse-text pass on a lightly
+    upscaled image; on a wide multi-sachet photo that read nothing. Now it:
+      • upscales aggressively (small print → ~30px tall, Tesseract's sweet spot)
+      • tiles big images into overlapping quadrants, like the RapidOCR path,
+        so each code gets a bigger share of a pass
+      • tries two page-segmentation modes and merges the hits
+    """
     try:
         import pytesseract
-        from PIL import Image, ImageOps, ImageFilter
+        from PIL import Image
     except ImportError as e:
-        log.info("Tesseract path unavailable (%s); will use Haiku fallback", e)
+        log.info("Tesseract path unavailable (%s)", e)
         return []
     try:
         import io as _io
+
         img = Image.open(_io.BytesIO(img_bytes))
-        # Phone photos of small printed text need preprocessing — grayscale,
-        # autocontrast, sharpen, then upscale if the image is small.
-        img = img.convert("L")
-        img = ImageOps.autocontrast(img, cutoff=2)
-        img = img.filter(ImageFilter.SHARPEN)
-        if min(img.size) < 800:
-            scale = max(2, 800 // min(img.size))
-            img = img.resize((img.size[0] * scale, img.size[1] * scale))
-        # PSM 11 = sparse text; whitelist the characters MMS codes use.
-        cfg = (
-            "--psm 11 "
-            "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "abcdefghijklmnopqrstuvwxyz0123456789-"
-        )
-        raw = pytesseract.image_to_string(img, config=cfg)
+        proc = _tesseract_preprocess(img)
+        texts = [_tesseract_read(pytesseract, proc)]
+
+        # Tile large images — mirror the RapidOCR tiling so a wide shot of
+        # several sachets isn't read as one shrunken blur.
+        w, hgt = proc.size
+        if max(w, hgt) >= _TILE_MIN_LONG_EDGE:
+            ox, oy = int(w * _TILE_OVERLAP), int(hgt * _TILE_OVERLAP)
+            mx, my = w // 2, hgt // 2
+            for box in (
+                (0, 0, mx + ox, my + oy),
+                (max(0, mx - ox), 0, w, my + oy),
+                (0, max(0, my - oy), mx + ox, hgt),
+                (max(0, mx - ox), max(0, my - oy), w, hgt),
+            ):
+                try:
+                    texts.append(_tesseract_read(pytesseract, proc.crop(box)))
+                except Exception as e:  # noqa: BLE001
+                    log.debug("Tesseract tile failed: %s", e)
+        raw = "\n".join(texts)
     except Exception as e:  # noqa: BLE001 — pytesseract.TesseractNotFound etc.
         log.info("Tesseract OCR failed: %s", e)
         return []

@@ -1,0 +1,19 @@
+# Keep the image lean and never bake secrets in — Railway injects env vars
+# and service_account.json at runtime.
+.env
+service_account.json
+.git
+.claude
+__pycache__
+*.pyc
+node_modules
+quote_web/node_modules
+quote_web/.next
+tests
+# Large local investigation artefacts (not needed at runtime).
+_*.json
+_*.csv
+_*.txt
+_*.html
+*.log
+NPSampleBotSkills

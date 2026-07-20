@@ -156,6 +156,19 @@ def login(session: requests.Session, user: str, password: str) -> bool:
     body = resp.text.lower()
     ok = "logout" in body or "sample submission" in body
     if not ok:
+        # V1.17.14 — MMS's user id is CASE-SENSITIVE. "Alex" vs "alex" was the
+        # entire cause of the 17-21 Jul 2026 blackout: a valid password, a
+        # correctly deployed config, and four days of zero scraping. One
+        # lowercase retry costs a single request and removes that whole class
+        # of outage. Only retried when the id isn't already lowercase, so we
+        # never double-count a genuine bad-credential failure (MMS increments
+        # a server-side faildCount that can lock the account).
+        if user != user.lower():
+            log.warning(
+                "MMS login failed as %r — retrying lowercase (MMS is "
+                "case-sensitive)", user,
+            )
+            return login(session, user.lower(), password)
         log.warning("MMS login appears to have failed (status=%s)", resp.status_code)
     return ok
 

@@ -93,7 +93,10 @@ DRAFT_TIMEOUT_MINUTES = int(os.getenv("DRAFT_TIMEOUT_MINUTES", "30"))
 
 # MMS3 — credentials for /updatesamplelist (sync Sample Master List from MMS).
 # Only visible to the ragonic-gated command, never exposed to other users.
-MMS_USER = os.getenv("MMS_USER", "Alex").strip()
+# V1.17.14 — lowercase. MMS's login is CASE-SENSITIVE on the user id, and the
+# capitalised "Alex" silently stopped authenticating on 17 Jul 2026, killing
+# all scraping for four days while the password was perfectly valid.
+MMS_USER = os.getenv("MMS_USER", "alex").strip()
 MMS_PASSWORD = os.getenv("MMS_PASSWORD", "").strip()
 # V1.17.x — Sample Request code the /pp lookup borrows for the Add-Delete
 # probe trick (mms_product._fetch_rd_via_probe_sr). Used only when a code

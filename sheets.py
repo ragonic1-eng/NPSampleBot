@@ -198,6 +198,51 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
             )
             count += 1
         per_tab.append((ws.title, count))
+
+    # V1.17.11 — FSL fallback. The old per-category catalog tabs ("Snack",
+    # "Noodle & Instant Soup", … with `Seasoning Name` / `Code` columns) no
+    # longer exist in this workbook, so the loop above now yields ZERO rows
+    # and every consumer silently degraded:
+    #   • OCR self-healing ran with an EMPTY catalog — it could never snap a
+    #     misread code to a real one, which is why /scan corrections never
+    #     fired in production
+    #   • product-name search + "did you mean" code suggestions returned
+    #     nothing
+    # The Full Sample Listing tabs are the real source of truth now, and they
+    # carry Product Code / Product Name / Category / R&D Price. Derive the
+    # catalog from them, newest row per code wins (most recent price), so the
+    # catalog self-heals no matter which tabs the workbook keeps.
+    if not cleaned:
+        derived: dict[str, dict[str, Any]] = {}
+        for tab in (FSL_TAB, JAKARTA_FSL_TAB, BANGKOK_FSL_TAB):
+            try:
+                rows = load_fsl_rows_all(tab)
+            except Exception as e:  # noqa: BLE001 — one tab failing is survivable
+                log.warning("load_seasonings FSL fallback: tab %r failed: %s", tab, e)
+                continue
+            for r in rows:
+                code = str(r.get("Product Code", "")).strip().upper()
+                name = str(r.get("Product Name", "")).strip()
+                if not code or not name:
+                    continue
+                prev = derived.get(code)
+                d = r.get("_date")
+                if prev is not None and (prev.get("_d") is not None) and (
+                    d is None or d <= prev["_d"]
+                ):
+                    continue  # keep the newer row
+                derived[code] = {
+                    "name": name,
+                    "price": str(r.get("R&D Price", "")).strip(),
+                    "code": code,
+                    "category": str(r.get("Category", "")).strip(),
+                    "_d": d,
+                }
+        for v in derived.values():
+            v.pop("_d", None)
+        cleaned = list(derived.values())
+        per_tab.append(("<FSL fallback>", len(cleaned)))
+
     _seasoning_cache = (now, cleaned)
     log.info(
         "Loaded %d seasonings across %d tabs (%s)",

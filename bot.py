@@ -7434,11 +7434,51 @@ async def _weekly_mms_sync_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     import sync_engine
     log.info("weekly_mms_sync_job: starting")
+
+    async def _alert(text: str) -> None:
+        """Shout about a broken sync instead of burying it in a log line.
+
+        V1.17.11 — an expired MMS password stopped ALL scraping for 3 days
+        and nobody noticed: run_mms_to_fsl_sync returned
+        {"status": "error", "error": "MMS login failed (check creds)"} and
+        that went straight into a log file no human reads. Silent data-loss
+        is the worst failure mode this bot has, so a failed sync now posts to
+        the digest chat where the team already looks every evening.
+        """
+        chat_id = config.DAILY_DIGEST_CHAT_ID
+        if not chat_id:
+            log.warning("sync alert not sent — DAILY_DIGEST_CHAT_ID unset: %s", text)
+            return
+        try:
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:  # noqa: BLE001 — alerting must never crash the job
+            log.warning("sync alert send failed: %s", e)
+
     try:
         result = await asyncio.to_thread(sync_engine.run_mms_to_fsl_sync, True)
         log.info("weekly_mms_sync_job: result %s", result)
+        if isinstance(result, dict) and result.get("status") == "error":
+            err = str(result.get("error", "unknown"))
+            hint = ""
+            if "login" in err.lower():
+                hint = (
+                    "\n\n<i>MMS is rejecting the bot's credentials. Someone "
+                    "needs to update <code>MMS_PASSWORD</code> in Railway → "
+                    "NPSampleBot → Variables. Until then NO new samples are "
+                    "being recorded.</i>"
+                )
+            await _alert(
+                "🚨 <b>MMS sync FAILED</b> — no new samples were imported.\n"
+                f"<code>{h(err)}</code>{hint}"
+            )
     except Exception as e:  # noqa: BLE001
         log.exception("weekly_mms_sync_job failed: %s", e)
+        await _alert(
+            "🚨 <b>MMS sync CRASHED</b> — no new samples were imported.\n"
+            f"<code>{h(str(e)[:300])}</code>"
+        )
 
 
 # --------------------------- V1.13.13: daily sample digest ---------------------------

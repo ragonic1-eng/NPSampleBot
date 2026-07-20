@@ -106,9 +106,34 @@ def login(session: requests.Session, user: str, password: str) -> bool:
     looking for the login form still being present in the response body.
     """
     # First GET to seed JSESSIONID.
-    session.get(f"{BASE_URL}/", headers=HEADERS_BASE, timeout=30)
+    seed = session.get(f"{BASE_URL}/", headers=HEADERS_BASE, timeout=30)
+
+    # V1.17.13 — post to the form's OWN action, not a hardcoded URL.
+    #
+    # MMS (a Java app) does URL-rewritten session tracking: the login form's
+    # action carries the session inline, e.g.
+    #     /mms3/login.do;jsessionid=5ADA1157BBD079D387C1D22F14E28D18
+    # Posting to a bare /mms3/login.do submits credentials with no session
+    # attached, so the server answers "Login Failed!!" even when the password
+    # is perfectly correct — which is exactly what happened from 17 Jul 2026:
+    # a human could log in fine (the browser follows the form action) while
+    # the bot could not, and the stored credential matched the working one
+    # byte-for-byte. Scraping the action makes us follow whatever session
+    # scheme the server is using today, cookie- or URL-based.
+    post_url = LOGIN_URL
+    try:
+        seed.encoding = "utf-8"
+        m = re.search(
+            r"<form[^>]+action\s*=\s*[\"']([^\"']*login\.do[^\"']*)", seed.text, re.I
+        )
+        if m:
+            from urllib.parse import urljoin
+            post_url = urljoin(f"{BASE_URL}/", m.group(1))
+    except Exception as e:  # noqa: BLE001 — fall back to the static URL
+        log.debug("MMS login: could not read form action (%s); using %s", e, LOGIN_URL)
+
     resp = session.post(
-        LOGIN_URL,
+        post_url,
         data={
             "faildCount": "0",
             "name": user,

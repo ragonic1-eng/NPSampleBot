@@ -258,13 +258,20 @@ def resolve_taste(
     taste_cache: dict[str, str],
     haiku_client=None,
     fsl_map: dict[str, str] | None = None,
+    name_map: dict[str, str] | None = None,
 ) -> str:
     """Resolve the taste blurb — free paths only (V1.17.1: no Anthropic).
 
     Order:
-      1. fsl_map     — already in Full Sample Listing (free, persistent)
-      2. taste_cache — on-disk JSON (free; lost on Railway redeploy)
-      3. local_llm   — Ollama on the local PC (free); unreachable from
+      1. fsl_map     — same CODE already in Full Sample Listing (free)
+      2. name_map    — same product NAME already described (V1.17.12, free).
+                       A new code is usually a re-run of a product we already
+                       describe (new size, regional variant, "(COPY)"), so
+                       this catches what the code map misses: of the 49
+                       unfilled products on 2026-07-20 the code map resolved
+                       0 and the name map resolved 43 (88%).
+      3. taste_cache — on-disk JSON (free; lost on Railway redeploy)
+      4. local_llm   — Ollama on the local PC (free); unreachable from
                        Railway, which is fine: the cell stays blank and a
                        later local batch run fills it into the sheet, after
                        which step 1 serves it forever.
@@ -277,6 +284,10 @@ def resolve_taste(
     upper = code.strip().upper()
     if fsl_map and fsl_map.get(upper):
         return fsl_map[upper]
+    if name_map and name:
+        hit = name_map.get(name.strip().upper())
+        if hit:
+            return hit
     if upper in taste_cache and taste_cache[upper]:
         return taste_cache[upper]
     blurb = _ask_local_taste(name)
@@ -314,14 +325,19 @@ def resolve_category(
     category_cache: dict[str, str],
     haiku_client=None,
     fsl_map: dict[str, str] | None = None,
+    name_map: dict[str, str] | None = None,
 ) -> str:
     """Resolve category cheapest-first.
 
     Order (V1.17.1: no Anthropic — free paths only):
       1. tab_map        — the 6 authoritative category tabs (free)
-      2. fsl_map        — past FSL row for this code (free, persistent)
-      3. category_cache — on-disk JSON (free; lost on Railway redeploy)
-      4. local_llm      — Ollama on the local PC (free); unreachable from
+      2. fsl_map        — past FSL row for this CODE (free, persistent)
+      3. name_map       — same product NAME already categorised (V1.17.12).
+                          Also more RELIABLE than the local model, which
+                          filed "SINGAPORE LAKSA SEASONING" under Snack when
+                          the sheet already had "Noodle & Instant Soup".
+      4. category_cache — on-disk JSON (free; lost on Railway redeploy)
+      5. local_llm      — Ollama on the local PC (free); unreachable from
                           Railway, so the cell stays blank there until a
                           local batch run fills it into the sheet.
 
@@ -334,6 +350,10 @@ def resolve_category(
         return tab_map[upper]
     if fsl_map and fsl_map.get(upper) in CATEGORIES:
         return fsl_map[upper]
+    if name_map and name:
+        hit = name_map.get(name.strip().upper())
+        if hit in CATEGORIES:
+            return hit
     if upper in category_cache and category_cache[upper] in CATEGORIES:
         return category_cache[upper]
     cat = _ask_local_category(name)

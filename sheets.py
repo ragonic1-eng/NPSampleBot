@@ -384,6 +384,16 @@ def load_fsl_state(tab: str = FSL_TAB) -> dict:
     by_customer: dict[str, Counter] = {}
     code_taste: dict[str, str] = {}
     code_category: dict[str, str] = {}
+    # V1.17.12 — NAME-keyed maps as well as code-keyed. A brand-new product
+    # CODE is usually a re-run of a product we already describe (a new size,
+    # a regional variant, a "(COPY)"), so the code map misses it while the
+    # name map hits. Measured over the 49 unfilled products on 2026-07-20:
+    # code-only reuse left all 49 blank; name reuse resolved 43 of them (88%)
+    # with the exact reviewed blurb. That keeps the column a consistent
+    # controlled vocabulary AND avoids inventing text — which matters because
+    # a small local model misreads culinary terms ("Tom Yum" -> "tomato").
+    name_taste: dict[str, str] = {}
+    name_category: dict[str, str] = {}
 
     for r in rows:
         date = (r[FSL_COL_DATE] if len(r) > FSL_COL_DATE else "").strip()
@@ -392,6 +402,7 @@ def load_fsl_state(tab: str = FSL_TAB) -> dict:
         country = (r[FSL_COL_COUNTRY] if len(r) > FSL_COL_COUNTRY else "").strip()
         taste = (r[FSL_COL_TASTE] if len(r) > FSL_COL_TASTE else "").strip()
         category = (r[FSL_COL_CATEGORY] if len(r) > FSL_COL_CATEGORY else "").strip()
+        pname = (r[FSL_COL_NAME] if len(r) > FSL_COL_NAME else "").strip().upper()
 
         if date and code and cust:
             dedupe_keys.add((date, code, _norm_customer(cust)))
@@ -401,12 +412,18 @@ def load_fsl_state(tab: str = FSL_TAB) -> dict:
             code_taste[code] = taste
         if code and category and code not in code_category:
             code_category[code] = category
+        if pname and taste and pname not in name_taste:
+            name_taste[pname] = taste
+        if pname and category and pname not in name_category:
+            name_category[pname] = category
 
     return {
         "dedupe_keys": dedupe_keys,
         "customer_country": {k: ctr.most_common(1)[0][0] for k, ctr in by_customer.items()},
         "code_taste": code_taste,
         "code_category": code_category,
+        "name_taste": name_taste,
+        "name_category": name_category,
     }
 
 

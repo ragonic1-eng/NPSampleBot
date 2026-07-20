@@ -114,6 +114,11 @@ def _process_region(
     customer_map = state["customer_country"]
     fsl_taste_map = state["code_taste"]
     fsl_category_map = state["code_category"]
+    # V1.17.12 — name-keyed reuse. A new product CODE is usually a re-run of a
+    # product already described (new size / regional variant / "(COPY)"), so
+    # these catch what the code maps miss and keep the columns filled for free.
+    name_taste_map = state.get("name_taste", {})
+    name_category_map = state.get("name_category", {})
     # Category-tab lookup (the 6 manual tabs Snack / Noodle ... / Beverage)
     # is only meaningful for Singapore S- codes — Indonesia products aren't
     # listed there. Skip the read entirely for J-.
@@ -231,17 +236,25 @@ def _process_region(
 
             code_upper = (r.product_code or "").strip().upper()
             # Taste source classification (for cost reporting).
+            # V1.17.12 — every path here is FREE now; Anthropic is never
+            # called (enrich.py ignores haiku_client). The old "haiku"
+            # bucket is kept only so the existing log line / metric keys
+            # stay valid, but it now means "left blank for a later local
+            # batch run", never "money was spent".
+            _pname_u = (r.product_name or "").strip().upper()
             taste_src = "haiku"
             if not code_upper:
                 taste_src = "free"
             elif fsl_taste_map.get(code_upper):
+                taste_src = "free"
+            elif _pname_u and name_taste_map.get(_pname_u):
                 taste_src = "free"
             elif code_upper in taste_cache and taste_cache[code_upper]:
                 taste_src = "free"
             taste = enrich.resolve_taste(
                 code=r.product_code, name=r.product_name,
                 taste_cache=taste_cache, haiku_client=haiku_client,
-                fsl_map=fsl_taste_map,
+                fsl_map=fsl_taste_map, name_map=name_taste_map,
             )
             metrics[f"taste_{taste_src}"] += 1
 
@@ -253,12 +266,15 @@ def _process_region(
                 cat_src = "free"
             elif fsl_category_map.get(code_upper) in enrich.CATEGORIES:
                 cat_src = "free"
+            elif _pname_u and name_category_map.get(_pname_u) in enrich.CATEGORIES:
+                cat_src = "free"
             elif code_upper in category_cache and category_cache[code_upper] in enrich.CATEGORIES:
                 cat_src = "free"
             category = enrich.resolve_category(
                 code=r.product_code, name=r.product_name,
                 tab_map=tab_map, category_cache=category_cache,
                 haiku_client=haiku_client, fsl_map=fsl_category_map,
+                name_map=name_category_map,
             )
             metrics[f"category_{cat_src}"] += 1
 

@@ -450,6 +450,15 @@ def load_fsl_category_tab_map() -> dict[str, str]:
     return out
 
 
+def _col_letter(n: int) -> str:
+    """1-based column index -> A1 letter ('A', 'Z', 'AA', 'AB', …)."""
+    out = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        out = chr(ord("A") + rem) + out
+    return out
+
+
 def sort_fsl_by_date(tab: str = FSL_TAB) -> int:
     """Resort the target FSL tab by Sample Date Out (asc).
 
@@ -472,7 +481,19 @@ def sort_fsl_by_date(tab: str = FSL_TAB) -> int:
     if len(values) < 2:
         return 0
     data = values[1:]
-    width = len(FSL_HEADER)
+    # V1.17.15 — sort the FULL sheet width, not just FSL_HEADER's columns.
+    #
+    # Two bugs lived here. The write range was hardcoded to A2:J (10 cols)
+    # while rows were padded to len(FSL_HEADER) (13), so every sort after the
+    # sheet grew past J died with "tried writing to column [K]" — which is why
+    # appended rows stopped being chronologically ordered.
+    #
+    # The naive fix (widen to A2:M) would be WORSE than the bug: this sheet now
+    # carries 15 columns, and reordering only A-M while leaving N/O physically
+    # in place would silently misalign the 6,393 'Sample Request Date' values
+    # against their rows. A sort must move WHOLE rows, so take the width from
+    # the sheet itself.
+    width = max(len(FSL_HEADER), len(values[0]), max((len(r) for r in data), default=0))
     data = [r + [""] * (width - len(r)) if len(r) < width else r[:width] for r in data]
 
     SENTINEL = _d.date(9999, 12, 31)
@@ -487,9 +508,14 @@ def sort_fsl_by_date(tab: str = FSL_TAB) -> int:
 
     last_row = len(sorted_data) + 1
     ws.update(
-        range_name=f"A2:J{last_row}",
+        range_name=f"A2:{_col_letter(width)}{last_row}",
         values=sorted_data,
-        value_input_option="USER_ENTERED",
+        # RAW, not USER_ENTERED. A re-sort must be lossless: it rewrites values
+        # we just read back verbatim, so Sheets must not re-interpret them.
+        # With USER_ENTERED it re-parses every cell and silently rewrites dates
+        # ("06/Mar/2026" -> "6/Mar/2026") — harmless to the parser but it churns
+        # thousands of cells and makes any diff of this sheet meaningless.
+        value_input_option="RAW",
     )
     return len(sorted_data)
 

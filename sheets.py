@@ -238,8 +238,12 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
                     "category": str(r.get("Category", "")).strip(),
                     "_d": d,
                 }
+        # Keep the winning row's Sample Date Out as `last_sent` (date|None).
+        # The catalog already resolves newest-row-per-code above; exposing the
+        # date lets search RANK by recency too, so what a rep sees is the most
+        # recently sampled product, not just the newest price for it.
         for v in derived.values():
-            v.pop("_d", None)
+            v["last_sent"] = v.pop("_d", None)
         cleaned = list(derived.values())
         per_tab.append(("<FSL fallback>", len(cleaned)))
 

@@ -4314,9 +4314,15 @@ async def _smart_route_text(
                     and not str(price).upper().startswith("USD")
                 ):
                     usd_str = f" (≈ ${usd:.2f})"
+                # V1.17.18 — show when the product was last sampled. Results
+                # are ranked newest-first within each relevance band, so
+                # without the date the rep has no way to see that ordering.
+                _ls = s.get("last_sent")
+                last_str = f" · 📅 {_ls.strftime('%d %b %Y')}" if _ls else ""
                 lines.append(
                     f"  {i}. <b>{h(s['name'])}</b>\n"
                     f"      <code>{h(p_code or '—')}</code> · {h(str(price))}{usd_str}"
+                    f"{last_str}"
                 )
                 if p_code:
                     label = f"{i}. {p_code} · {s['name']}"

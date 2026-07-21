@@ -169,3 +169,65 @@ def test_no_prefix_returns_all_factories():
     res = matcher.top_seasonings("sesame", PREFIX_CATALOG, limit=10)
     pfxs = {r["code"].split("-")[0] for r in res}
     assert {"S", "J", "B"} <= pfxs
+
+
+# ---------- recency: newest sample wins (V1.17.18) ----------
+
+from datetime import date as _d  # noqa: E402
+
+RECENCY_CATALOG = [
+    {"name": "CHEESE SEASONING", "code": "B-OLD", "price": "THB 100.0",
+     "category": "Snack", "last_sent": _d(2010, 6, 16)},
+    {"name": "CHEESE SEASONING", "code": "B-NEW", "price": "THB 200.0",
+     "category": "Snack", "last_sent": _d(2026, 7, 16)},
+    {"name": "CHEESE SEASONING", "code": "B-MID", "price": "THB 150.0",
+     "category": "Snack", "last_sent": _d(2020, 1, 1)},
+    {"name": "CHEESE SEASONING", "code": "B-NONE", "price": "THB 90.0",
+     "category": "Snack"},
+]
+
+
+def test_newest_sample_ranks_first_even_when_pricier():
+    """The 2026 product must lead, though it is the MOST expensive —
+    recency beats price once relevance is tied."""
+    res = matcher.top_seasonings("cheese", RECENCY_CATALOG, limit=4)
+    assert [r["code"] for r in res][:3] == ["B-NEW", "B-MID", "B-OLD"]
+
+
+def test_undated_product_sorts_last_not_first():
+    res = matcher.top_seasonings("cheese", RECENCY_CATALOG, limit=4)
+    assert res[-1]["code"] == "B-NONE"
+
+
+def test_recency_does_not_override_relevance():
+    """An ancient exact match still beats a fresh irrelevant one."""
+    cat = [
+        {"name": "SESAME SEASONING", "code": "S-OLD", "price": "USD 3.00",
+         "category": "Snack", "last_sent": _d(2009, 1, 1)},
+        {"name": "CHEESE SEASONING", "code": "S-NEW", "price": "USD 3.00",
+         "category": "Snack", "last_sent": _d(2026, 7, 1)},
+    ]
+    res = matcher.top_seasonings("sesame", cat, limit=2)
+    assert res[0]["code"] == "S-OLD"
+
+
+def test_recency_survives_string_and_missing_dates():
+    """Catalog can be built from tabs with no date column — must not crash."""
+    cat = [
+        {"name": "CHEESE SEASONING", "code": "X-1", "price": "USD 3.00",
+         "category": "Snack", "last_sent": "2026-07-16"},
+        {"name": "CHEESE SEASONING", "code": "X-2", "price": "USD 3.00",
+         "category": "Snack", "last_sent": None},
+        {"name": "CHEESE SEASONING", "code": "X-3", "price": "USD 3.00",
+         "category": "Snack", "last_sent": "not a date"},
+    ]
+    res = matcher.top_seasonings("cheese", cat, limit=3)
+    assert res[0]["code"] == "X-1"
+    assert len(res) == 3
+
+
+def test_recency_respects_budget_and_prefix_filters():
+    res = matcher.top_seasonings("cheese b code below 4usd", RECENCY_CATALOG, limit=4)
+    assert res
+    assert all(r["code"].startswith("B-") for r in res)
+    assert all(r["_price_num"] <= 4.0 for r in res)

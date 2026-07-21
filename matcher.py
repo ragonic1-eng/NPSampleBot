@@ -1,6 +1,7 @@
 """Fuzzy suggestion helpers."""
 from __future__ import annotations
 
+from datetime import date as _date
 from typing import Any
 
 from rapidfuzz import fuzz, process, utils
@@ -191,6 +192,23 @@ def parse_seasoning_query(query: str) -> tuple[str, float | None]:
     return cleaned, max_price
 
 
+def _recency_ord(v: Any) -> int:
+    """Sortable ordinal for a `last_sent` value; 0 when unknown.
+
+    Tolerates date, datetime and ISO string, because the catalog can be built
+    from either the FSL fallback (parsed dates) or the legacy category tabs
+    (no date column at all) — an undated product must sort last, not crash.
+    """
+    if v is None:
+        return 0
+    if isinstance(v, _date):
+        return v.toordinal()
+    try:
+        return _date.fromisoformat(str(v)[:10]).toordinal()
+    except (ValueError, TypeError):
+        return 0
+
+
 def top_seasonings(
     query: str,
     seasonings: list[dict[str, Any]],
@@ -255,6 +273,18 @@ def top_seasonings(
     # so "korean noodle" rewards items in the Noodle category tab. Also strip
     # generic terms from the choice string so "seasoning" / "powder" /
     # "flavour" don't dominate the score.
+    # Newest-first BEFORE scoring. This is load-bearing, not cosmetic: the
+    # catalog holds 35k products and thousands of them tie at the same fuzzy
+    # score (every "* CHEESE SEASONING" scores 95 against "cheese"). rapidfuzz
+    # keeps only `pool` results and breaks score ties by iteration order, so
+    # an unsorted list handed back whatever 30 items it happened to reach
+    # first — which is why "cheese b code" surfaced products last sampled in
+    # 2010. Sorting here makes the pool itself the newest N, and the final
+    # sort then orders within it.
+    candidates = sorted(
+        candidates, key=lambda s: -_recency_ord(s.get("last_sent"))
+    )
+
     choices = {
         i: _strip_generic(f"{s['name']} {s.get('category', '')}").strip()
         for i, s in enumerate(candidates)
@@ -394,8 +424,22 @@ def top_seasonings(
             by_code[code] = s
 
     ranked = list(by_code.values()) + no_code_entries
-    # Best-first by score, then cheapest within ties.
-    ranked.sort(key=lambda s: (-s["score"], s["_price_num"]))
+    # Best-first by relevance, then MOST RECENTLY SAMPLED, then cheapest.
+    #
+    # Recency is a tiebreaker, not the primary key: a rep asking for "spicy"
+    # must still get spicy things first. But fuzzy scores cluster hard — a
+    # dozen SPICY * SEASONING entries routinely land within a point or two of
+    # each other — and among equally-relevant products the useful one is the
+    # one actually being sampled today, not a 2019 code that may be long dead.
+    # So scores are bucketed into 5-point bands and recency orders within the
+    # band. Undated rows sort last (SENTINEL), never ahead of a dated one.
+    ranked.sort(
+        key=lambda s: (
+            -round(s["score"] / 5.0),
+            -_recency_ord(s.get("last_sent")),
+            s["_price_num"],
+        )
+    )
     return ranked[:limit]
 
 

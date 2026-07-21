@@ -50,15 +50,75 @@ _PRICE_STRIP_RE = re.compile(
 _LONELY_CURRENCY_RE = re.compile(r"\b(?:usd|sgd|dollars?)\b", re.IGNORECASE)
 
 
+# Catalog prices are MIXED CURRENCY — as of Jul 2026 the live catalogue is
+# ~50% THB, 20% IDR, 15% USD, 15% SGD. A "below 4 usd" filter compared against
+# the bare number in "THB 147.9" or "IDR 49,892" excludes everything and the
+# rep gets zero results, which is exactly what happened. Normalise to USD
+# before any comparison or sort.
+#
+# Rates are approximate but stable enough for filtering: the rep is expressing
+# a rough budget, not requesting a quotation. Exact pricing comes from /pp,
+# which uses MMS3's live rate table. Kept in sync with the table in
+# bot._run_seasoning_search.
+_USD_RATE = {
+    "USD": 1.0,
+    "SGD": 0.74,
+    "THB": 0.029,
+    "IDR": 0.000063,
+    "MYR": 0.21,
+    "JPY": 0.0064,
+}
+# Currency prefix + number, tolerating thousands separators.
+_CURRENCY_PRICE_RE = re.compile(
+    r"^\s*([A-Z]{3,4}|RM|S\$|\$)\s*([\d,]+(?:\.\d+)?)\s*$", re.IGNORECASE
+)
+_CURRENCY_ALIAS = {"S$": "SGD", "$": "USD", "RM": "MYR"}
+
+
 def _parse_price(raw: Any) -> float:
-    """Convert a price cell like '$4.96' or '5.20' to a float. Unknown → +inf so it sorts last."""
+    """Price cell → USD-equivalent float. Unknown → +inf so it sorts last.
+
+    Handles 'USD 4.96', 'THB 162.9', 'IDR 49,892', 'S$6.60', '5.20'.
+    A bare number is treated as USD (legacy Singapore convention).
+
+    NB thousands separators matter: the old bare-regex parser read
+    'IDR 49,892' as **49**, which made expensive Indonesian items look like
+    pocket change and let them slip past a low budget filter.
+    """
     if raw is None:
         return float("inf")
-    m = _PRICE_NUM.search(str(raw))
-    if not m:
+    s = str(raw).strip()
+    if not s:
+        return float("inf")
+
+    # Bare number → USD by convention.
+    try:
+        v = float(s.replace(",", ""))
+        return v if v > 0 else float("inf")
+    except ValueError:
+        pass
+
+    m = _CURRENCY_PRICE_RE.match(s)
+    if m:
+        cur = m.group(1).upper()
+        cur = _CURRENCY_ALIAS.get(cur, cur)
+        rate = _USD_RATE.get(cur)
+        if rate is not None:
+            try:
+                v = float(m.group(2).replace(",", ""))
+            except ValueError:
+                return float("inf")
+            return v * rate if v > 0 else float("inf")
+        # Known shape, unknown currency: don't invent a conversion.
+        return float("inf")
+
+    # Last resort: first number in the string, commas stripped.
+    m2 = _PRICE_NUM.search(s.replace(",", ""))
+    if not m2:
         return float("inf")
     try:
-        return float(m.group())
+        v = float(m2.group())
+        return v if v > 0 else float("inf")
     except ValueError:
         return float("inf")
 

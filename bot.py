@@ -4194,7 +4194,19 @@ async def _smart_route_text(
     async def _prod_probe() -> list[dict]:
         try:
             seasonings = await asyncio.to_thread(sheets.load_seasonings)
-            return matcher.top_seasonings(probe, seasonings, limit=3)
+            # V1.17.16 — budget queries ("sesame below 4usd", "sesame <4usd")
+            # deserve a longer list, and must never dead-end: if nothing is
+            # under the cap, fall back to the closest ABOVE-budget matches
+            # and let the caller say so, rather than returning nothing.
+            _, cap = matcher.parse_seasoning_query(probe)
+            if cap is None:
+                return matcher.top_seasonings(probe, seasonings, limit=3)
+            hits = matcher.top_seasonings(probe, seasonings, limit=6)
+            if hits:
+                return hits
+            return matcher.top_seasonings(
+                probe, seasonings, limit=4, strict_price=False
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("smart route: product probe failed: %s", e)
             return []
@@ -4254,13 +4266,43 @@ async def _smart_route_text(
 
         if prod_hits:
             lines.append("")
-            lines.append("🥫 <b>Product</b> — tap for the price:")
+            # V1.17.16 — when the rep typed a budget ("below 4usd", "<4usd"),
+            # say so and show the USD equivalent. The catalogue is ~50% THB /
+            # 20% IDR, so "IDR 45,021" alone gives a rep asking for "under $4"
+            # no way to see the filter was honoured.
+            _, _cap = matcher.parse_seasoning_query(probe)
+            over = [
+                s for s in prod_hits
+                if _cap is not None and s.get("_price_num", 0) > _cap
+            ]
+            if _cap is None:
+                lines.append("🥫 <b>Product</b> — tap for the price:")
+            elif over:
+                lines.append(
+                    f"🥫 <b>Product</b> — ⚠️ nothing under <b>${_cap:g} USD</b>; "
+                    "closest options above budget:"
+                )
+            else:
+                lines.append(
+                    f"🥫 <b>Product</b> — under <b>${_cap:g} USD</b> · tap for the price:"
+                )
             for i, s in enumerate(prod_hits, 1):
                 p_code = str(s.get("code") or "").strip().upper()
                 price = s.get("price") or "—"
+                usd = s.get("_price_num")
+                # Show the USD equivalent next to a non-USD source price so the
+                # budget is verifiable at a glance.
+                usd_str = ""
+                if (
+                    _cap is not None
+                    and isinstance(usd, (int, float))
+                    and usd != float("inf")
+                    and not str(price).upper().startswith("USD")
+                ):
+                    usd_str = f" (≈ ${usd:.2f})"
                 lines.append(
                     f"  {i}. <b>{h(s['name'])}</b>\n"
-                    f"      <code>{h(p_code or '—')}</code> · {h(str(price))}"
+                    f"      <code>{h(p_code or '—')}</code> · {h(str(price))}{usd_str}"
                 )
                 if p_code:
                     label = f"{i}. {p_code} · {s['name']}"

@@ -77,6 +77,12 @@ _DEFAULT_TASTE_SHOTS = [
     ("CHEESE SEASONING", "savoury aged cheese — creamy umami profile"),
     ("TANDOORI CHICKEN SEASONING", "chicken savoury — rich umami chicken"),
     ("TOMATO SOUP BASE", "tomato — sweet-tangy"),
+    # Load-bearing, keep adjacent to TOMATO. Without a TOM YUM exemplar the
+    # model matches "TOM YUM" to "TOMATO" on spelling and copies the tomato
+    # blurb — reproduced on qwen3.5:4b and qwen3:30b-a3b alike, so it is an
+    # exemplar-coverage bug, not a model-quality one. Wording is the sheet's
+    # own reviewed blurb, so generated values match the existing column.
+    ("TOM YUM SEASONING", "Thai tom yum — sour-spicy lemongrass-lime-galangal"),
     ("SWEET CHILLI & RED PEPPER SEASONING", "chili savoury heat"),
     ("KOREAN BBQ CHICKEN", "Korean-style sweet-spicy"),
     ("VEGETABLE PASTA SOUP CONC.", "vegetable savoury — mixed vegetable umami"),
@@ -138,7 +144,9 @@ def _taste_prompt(name: str) -> str:
         "ingredients, dishes or cuisines that aren't implied by the name.\n"
         "  - Lowercase, except real proper nouns (Korean, Japanese, Italian).\n"
         "  - Max ~10 words. No marketing words. No product codes.\n"
-        "  - Reuse an example's wording verbatim when the product matches.\n\n"
+        "  - Reuse an example's wording verbatim ONLY when the product is "
+        "the SAME DISH. Match on meaning, never on spelling: 'TOM YUM' is a "
+        "Thai hot-and-sour soup and has nothing to do with 'TOMATO'.\n\n"
         f"Product name: {name}\n"
         'Return JSON: {"taste": "<blurb>"}'
     )

@@ -4972,6 +4972,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     )
     if has_lastsample_flag or is_lastsample_reply:
+        # V1.17.18 — escape hatch. The last-sample prompt is sticky, so a rep
+        # who taps 'Find ANY rep's last sample' and then types a CATALOGUE
+        # query ("s code spicy <4usd") had it searched as literal text against
+        # Product/Customer Name — which of course matched nothing. A factory
+        # prefix or a price cap is only ever a catalogue question (the sample
+        # listing has neither concept), so hand those to the smart router.
+        _q_np, _q_pfx = matcher.parse_code_prefix(_route_strip_fillers(text))
+        _, _q_cap = matcher.parse_seasoning_query(_q_np)
+        if _q_pfx or _q_cap is not None:
+            ctx.user_data.pop("awaiting_lastsample_query", None)
+            await _smart_route_text(update, ctx, text)
+            return
         # Don't pop these — _run_lastsample_search rewrites them after the
         # search so the next text message can refine. cmd_lastsample /
         # cmd_alllastsample (or the 🔎 Find another button) is what clears

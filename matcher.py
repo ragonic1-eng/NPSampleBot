@@ -123,6 +123,52 @@ def _parse_price(raw: Any) -> float:
         return float("inf")
 
 
+# --- factory / region code-prefix filter -----------------------------------
+#
+# Product codes are namespaced by factory: S- Singapore, J- Indonesia,
+# B- Thailand (T- legacy). Reps think in those terms ("show me the J codes"),
+# so a search should be filterable by prefix.
+#
+# The trigger deliberately REQUIRES the word "code(s)". A bare country word is
+# ambiguous in this catalogue and must not hard-filter: "singapore laksa" and
+# "thai tom yum" are FLAVOURS sold from every factory, so treating "singapore"
+# as a filter would hide the very products the rep asked for. "singapore
+# codes", by contrast, can only mean the factory.
+_PREFIX_WORDS = {
+    "s": "S", "sg": "S", "singapore": "S",
+    "j": "J", "id": "J", "indo": "J", "indonesia": "J", "jakarta": "J",
+    "b": "B", "th": "B", "thailand": "B", "bangkok": "B",
+    "t": "T",
+}
+_CODE_PREFIX_RE = re.compile(
+    r"\b(" + "|".join(sorted(_PREFIX_WORDS, key=len, reverse=True)) + r")[\s\-]*codes?\b",
+    re.IGNORECASE,
+)
+
+
+def parse_code_prefix(query: str) -> tuple[str, str | None]:
+    """Pull a factory code-prefix filter out of a query.
+
+    "sesame j code"      → ("sesame", "J")
+    "S codes cheese"     → ("cheese", "S")
+    "b-codes below 4usd" → ("below 4usd", "B")
+    "singapore laksa"    → ("singapore laksa", None)   # flavour, not a filter
+    """
+    q = (query or "").strip()
+    m = _CODE_PREFIX_RE.search(q)
+    if not m:
+        return q, None
+    prefix = _PREFIX_WORDS.get(m.group(1).lower())
+    cleaned = re.sub(r"\s+", " ", _CODE_PREFIX_RE.sub(" ", q)).strip()
+    return cleaned, prefix
+
+
+def code_has_prefix(code: Any, prefix: str) -> bool:
+    """True when `code` belongs to the `prefix` factory (S-/J-/B-/T-)."""
+    c = str(code or "").strip().upper()
+    return c.startswith(f"{prefix.upper()}-")
+
+
 def parse_seasoning_query(query: str) -> tuple[str, float | None]:
     """Pull a max-price constraint out of a natural-language query.
 
@@ -152,13 +198,16 @@ def top_seasonings(
     pool: int = 30,
     past_submissions: list[dict[str, str]] | None = None,
     strict_price: bool = True,
+    prefix: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fuzzy-match the query, then return the `limit` cheapest from the top `pool`.
 
     Understands a max-price filter in the query itself ("below 4.5 usd",
-    "under $3", "<=2.50"). Market / style / flavor hints (e.g. "for bangladesh",
-    "chinese style") are handled implicitly: fuzzy WRatio scores names that
-    contain those keywords higher.
+    "under $3", "<=2.50") and a factory code-prefix filter ("j code",
+    "S codes"), either passed via ``prefix`` or written in the query.
+    Market / style / flavor hints (e.g. "for bangladesh", "chinese style")
+    are handled implicitly: fuzzy WRatio scores names that contain those
+    keywords higher.
 
     If ``past_submissions`` is supplied, items whose code shows up against a
     similar past query get a +score boost — surfaces "korea spicy noodle"
@@ -167,6 +216,10 @@ def top_seasonings(
     if not query.strip() or not seasonings:
         return []
 
+    # Factory filter: explicit argument wins, else read it out of the query.
+    query, q_prefix = parse_code_prefix(query)
+    prefix = prefix or q_prefix
+
     cleaned_query, max_price = parse_seasoning_query(query)
 
     # Apply the price cap first so we never suggest things out of budget —
@@ -174,6 +227,10 @@ def top_seasonings(
     # the caller as a fallback when the strict pool comes back empty, so
     # the user gets the closest above-budget items rather than nothing).
     candidates = seasonings
+    if prefix:
+        candidates = [s for s in candidates if code_has_prefix(s.get("code"), prefix)]
+        if not candidates:
+            return []
     if max_price is not None and strict_price:
         candidates = [
             s for s in candidates

@@ -4198,12 +4198,17 @@ async def _smart_route_text(
             # deserve a longer list, and must never dead-end: if nothing is
             # under the cap, fall back to the closest ABOVE-budget matches
             # and let the caller say so, rather than returning nothing.
-            _, cap = matcher.parse_seasoning_query(probe)
-            if cap is None:
+            q_nopfx, pfx = matcher.parse_code_prefix(probe)
+            _, cap = matcher.parse_seasoning_query(q_nopfx)
+            if cap is None and not pfx:
                 return matcher.top_seasonings(probe, seasonings, limit=3)
+            # A budget or factory filter means the rep is browsing, so give
+            # them a longer list.
             hits = matcher.top_seasonings(probe, seasonings, limit=6)
-            if hits:
+            if hits or cap is None:
                 return hits
+            # Nothing under the cap — never dead-end; show the closest options
+            # above budget (still within the requested factory, if any).
             return matcher.top_seasonings(
                 probe, seasonings, limit=4, strict_price=False
             )
@@ -4270,21 +4275,30 @@ async def _smart_route_text(
             # say so and show the USD equivalent. The catalogue is ~50% THB /
             # 20% IDR, so "IDR 45,021" alone gives a rep asking for "under $4"
             # no way to see the filter was honoured.
-            _, _cap = matcher.parse_seasoning_query(probe)
+            _q_nopfx, _pfx = matcher.parse_code_prefix(probe)
+            _, _cap = matcher.parse_seasoning_query(_q_nopfx)
             over = [
                 s for s in prod_hits
                 if _cap is not None and s.get("_price_num", 0) > _cap
             ]
+            # V1.17.17 — name the factory when the rep filtered by code prefix
+            # ("j code", "S codes"), so it's obvious the filter was applied.
+            _pfx_label = {
+                "S": "🇸🇬 S-codes", "J": "🇮🇩 J-codes",
+                "B": "🇹🇭 B-codes", "T": "T-codes",
+            }.get(_pfx or "", "")
+            _scope = f" · {_pfx_label}" if _pfx_label else ""
             if _cap is None:
-                lines.append("🥫 <b>Product</b> — tap for the price:")
+                lines.append(f"🥫 <b>Product</b>{_scope} — tap for the price:")
             elif over:
                 lines.append(
-                    f"🥫 <b>Product</b> — ⚠️ nothing under <b>${_cap:g} USD</b>; "
-                    "closest options above budget:"
+                    f"🥫 <b>Product</b>{_scope} — ⚠️ nothing under "
+                    f"<b>${_cap:g} USD</b>; closest options above budget:"
                 )
             else:
                 lines.append(
-                    f"🥫 <b>Product</b> — under <b>${_cap:g} USD</b> · tap for the price:"
+                    f"🥫 <b>Product</b>{_scope} — under <b>${_cap:g} USD</b> · "
+                    "tap for the price:"
                 )
             for i, s in enumerate(prod_hits, 1):
                 p_code = str(s.get("code") or "").strip().upper()

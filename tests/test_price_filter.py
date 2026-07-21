@@ -112,3 +112,60 @@ def test_budget_does_not_leak_into_keyword_matching():
     """'below 4usd' must not be matched as product text."""
     res = matcher.top_seasonings("sesame below 4usd", CATALOG, limit=10)
     assert all("SESAME" in r["name"].upper() for r in res)
+
+
+# ---------- factory code-prefix filter (S- / J- / B-) ----------
+
+PREFIX_CATALOG = [
+    {"name": "SESAME SEASONING",       "code": "S-100", "price": "USD 3.00", "category": "Snack"},
+    {"name": "SESAME OIL SEASONING",   "code": "S-101", "price": "USD 3.50", "category": "Oil"},
+    {"name": "BLACK SESAME SEASONING", "code": "J-200", "price": "IDR 45,021", "category": "Snack"},
+    {"name": "SESAME PEANUT SEASONING","code": "J-201", "price": "IDR 49,810", "category": "Snack"},
+    {"name": "SESAME BUTTER SEASONING","code": "B-300", "price": "THB 106.9", "category": "Snack"},
+    {"name": "SINGAPORE LAKSA SEASONING","code": "B-301", "price": "THB 110.0", "category": "Snack"},
+]
+
+
+def test_prefix_parsed_from_query():
+    assert matcher.parse_code_prefix("sesame j code") == ("sesame", "J")
+    assert matcher.parse_code_prefix("S codes cheese") == ("cheese", "S")
+    assert matcher.parse_code_prefix("sesame b-codes") == ("sesame", "B")
+    assert matcher.parse_code_prefix("sesame indonesia codes") == ("sesame", "J")
+    assert matcher.parse_code_prefix("sesame thailand code") == ("sesame", "B")
+
+
+def test_bare_country_word_is_NOT_a_filter():
+    """'singapore laksa' / 'thai tom yum' are FLAVOURS sold from every
+    factory — treating them as filters would hide what the rep asked for."""
+    for q in ("singapore laksa", "thai tom yum", "indonesia style sesame"):
+        assert matcher.parse_code_prefix(q) == (q, None)
+
+
+def test_search_filtered_to_each_factory():
+    for pfx, expect in (("j", {"J-200", "J-201"}),
+                        ("s", {"S-100", "S-101"}),
+                        ("b", {"B-300"})):
+        res = matcher.top_seasonings(f"sesame {pfx} code", PREFIX_CATALOG, limit=10)
+        got = {r["code"] for r in res}
+        assert got == expect, f"{pfx}: {got}"
+        assert all(matcher.code_has_prefix(c, pfx) for c in got)
+
+
+def test_prefix_combines_with_budget():
+    """'sesame j code below 4usd' -> only J- codes, all under $4."""
+    res = matcher.top_seasonings("sesame j code below 4usd", PREFIX_CATALOG, limit=10)
+    assert res
+    assert all(r["code"].startswith("J-") for r in res)
+    assert all(r["_price_num"] <= 4.0 for r in res)
+
+
+def test_prefix_via_argument_matches_inline_syntax():
+    a = {r["code"] for r in matcher.top_seasonings("sesame", PREFIX_CATALOG, limit=10, prefix="J")}
+    b = {r["code"] for r in matcher.top_seasonings("sesame j code", PREFIX_CATALOG, limit=10)}
+    assert a == b == {"J-200", "J-201"}
+
+
+def test_no_prefix_returns_all_factories():
+    res = matcher.top_seasonings("sesame", PREFIX_CATALOG, limit=10)
+    pfxs = {r["code"].split("-")[0] for r in res}
+    assert {"S", "J", "B"} <= pfxs

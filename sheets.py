@@ -236,6 +236,11 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
                     "price": str(r.get("R&D Price", "")).strip(),
                     "code": code,
                     "category": str(r.get("Category", "")).strip(),
+                    # Winning row = most recent sample of this product, so its
+                    # customer + country answer "who last requested this, and
+                    # from which country" without a second lookup.
+                    "customer": str(r.get("Customer Name", "")).strip(),
+                    "country": str(r.get("Country", "")).strip(),
                     "_d": d,
                 }
         # Keep the winning row's Sample Date Out as `last_sent` (date|None).

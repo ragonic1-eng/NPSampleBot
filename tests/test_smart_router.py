@@ -69,3 +69,37 @@ def test_two_char_leo_requires_exact():
     # 'leo' is 3 chars — allowed, exact match.
     hits, strong = _match_rep_names("leo", REPS)
     assert strong is True and hits == ["Leo"]
+
+
+# ---------- origin line: country + customer on product results (V1.17.x) ----------
+
+from bot import _origin_line  # noqa: E402
+
+
+def test_origin_line_shows_country_and_customer():
+    out = _origin_line("Indonesia", "PT MAKMUR")
+    assert "Indonesia" in out and "PT MAKMUR" in out
+    assert out.startswith("📍")
+    assert "🇮🇩" in out          # known country gets a flag
+
+
+def test_origin_line_customer_only():
+    out = _origin_line("", "ACME")
+    assert "ACME" in out
+    assert "from" not in out       # no country -> don't say "from"
+
+
+def test_origin_line_country_only():
+    out = _origin_line("Thailand", "")
+    assert "Thailand" in out
+    assert "🇹🇭" in out
+
+
+def test_origin_line_empty_when_nothing_known():
+    assert _origin_line("", "") == ""
+    assert _origin_line(None, None) == ""
+
+
+def test_origin_line_unknown_country_has_no_flag_but_still_shows():
+    out = _origin_line("Narnia", "SOMECO")
+    assert "Narnia" in out and "SOMECO" in out

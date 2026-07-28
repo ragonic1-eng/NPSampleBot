@@ -1303,6 +1303,39 @@ async def _close_catalog_codes(code: str, limit: int = 3) -> list[str]:
         return []
 
 
+_COUNTRY_FLAG = {
+    "SINGAPORE": "🇸🇬", "INDONESIA": "🇮🇩", "THAILAND": "🇹🇭",
+    "MALAYSIA": "🇲🇾", "VIETNAM": "🇻🇳", "PHILIPPINES": "🇵🇭",
+    "INDIA": "🇮🇳", "JAPAN": "🇯🇵", "CHINA": "🇨🇳", "KOREA": "🇰🇷",
+    "BANGLADESH": "🇧🇩", "MYANMAR": "🇲🇲", "CAMBODIA": "🇰🇭",
+    "TAIWAN": "🇹🇼", "HONG KONG": "🇭🇰", "USA": "🇺🇸",
+    "AUSTRALIA": "🇦🇺", "UAE": "🇦🇪",
+}
+
+
+def _origin_line(country: str, customer: str) -> str:
+    """One-line '📍 last requested from <country> · for <customer>'.
+
+    Both fields come from the most-recent FSL row for the product, so this
+    answers 'who last asked for this, and from which country' — the two
+    things a rep needs to gauge whether a sample is live and who owns it.
+    Renders whatever is present; empty string if neither is known.
+    """
+    country = (country or "").strip()
+    customer = (customer or "").strip()
+    if not country and not customer:
+        return ""
+    parts = []
+    if country:
+        flag = _COUNTRY_FLAG.get(country.upper(), "")
+        parts.append(f"{flag + ' ' if flag else ''}{h(country)}")
+    if customer:
+        parts.append(f"for {h(customer)}")
+    return "📍 last requested " + (
+        "from " + " · ".join(parts) if country else " · ".join(parts)
+    )
+
+
 async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
     """Fetch /pp for each code, edit-in-place loader, audit-log every result.
 
@@ -1389,6 +1422,11 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
                 f"<b>Name:</b> {h(fsl_name)}\n"
                 f"<b>R&amp;D Price:</b> {fsl_price_display}"
             )
+            origin = _origin_line(
+                fsl_row.get("Country") or "", fsl_row.get("Customer Name") or ""
+            )
+            if origin:
+                body += f"\n{origin}"
             await _replace(body, markup=_price_kb())
             _audit(
                 query=asked_code,
@@ -1561,6 +1599,24 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             f"<b>R&amp;D Price:</b> {rd_line}\n"
             f"<b>Raw Material Cost:</b> {rmc_line}"
         )
+        # V1.17.x — append who last requested this code + from which country.
+        # FSL read is 90s-cached, so this rarely costs a network round-trip.
+        # 'asked' is the exact code the rep typed (MMS may have prefix-matched
+        # to a parent); origin should reflect their code, not the parent's.
+        try:
+            _origin_row = await asyncio.to_thread(
+                sheets.find_fsl_product_by_code, asked
+            )
+        except Exception as e:  # noqa: BLE001 — origin is a nice-to-have
+            _origin_row = None
+            log.debug("/pp origin lookup failed for %s: %s", asked, e)
+        if _origin_row:
+            _origin = _origin_line(
+                _origin_row.get("Country") or "",
+                _origin_row.get("Customer Name") or "",
+            )
+            if _origin:
+                body += f"\n{_origin}"
         await _replace(body, markup=_price_kb())
         # For audit, log the FSL fallback as a numeric only if it parses
         # cleanly to a float — non-USD currency text isn't comparable, so
@@ -4324,6 +4380,12 @@ async def _smart_route_text(
                     f"      <code>{h(p_code or '—')}</code> · {h(str(price))}{usd_str}"
                     f"{last_str}"
                 )
+                # V1.17.x — who last requested it + from where (most-recent
+                # sample row). Indented under the product so the list stays
+                # scannable.
+                _origin = _origin_line(s.get("country") or "", s.get("customer") or "")
+                if _origin:
+                    lines.append(f"      {_origin}")
                 if p_code:
                     label = f"{i}. {p_code} · {s['name']}"
                     if len(label) > 40:

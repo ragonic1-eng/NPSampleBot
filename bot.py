@@ -3845,7 +3845,7 @@ async def _show_lastsample_results(
         # Line 4: AWB. Same three-state rendering as the digest +
         # customer view — real tracking number, 🚗 hand-carry marker,
         # or '—' when the row is still unmapped.
-        if not awb_raw:
+        if not awb_raw or _awb_is_price_leak(awb_raw):
             lines.append("   📦 AWB —")
         elif _is_hand_carry(awb_raw):
             lines.append("   🚗 Hand carry")
@@ -3983,7 +3983,7 @@ async def _show_customer_samples(
         # AWB suffix. The same value the digest shows — real tracking
         # number, '🚗 Hand carry' marker, or '—' when still unmatched.
         awb_raw = (r.get("AWB") or "").strip()
-        if not awb_raw:
+        if not awb_raw or _awb_is_price_leak(awb_raw):
             awb_suffix = " · AWB —"
         elif _is_hand_carry(awb_raw):
             awb_suffix = " · 🚗 Hand carry"
@@ -7648,6 +7648,27 @@ def _fmt_digest_price(raw: str) -> str:
         return s
 
 
+_AWB_PRICE_LEAK_RE = re.compile(
+    r"^(?:usd|thb|idr|sgd|myr|rm|s\$|\$)?\s*\d{1,4}\.\d{1,5}\s*(?:usd)?$",
+    re.IGNORECASE,
+)
+
+
+def _awb_is_price_leak(awb_value: str) -> bool:
+    """True when the AWB cell holds a price, not a tracking number.
+
+    The Singapore FSL tab's column K ('AWB') was historically loaded with
+    the raw-material COST (a small decimal ≈ half the R&D price) instead of
+    an air-waybill number — 15,692 rows across every year 2010–2026. A real
+    AWB is a long digit run (DHL 10, FedEx 12+); a leaked cost looks like
+    '1.9232' or 'SGD 4.36'. Rendering that as '📦 AWB 1.9232' misleads the
+    rep into thinking it's a tracking number, so callers treat a leak as
+    'no AWB' (—). We reject only this specific price shape, never a genuine
+    tracking number.
+    """
+    return bool(_AWB_PRICE_LEAK_RE.match((awb_value or "").strip()))
+
+
 def _is_hand_carry(awb_value: str) -> bool:
     """Detect manually-entered hand-carry markers in the AWB cell.
 
@@ -7835,6 +7856,7 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                     (s.get("AWB") or "").strip()
                     for s in samples
                     if (s.get("AWB") or "").strip()
+                    and not _awb_is_price_leak(s.get("AWB") or "")
                 })
                 if any(_is_hand_carry(a) for a in awbs):
                     lines.append("       🚗 Hand carry")

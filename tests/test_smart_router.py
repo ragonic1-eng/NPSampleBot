@@ -103,3 +103,22 @@ def test_origin_line_empty_when_nothing_known():
 def test_origin_line_unknown_country_has_no_flag_but_still_shows():
     out = _origin_line("Narnia", "SOMECO")
     assert "Narnia" in out and "SOMECO" in out
+
+
+# ---------- AWB price-leak guard (S-B25L4 bug) ----------
+
+from bot import _awb_is_price_leak  # noqa: E402
+
+
+def test_awb_price_leak_detects_costs_not_tracking_numbers():
+    # Raw-material costs wrongly living in col K of the Singapore FSL tab.
+    for leak in ("1.9232", "4.3635", "2.57", "123.45", "SGD 4.36",
+                 "USD 3.10", "  2.57  "):
+        assert _awb_is_price_leak(leak), leak
+
+
+def test_awb_price_leak_passes_real_awbs():
+    # Genuine tracking numbers and markers must NOT be flagged.
+    for good in ("1234567890", "JD014600003217", "HAND CARRY", "HC",
+                 "", "1Z999AA10123456784"):
+        assert not _awb_is_price_leak(good), good

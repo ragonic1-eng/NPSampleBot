@@ -4355,23 +4355,45 @@ def _route_strip_fillers(text: str) -> str:
 
 
 async def _active_rep_names() -> list[str]:
-    """Distinct MMS Names of active rows on the Authorized Users tab."""
-    try:
-        users = await asyncio.to_thread(sheets.load_users)
-    except Exception as e:  # noqa: BLE001
-        log.debug("rep-name probe: load_users failed: %s", e)
-        return []
+    """Distinct rep names the router recognizes when typed.
+
+    Union of:
+      1. MMS Names of active rows on the Authorized Users tab, and
+      2. every distinct Sales value across the three FSL tabs — so reps
+         like Ayaka who send samples but don't use the bot are still
+         recognized (V1.17.x fix; before this, typing their name fell
+         through to a product search and found nothing).
+    Authorized names are added first so their capitalization wins on
+    duplicates. FSL reads ride the 90s row cache — near-free when warm.
+    """
     names: list[str] = []
     seen: set[str] = set()
-    for row in users:
-        active = str(sheets._row_get_loose(row, "Active")).strip().lower()
-        if active not in {"y", "yes", "true", "1"}:
-            continue
-        name = str(sheets._row_get_loose(row, "MMS Name")).strip()
+
+    def _add(name: str) -> None:
         key = " ".join(name.lower().split())
         if name and key not in seen:
             seen.add(key)
             names.append(name)
+
+    try:
+        users = await asyncio.to_thread(sheets.load_users)
+    except Exception as e:  # noqa: BLE001
+        log.debug("rep-name probe: load_users failed: %s", e)
+        users = []
+    for row in users:
+        active = str(sheets._row_get_loose(row, "Active")).strip().lower()
+        if active not in {"y", "yes", "true", "1"}:
+            continue
+        _add(str(sheets._row_get_loose(row, "MMS Name")).strip())
+
+    for tab in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB):
+        try:
+            rows = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
+        except Exception as e:  # noqa: BLE001 — probe stays best-effort
+            log.debug("rep-name probe: FSL tab %r failed: %s", tab, e)
+            continue
+        for r in rows:
+            _add((r.get("Sales") or "").strip())
     return names
 
 
@@ -4422,18 +4444,21 @@ async def _show_rep_samples(
         )
         return
 
+    # V1.17.x — cap the browse window at 2 years. Undated rows can't be
+    # proven inside the window, so they're dropped too.
+    cutoff = (_sgt_now() - timedelta(days=730)).date()
+    rows = [r for r in rows if r.get("_date") and r["_date"] >= cutoff]
+
     if not rows:
         await send(
             update,
             f"📭 I don't see any samples sent by <b>{h(rep_name)}</b> in "
-            "Full Sample Listing yet.",
+            "Full Sample Listing in the past 2 years.",
             kb([[("🏠 Main menu", "menu:home")]]),
         )
         return
 
-    from datetime import date as _date
-    SENTINEL = _date(1900, 1, 1)
-    rows.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
+    rows.sort(key=lambda r: r["_date"], reverse=True)
 
     total = len(rows)
     total_pages = max(1, (total + _CUST_PAGE_SIZE - 1) // _CUST_PAGE_SIZE)
@@ -4450,7 +4475,10 @@ async def _show_rep_samples(
         if total_pages > 1
         else f"  <i>({total} total)</i>"
     )
-    lines = [f"👔 <b>Samples sent by {h(rep_name)}:</b>{page_marker}", ""]
+    lines = [
+        f"👔 <b>Samples sent by {h(rep_name)}</b> — last 2 years{page_marker}",
+        "",
+    ]
     for i, r in enumerate(page_rows, start + 1):
         d = r.get("_date")
         date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")

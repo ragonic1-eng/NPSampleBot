@@ -159,6 +159,25 @@ class MMSProductClient:
             )
             ids = re.findall(r"sampleRequestCreate\.do\?prod_id=(\d+)", r.text)
             if not ids:
+                # V1.17.x — oil-type products (e.g. S-B4D31 SHRIMP OIL) never
+                # get a "Create New Sample Request" page; their doList rows
+                # link to sampleRequestSearch.do instead:
+                #   <a href=".../sampleRequestSearch.do?command=listfp&prod_id=NNN">
+                #     <small> CODE </small></a>
+                # Without this branch such codes were reported ProductNotFound
+                # even though doFind found them. Prefer the row whose code
+                # cell matches exactly; fall back to the first row (mirrors
+                # MMS's own prefix-match behaviour on the Create path).
+                pairs = re.findall(
+                    r'sampleRequestSearch\.do\?command=listfp&(?:amp;)?prod_id=(\d+)"'
+                    r"[^>]*>\s*<small>\s*(\S+)\s*</small>",
+                    r.text,
+                )
+                if pairs:
+                    want = code.strip().upper()
+                    exact = [pid for pid, c in pairs if c.strip().upper() == want]
+                    ids = exact or [pairs[0][0]]
+            if not ids:
                 # doList came back empty even though doFind reported hits.
                 # Strong signal that the server-side search session was
                 # invalidated between the two POSTs. Retry with a fresh

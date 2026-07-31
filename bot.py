@@ -3937,24 +3937,54 @@ def _rmc_cache_get(code: str) -> tuple[bool, float | None]:
     return True, val
 
 
-def _rmc_fetch_one(code: str) -> float | None:
+def _rmc_fetch_one(code: str, client=None) -> float | None:
     """Blocking MMS fetch of the adjusted RM cost for one code.
 
     Deliberately uses find_sid + fetch_detail only — skips the R&D-price
     lookup (we already have R&D price from the sheet) and therefore also
     skips the Add/Delete probe fallback entirely.
+
+    client — an MMSProductClient to use (pool worker); defaults to the
+    shared singleton.
     """
     import time as _time
-    client = mms_product.get_client()
+    client = client or mms_product.get_client()
     try:
         sid = client.find_sid(code)
         product = client.fetch_detail(sid)
-        val = _adjusted_rmc_usd(product.raw_material_cost_usd)
+        # MMS prefix-matches: asking for a variant can return the parent.
+        # The parent's RM cost is wrong for the variant — treat as a miss
+        # rather than show a wrong price.
+        if (product.code or "").strip().upper() != code.strip().upper():
+            log.info("my-samples RM fetch for %s returned %s — skipping",
+                     code, product.code)
+            val = None
+        else:
+            val = _adjusted_rmc_usd(product.raw_material_cost_usd)
     except Exception as e:  # noqa: BLE001 — a miss just renders as "—"
         log.info("my-samples RM fetch failed for %s: %s", code, e)
         val = None
     _RMC_CACHE[code] = (_time.time(), val)
     return val
+
+
+async def _rmc_fetch_many(codes: list[str]) -> dict[str, float]:
+    """Fetch RM costs for `codes` in parallel across a small MMS client
+    pool (each client owns its own session, so search state can't
+    cross-talk). Returns only the successful code → adj-USD values."""
+    todo = list(codes)
+    got: dict[str, float] = {}
+    pool = mms_product.get_pool(min(3, len(todo)) or 1)
+
+    async def _worker(cl) -> None:
+        while todo:
+            c = todo.pop()
+            val = await asyncio.to_thread(_rmc_fetch_one, c, cl)
+            if val is not None:
+                got[c] = val
+
+    await asyncio.gather(*(_worker(cl) for cl in pool))
+    return got
 
 
 def _render_my_samples_page(
@@ -4097,6 +4127,20 @@ async def show_my_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: 
         c = (r.get("Product Code") or "").strip().upper()
         if c and c != "—" and c not in page_codes:
             page_codes.append(c)
+    # Seed the in-memory cache from the persistent RMC Cache tab (10-min
+    # cached read) — RM costs fetched on earlier days / by other reps /
+    # before a redeploy render instantly instead of re-hitting MMS.
+    missing = [c for c in page_codes if not _rmc_cache_get(c)[0]]
+    if missing:
+        try:
+            sheet_rmc = await asyncio.to_thread(sheets.load_rmc_cache)
+        except Exception as e:  # noqa: BLE001 — cache tab is an accelerator only
+            log.warning("my-samples RMC sheet cache read failed: %s", e)
+            sheet_rmc = {}
+        import time as _time
+        for c in missing:
+            if c in sheet_rmc:
+                _RMC_CACHE[c] = (_time.time(), sheet_rmc[c])
     pending = {c for c in page_codes if not _rmc_cache_get(c)[0]}
 
     text = _render_my_samples_page(
@@ -4117,8 +4161,13 @@ async def show_my_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: 
 
     async def _fill_and_edit() -> None:
         try:
-            for c in list(pending):
-                await asyncio.to_thread(_rmc_fetch_one, c)
+            fetched = await _rmc_fetch_many(list(pending))
+            if fetched:
+                # Persist so redeploys / other reps skip the MMS trip.
+                try:
+                    await asyncio.to_thread(sheets.save_rmc_cache, fetched)
+                except Exception as e:  # noqa: BLE001 — best-effort
+                    log.warning("my-samples RMC sheet cache write failed: %s", e)
             if ctx.user_data.get("mys_seq") != seq:
                 return  # user moved on — cache is warm for their next visit
             new_text = _render_my_samples_page(

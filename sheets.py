@@ -968,6 +968,86 @@ def log_pp_query(
         log.warning("log_pp_query failed: %s", e)
 
 
+# ---------- RM-cost cache (persists My-samples MMS fetches) ----------
+
+RMC_CACHE_TAB = "RMC Cache"
+RMC_CACHE_HEADER = ["Product Code", "Adj RMC (USD)", "Updated UTC"]
+# Entries older than this are treated as stale (RM costs drift slowly).
+_RMC_SHEET_MAX_AGE_SEC = 7 * 24 * 3600
+# In-module TTL on the tab read so page flips don't re-hit the Sheets API.
+_RMC_SHEET_TTL_SEC = 600
+_rmc_sheet_cache: tuple[float, dict[str, float]] | None = None
+
+
+def load_rmc_cache(force: bool = False) -> dict[str, float]:
+    """code → adjusted RM cost (USD) from the RMC Cache tab, fresh rows only.
+
+    Populated by bot._fill_and_edit after each MMS fetch so RM costs
+    survive Railway redeploys and are shared across reps. Missing tab →
+    empty dict (it gets created on first save).
+    """
+    global _rmc_sheet_cache
+    now = time.time()
+    if not force and _rmc_sheet_cache and now - _rmc_sheet_cache[0] < _RMC_SHEET_TTL_SEC:
+        return _rmc_sheet_cache[1]
+    import calendar
+    out: dict[str, float] = {}
+    try:
+        ws = _open_seasoning_master().worksheet(RMC_CACHE_TAB)
+        for row in ws.get_all_values()[1:]:
+            if len(row) < 3:
+                continue
+            code = (row[0] or "").strip().upper()
+            try:
+                val = float(row[1])
+                updated = calendar.timegm(
+                    time.strptime(row[2].strip(), "%Y-%m-%d %H:%M:%S UTC")
+                )
+            except (ValueError, OverflowError):
+                continue
+            if code and time.time() - updated < _RMC_SHEET_MAX_AGE_SEC:
+                out[code] = val
+    except gspread.WorksheetNotFound:
+        pass
+    _rmc_sheet_cache = (now, out)
+    return out
+
+
+def save_rmc_cache(entries: dict[str, float]) -> None:
+    """Upsert adjusted RM costs into the RMC Cache tab. Best-effort — callers
+    swallow failures (a lost write just means one extra MMS fetch later)."""
+    if not entries:
+        return
+    global _rmc_sheet_cache
+    sh = _open_seasoning_master()
+    try:
+        ws = sh.worksheet(RMC_CACHE_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=RMC_CACHE_TAB, rows=1000, cols=len(RMC_CACHE_HEADER))
+        ws.update("A1", [RMC_CACHE_HEADER])
+    values = ws.get_all_values()
+    row_of = {
+        (r[0] or "").strip().upper(): i
+        for i, r in enumerate(values[1:], start=2)
+        if r and (r[0] or "").strip()
+    }
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+    updates: list[dict] = []
+    appends: list[list[str]] = []
+    for code, val in entries.items():
+        code = code.strip().upper()
+        rowvals = [code, f"{val:.2f}", now_str]
+        if code in row_of:
+            updates.append({"range": f"A{row_of[code]}:C{row_of[code]}", "values": [rowvals]})
+        else:
+            appends.append(rowvals)
+    if updates:
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+    if appends:
+        ws.append_rows(appends, value_input_option="USER_ENTERED")
+    _rmc_sheet_cache = None  # next load sees the new rows
+
+
 # ---------- Past sample submissions (for smart seasoning suggestions) ----------
 
 def load_past_submissions(force: bool = False) -> list[dict[str, str]]:

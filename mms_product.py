@@ -746,3 +746,20 @@ def get_client() -> MMSProductClient:
         if _singleton is None:
             _singleton = MMSProductClient()
     return _singleton
+
+
+# V1.17.x — small pool of extra clients for parallel read-only fetches
+# (the My-samples RM-cost fill). Each client owns its own session cookie,
+# so server-side search state doesn't cross-talk between them. Kept small
+# deliberately — MMS3 is an old Struts app; be gentle.
+_pool: list[MMSProductClient] = []
+_pool_lock = Lock()
+
+
+def get_pool(size: int = 3) -> list[MMSProductClient]:
+    """Return `size` reusable clients (grown lazily, capped at 3)."""
+    size = max(1, min(size, 3))
+    with _pool_lock:
+        while len(_pool) < size:
+            _pool.append(MMSProductClient())
+        return _pool[:size]

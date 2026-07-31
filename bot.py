@@ -4469,32 +4469,31 @@ async def _show_rep_samples(
 
     rep_pref_currency = await _user_pref_currency(update)
 
-    page_marker = (
-        f"  <i>(page {page + 1} of {total_pages}, "
-        f"showing {start + 1}–{end} of {total})</i>"
-        if total_pages > 1
-        else f"  <i>({total} total)</i>"
-    )
+    # V1.17.x — same block layout as the My-samples browse (one sample =
+    # one 4-line block); the old single-line-per-sample format was
+    # unreadable on mobile.
     lines = [
-        f"👔 <b>Samples sent by {h(rep_name)}</b> — last 2 years{page_marker}",
+        f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
+        f"<i>Showing {start + 1}–{end} of {total} · newest first</i>",
         "",
     ]
     for i, r in enumerate(page_rows, start + 1):
         d = r.get("_date")
         date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
         cust = (r.get("Customer Name") or "—").strip() or "—"
-        name = r.get("Product Name") or "—"
-        code = r.get("Product Code") or "—"
+        name = (r.get("Product Name") or "—").strip()
+        code = (r.get("Product Code") or "—").strip().upper()
         price_raw = (r.get("R&D Price") or "").strip()
         price = _format_price_for_currency(price_raw, rep_pref_currency) if price_raw else "—"
-        lines.append(
-            f" {i}. {h(date_str)} · <b>{h(cust)}</b> · {h(name)} · "
-            f"<code>{h(code)}</code> · {h(price)}"
-        )
+        lines.append(f"<b>{i}. {h(name)}</b>")
+        lines.append(f"   <code>{h(code)}</code> · {h(date_str)}")
+        lines.append(f"   💲 R&amp;D {h(price)}")
+        lines.append(f"   🏢 {h(cust)}")
+        lines.append("")
 
     sync_footer = await _last_sync_footer()
     if sync_footer:
-        lines.append("")
+        # Blocks already end with a blank separator line — no extra needed.
         lines.append(f"<i>{sync_footer}</i>")
 
     rep_hash = _cust_hash(rep_name)
@@ -4511,7 +4510,7 @@ async def _show_rep_samples(
     if pnav:
         btn_rows.append(pnav)
     btn_rows.append([("🏠 Main menu", "menu:home")])
-    await send(update, "\n".join(lines), kb(btn_rows))
+    await send(update, "\n".join(lines).rstrip(), kb(btn_rows))
 
 
 async def _rep_name_from_hash(target_hash: str) -> str | None:

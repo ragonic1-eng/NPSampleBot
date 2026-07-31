@@ -358,6 +358,9 @@ async def send(
             getattr(sent_msg, "message_id", None),
             user.id,
         )
+    # Returned so callers that need to edit the message later (e.g. the
+    # My-samples background RM-cost fill) can grab chat_id + message_id.
+    return sent_msg
 
 
 def _effective_comment(d: state.Draft) -> str:
@@ -3894,6 +3897,244 @@ async def _show_lastsample_results(
     await send(update, "\n".join(lines).rstrip(), kb(btn_rows))
 
 
+# --------------------- 👤 My samples — 12-month browse ---------------------
+# V1.17.x — the "👤 My samples" menu button now opens a paginated browse of
+# the rep's last 12 months of samples (10 per page, newest first) instead of
+# the keyword-search prompt. /lastsample keyword search is still available
+# via the 🔎 button on each page and the command itself.
+
+_MY_SAMPLES_PAGE_SIZE = 10
+
+# Raw Material Cost cache: code → (fetched_at_epoch, adj_rmc_usd | None).
+# RM cost lives only in MMS (one find+detail round-trip per code, serialized
+# behind the client lock), so the page renders instantly from the sheet and
+# a background task fills RM costs in, then edits the message. None = the
+# last fetch failed; cached briefly so a bad code doesn't get re-fetched on
+# every page flip.
+_RMC_CACHE: dict[str, tuple[float, float | None]] = {}
+_RMC_TTL_OK_SEC = 6 * 3600
+_RMC_TTL_FAIL_SEC = 15 * 60
+
+
+def _adjusted_rmc_usd(raw: float) -> float:
+    """Customer-facing RM cost: round UP to next 0.10, then + standing
+    markup. Same rule as /pp so the two views can never disagree."""
+    raw_dec = Decimal(str(raw))
+    rounded_up = float(raw_dec.quantize(Decimal("0.1"), rounding=ROUND_CEILING))
+    return rounded_up + config.RMC_MARKUP_USD
+
+
+def _rmc_cache_get(code: str) -> tuple[bool, float | None]:
+    """Returns (hit, value). value None on a cached recent failure."""
+    import time as _time
+    ent = _RMC_CACHE.get(code)
+    if not ent:
+        return False, None
+    ts, val = ent
+    ttl = _RMC_TTL_OK_SEC if val is not None else _RMC_TTL_FAIL_SEC
+    if _time.time() - ts > ttl:
+        return False, None
+    return True, val
+
+
+def _rmc_fetch_one(code: str) -> float | None:
+    """Blocking MMS fetch of the adjusted RM cost for one code.
+
+    Deliberately uses find_sid + fetch_detail only — skips the R&D-price
+    lookup (we already have R&D price from the sheet) and therefore also
+    skips the Add/Delete probe fallback entirely.
+    """
+    import time as _time
+    client = mms_product.get_client()
+    try:
+        sid = client.find_sid(code)
+        product = client.fetch_detail(sid)
+        val = _adjusted_rmc_usd(product.raw_material_cost_usd)
+    except Exception as e:  # noqa: BLE001 — a miss just renders as "—"
+        log.info("my-samples RM fetch failed for %s: %s", code, e)
+        val = None
+    _RMC_CACHE[code] = (_time.time(), val)
+    return val
+
+
+def _render_my_samples_page(
+    page_rows: list[dict],
+    page: int,
+    total: int,
+    pref_currency: str | None,
+    rmc_pending: set[str],
+    sync_footer: str,
+) -> str:
+    """Build the message body for one My-samples page.
+
+    rmc_pending — codes whose RM cost is still being fetched from MMS;
+    rendered as ⏳ now, replaced by the background edit when done.
+    """
+    start = page * _MY_SAMPLES_PAGE_SIZE
+    end = min(start + _MY_SAMPLES_PAGE_SIZE, total)
+    lines: list[str] = [
+        "👤 <b>My samples — last 12 months</b>",
+        f"<i>Showing {start + 1}–{end} of {total} · newest first</i>",
+        "",
+    ]
+
+    def _fmt_rd(raw: str) -> str:
+        return _format_price_for_currency(raw, pref_currency)
+
+    def _fmt_rmc(code: str) -> str:
+        if code in rmc_pending:
+            return "⏳ fetching…"
+        hit, val = _rmc_cache_get(code)
+        if not hit or val is None:
+            return "—"
+        return _format_price_for_currency(f"USD {val:.2f}", pref_currency)
+
+    for i, r in enumerate(page_rows, start + 1):
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        name = (r.get("Product Name") or "—").strip()
+        code = (r.get("Product Code") or "—").strip().upper()
+        rd_str = _fmt_rd(r.get("R&D Price") or "") or "—"
+        customer = (r.get("Customer Name") or "—").strip()
+        lines.append(f"<b>{i}. {h(name)}</b>")
+        lines.append(f"   <code>{h(code)}</code> · {h(date_str)}")
+        lines.append(f"   💲 R&amp;D {h(rd_str)}  ·  🧱 RM cost {h(_fmt_rmc(code))}")
+        lines.append(f"   🏢 {h(customer)}")
+        lines.append("")
+
+    if sync_footer:
+        lines.append(f"<i>{sync_footer}</i>")
+    return "\n".join(lines).rstrip()
+
+
+def _my_samples_kb(page: int, total: int) -> "InlineKeyboardMarkup":
+    total_pages = max(1, (total + _MY_SAMPLES_PAGE_SIZE - 1) // _MY_SAMPLES_PAGE_SIZE)
+    end = min((page + 1) * _MY_SAMPLES_PAGE_SIZE, total)
+    nav_row: list[tuple[str, str]] = []
+    if page > 0:
+        if page > 1:
+            nav_row.append(("⏮ First", "mys:page:0"))
+        nav_row.append(("◀ Prev", f"mys:page:{page - 1}"))
+    if page < total_pages - 1:
+        next_count = min(_MY_SAMPLES_PAGE_SIZE, total - end)
+        nav_row.append((f"Next {next_count} ▶", f"mys:page:{page + 1}"))
+    btn_rows: list[list[tuple[str, str]]] = []
+    if nav_row:
+        btn_rows.append(nav_row)
+    btn_rows.append([("🔎 Search by keyword", "lastsample:again"),
+                     ("🏠 Main menu", "menu:home")])
+    return kb(btn_rows)
+
+
+async def show_my_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    """👤 My samples — paginated 12-month browse, newest first.
+
+    Stateless pagination (mys:page:<n> carries everything) so clicks work
+    across Railway worker switches; the 90s FSL cache keeps re-loads cheap.
+    """
+    # Bumped on EVERY render so any in-flight background RM fill from a
+    # previous page knows it's stale and must not overwrite this message.
+    seq = ctx.user_data.get("mys_seq", 0) + 1
+    ctx.user_data["mys_seq"] = seq
+
+    user = update.effective_user
+    mms_name = ctx.user_data.get("lastsample_mms_name") or await asyncio.to_thread(
+        sheets.get_user_mms_name, user.id, user.username,
+    )
+    if not mms_name:
+        await send(
+            update,
+            "🛑 I can't see your <b>MMS Name</b> — ask the admin to set it "
+            "on the <i>Authorized Users</i> tab, then tap 👤 My samples again.",
+            kb([[("🏠 Main menu", "menu:home")]]),
+        )
+        return
+    ctx.user_data["lastsample_mms_name"] = mms_name
+
+    try:
+        await update.effective_chat.send_action("typing")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rows = await _load_lastsample_rows("self", mms_name)
+    except Exception as e:  # noqa: BLE001
+        log.warning("my-samples FSL read failed: %s", e)
+        await send(
+            update,
+            "⚠️ The sample sheet is busy right now (rate limit). "
+            "Please try again in a minute.",
+            kb([[("🔄 Retry", "mys:page:0"), ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    cutoff = (_sgt_now() - timedelta(days=365)).date()
+    recent = [r for r in rows if r.get("_date") and r["_date"] >= cutoff]
+    recent.sort(key=lambda r: r["_date"], reverse=True)
+
+    if not recent:
+        await send(
+            update,
+            "👤 <b>My samples — last 12 months</b>\n\n"
+            f"<i>No samples found for <b>{h(mms_name)}</b> in the past year.</i>\n\n"
+            "Use 🔎 keyword search to look further back.",
+            kb([[("🔎 Search by keyword", "lastsample:again"),
+                 ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    total = len(recent)
+    total_pages = max(1, (total + _MY_SAMPLES_PAGE_SIZE - 1) // _MY_SAMPLES_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    start = page * _MY_SAMPLES_PAGE_SIZE
+    page_rows = recent[start:start + _MY_SAMPLES_PAGE_SIZE]
+
+    pref_currency = await _user_pref_currency(update)
+    sync_footer = await _last_sync_footer()
+
+    # Which codes on this page still need an MMS round-trip for RM cost?
+    page_codes: list[str] = []
+    for r in page_rows:
+        c = (r.get("Product Code") or "").strip().upper()
+        if c and c != "—" and c not in page_codes:
+            page_codes.append(c)
+    pending = {c for c in page_codes if not _rmc_cache_get(c)[0]}
+
+    text = _render_my_samples_page(
+        page_rows, page, total, pref_currency, pending, sync_footer,
+    )
+    markup = _my_samples_kb(page, total)
+    sent_msg = await send(update, text, markup)
+
+    if not pending or sent_msg is None:
+        return
+
+    # Background fill: fetch the missing RM costs (serialized behind the
+    # MMS client lock anyway), then swap the ⏳ placeholders in-place.
+    # The seq captured at the top of this render stops a stale fill from
+    # overwriting the message after the rep has paged elsewhere
+    # (pagination EDITS this same message).
+    footer = _footer(update)
+
+    async def _fill_and_edit() -> None:
+        try:
+            for c in list(pending):
+                await asyncio.to_thread(_rmc_fetch_one, c)
+            if ctx.user_data.get("mys_seq") != seq:
+                return  # user moved on — cache is warm for their next visit
+            new_text = _render_my_samples_page(
+                page_rows, page, total, pref_currency, set(), sync_footer,
+            )
+            await sent_msg.edit_text(
+                f"{new_text}\n\n{footer}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        except Exception as e:  # noqa: BLE001 — the ⏳ page is still useful as-is
+            log.warning("my-samples RM background fill failed: %s", e)
+
+    asyncio.create_task(_fill_and_edit())
+
+
 _CUST_PAGE_SIZE = 10
 
 
@@ -5657,6 +5898,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _show_customer_samples(update, ctx, mms, chosen, scope=cs_scope)
         return
 
+    # V1.17.x — My-samples 12-month browse pagination. Stateless: the page
+    # number is the only state; rows re-load from the 90s FSL cache on
+    # whichever worker handles the click.
+    if data.startswith("mys:page:"):
+        try:
+            mys_page = int(data.split(":")[-1])
+        except ValueError:
+            return
+        await show_my_samples(update, ctx, page=mys_page)
+        return
+
     # V1.17.x — "last sample of this code" buttons under a /pp price
     # reply. Callback format: lsx:<s|a>:<code>
     #   s → the tapping rep's own samples (resolves their MMS Name)
@@ -6227,9 +6479,10 @@ async def _handle_menu_callback(update, ctx, action: str):
         )
         return
     if action == "lastsample":
-        # Same flow as the /lastsample command — reuse it so the prompt and
-        # MMS-name lookup logic stay in one place.
-        await cmd_lastsample(update, ctx)
+        # V1.17.x — the menu button now opens the 12-month browse view.
+        # Keyword search stays reachable via the 🔎 button on each page
+        # (and the /lastsample command itself is unchanged).
+        await show_my_samples(update, ctx, page=0)
         return
     if action == "alllastsample":
         # Admin-only entry — cmd_alllastsample re-checks the gate, so even

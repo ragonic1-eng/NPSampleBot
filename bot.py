@@ -4185,6 +4185,8 @@ async def show_my_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: 
 
 
 _CUST_PAGE_SIZE = 10
+# Rep view groups by customer — this many customer blocks per page.
+_REP_CUSTOMERS_PER_PAGE = 5
 
 
 async def _show_customer_samples(
@@ -4460,41 +4462,80 @@ async def _show_rep_samples(
 
     rows.sort(key=lambda r: r["_date"], reverse=True)
 
-    total = len(rows)
-    total_pages = max(1, (total + _CUST_PAGE_SIZE - 1) // _CUST_PAGE_SIZE)
+    # V1.17.x — reps raise samples per CUSTOMER, so the view groups by
+    # customer: header line + the samples hidden in a collapsed
+    # <blockquote expandable> (tap to show/hide — Telegram-native).
+    # rows are date-desc, so insertion order = customers by their most
+    # recent sample, newest first.
+    groups: dict[str, dict] = {}
+    for r in rows:
+        cust = (r.get("Customer Name") or "—").strip() or "—"
+        key = " ".join(cust.lower().split())
+        g = groups.setdefault(key, {"name": cust, "rows": []})
+        g["rows"].append(r)
+    glist = list(groups.values())
+
+    # Paginate by CUSTOMER — the unit reps think in.
+    per_page = _REP_CUSTOMERS_PER_PAGE
+    total_pages = max(1, (len(glist) + per_page - 1) // per_page)
     page = max(0, min(int(page or 0), total_pages - 1))
-    start = page * _CUST_PAGE_SIZE
-    end = min(start + _CUST_PAGE_SIZE, total)
-    page_rows = rows[start:end]
+    cust_start = page * per_page
+    page_groups = glist[cust_start:cust_start + per_page]
 
     rep_pref_currency = await _user_pref_currency(update)
-
-    # V1.17.x — same block layout as the My-samples browse (one sample =
-    # one 4-line block); the old single-line-per-sample format was
-    # unreadable on mobile.
-    lines = [
-        f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
-        f"<i>Showing {start + 1}–{end} of {total} · newest first</i>",
-        "",
-    ]
-    for i, r in enumerate(page_rows, start + 1):
-        d = r.get("_date")
-        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
-        cust = (r.get("Customer Name") or "—").strip() or "—"
-        name = (r.get("Product Name") or "—").strip()
-        code = (r.get("Product Code") or "—").strip().upper()
-        price_raw = (r.get("R&D Price") or "").strip()
-        price = _format_price_for_currency(price_raw, rep_pref_currency) if price_raw else "—"
-        lines.append(f"<b>{i}. {h(name)}</b>")
-        lines.append(f"   <code>{h(code)}</code> · {h(date_str)}")
-        lines.append(f"   💲 R&amp;D {h(price)}")
-        lines.append(f"   🏢 {h(cust)}")
-        lines.append("")
-
     sync_footer = await _last_sync_footer()
-    if sync_footer:
-        # Blocks already end with a blank separator line — no extra needed.
-        lines.append(f"<i>{sync_footer}</i>")
+
+    def _render(cap: int) -> str:
+        """Build the page, showing at most `cap` samples inside each
+        customer's quote block. Called with shrinking caps until the
+        message fits Telegram's 4096-char limit."""
+        out = [
+            f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
+            f"<i>Customers {cust_start + 1}–{cust_start + len(page_groups)} "
+            f"of {len(glist)} · newest first · {len(rows)} samples total</i>",
+            "<i>Tap a grey block to expand or hide it.</i>",
+            "",
+        ]
+        for g in page_groups:
+            g_rows = g["rows"]
+            latest = g_rows[0].get("_date")
+            latest_str = latest.strftime("%d %b %Y") if latest else "—"
+            n = len(g_rows)
+            out.append(
+                f"🏢 <b>{h(g['name'])}</b> — {n} sample{'s' if n != 1 else ''} "
+                f"· latest {h(latest_str)}"
+            )
+            inner: list[str] = []
+            for j, r in enumerate(g_rows[:cap], 1):
+                d = r.get("_date")
+                date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+                name = (r.get("Product Name") or "—").strip()
+                code = (r.get("Product Code") or "—").strip().upper()
+                price_raw = (r.get("R&D Price") or "").strip()
+                price = (
+                    _format_price_for_currency(price_raw, rep_pref_currency)
+                    if price_raw else "—"
+                )
+                inner.append(f"{j}. <b>{h(name)}</b>")
+                inner.append(
+                    f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}"
+                )
+            if n > cap:
+                inner.append(
+                    f"<i>… and {n - cap} older — type "
+                    f"“{h(g['name'][:28])}” to see all</i>"
+                )
+            out.append("<blockquote expandable>" + "\n".join(inner) + "</blockquote>")
+            out.append("")
+        if sync_footer:
+            out.append(f"<i>{sync_footer}</i>")
+        return "\n".join(out).rstrip()
+
+    # Telegram hard-caps messages at 4096 chars; _footer adds ~40 more.
+    for cap in (12, 8, 6, 4, 3, 2, 1):
+        text = _render(cap)
+        if len(text) <= 3900:
+            break
 
     rep_hash = _cust_hash(rep_name)
     pnav: list[tuple[str, str]] = []
@@ -4502,15 +4543,18 @@ async def _show_rep_samples(
         if page > 1:
             pnav.append(("⏮ First", f"rppg:0:{rep_hash}"))
         pnav.append(("◀ Prev", f"rppg:{page - 1}:{rep_hash}"))
-    if end < total:
-        next_count = min(_CUST_PAGE_SIZE, total - end)
-        pnav.append((f"Next {next_count} ▶", f"rppg:{page + 1}:{rep_hash}"))
+    if page < total_pages - 1:
+        next_custs = min(per_page, len(glist) - (cust_start + len(page_groups)))
+        pnav.append(
+            (f"Next {next_custs} customer{'s' if next_custs != 1 else ''} ▶",
+             f"rppg:{page + 1}:{rep_hash}")
+        )
 
     btn_rows = []
     if pnav:
         btn_rows.append(pnav)
     btn_rows.append([("🏠 Main menu", "menu:home")])
-    await send(update, "\n".join(lines).rstrip(), kb(btn_rows))
+    await send(update, text, kb(btn_rows))
 
 
 async def _rep_name_from_hash(target_hash: str) -> str | None:

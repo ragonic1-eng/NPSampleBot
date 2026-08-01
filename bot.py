@@ -4185,8 +4185,6 @@ async def show_my_samples(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: 
 
 
 _CUST_PAGE_SIZE = 10
-# Rep view groups by customer — this many customer blocks per page.
-_REP_CUSTOMERS_PER_PAGE = 5
 
 
 async def _show_customer_samples(
@@ -4475,67 +4473,97 @@ async def _show_rep_samples(
         g["rows"].append(r)
     glist = list(groups.values())
 
-    # Paginate by CUSTOMER — the unit reps think in.
-    per_page = _REP_CUSTOMERS_PER_PAGE
-    total_pages = max(1, (len(glist) + per_page - 1) // per_page)
-    page = max(0, min(int(page or 0), total_pages - 1))
-    cust_start = page * per_page
-    page_groups = glist[cust_start:cust_start + per_page]
-
     rep_pref_currency = await _user_pref_currency(update)
     sync_footer = await _last_sync_footer()
 
-    def _render(cap: int) -> str:
-        """Build the page, showing at most `cap` samples inside each
-        customer's quote block. Called with shrinking caps until the
-        message fits Telegram's 4096-char limit."""
-        out = [
-            f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
-            f"<i>Customers {cust_start + 1}–{cust_start + len(page_groups)} "
-            f"of {len(glist)} · newest first · {len(rows)} samples total</i>",
-            "<i>Tap a grey block to expand or hide it.</i>",
-            "",
-        ]
-        for g in page_groups:
-            g_rows = g["rows"]
-            latest = g_rows[0].get("_date")
-            latest_str = latest.strftime("%d %b %Y") if latest else "—"
-            n = len(g_rows)
-            out.append(
-                f"🏢 <b>{h(g['name'])}</b> — {n} sample{'s' if n != 1 else ''} "
-                f"· latest {h(latest_str)}"
+    def _group_block(g: dict, cap: int | None = None) -> str:
+        """Render one customer's block. cap=None shows EVERY sample; a
+        cap is used only for the pathological single-customer-too-big case."""
+        g_rows = g["rows"]
+        latest = g_rows[0].get("_date")
+        latest_str = latest.strftime("%d %b %Y") if latest else "—"
+        n = len(g_rows)
+        shown = g_rows if cap is None else g_rows[:cap]
+        head = (
+            f"🏢 <b>{h(g['name'])}</b> — {n} sample{'s' if n != 1 else ''} "
+            f"· latest {h(latest_str)}"
+        )
+        inner: list[str] = []
+        for j, r in enumerate(shown, 1):
+            d = r.get("_date")
+            date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+            name = (r.get("Product Name") or "—").strip()
+            code = (r.get("Product Code") or "—").strip().upper()
+            price_raw = (r.get("R&D Price") or "").strip()
+            price = (
+                _format_price_for_currency(price_raw, rep_pref_currency)
+                if price_raw else "—"
             )
-            inner: list[str] = []
-            for j, r in enumerate(g_rows[:cap], 1):
-                d = r.get("_date")
-                date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
-                name = (r.get("Product Name") or "—").strip()
-                code = (r.get("Product Code") or "—").strip().upper()
-                price_raw = (r.get("R&D Price") or "").strip()
-                price = (
-                    _format_price_for_currency(price_raw, rep_pref_currency)
-                    if price_raw else "—"
-                )
-                inner.append(f"{j}. <b>{h(name)}</b>")
-                inner.append(
-                    f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}"
-                )
-            if n > cap:
-                inner.append(
-                    f"<i>… and {n - cap} older — type "
-                    f"“{h(g['name'][:28])}” to see all</i>"
-                )
-            out.append("<blockquote expandable>" + "\n".join(inner) + "</blockquote>")
-            out.append("")
-        if sync_footer:
-            out.append(f"<i>{sync_footer}</i>")
-        return "\n".join(out).rstrip()
+            inner.append(f"{j}. <b>{h(name)}</b>")
+            inner.append(
+                f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}"
+            )
+        if cap is not None and n > cap:
+            inner.append(
+                f"<i>… and {n - cap} older not shown — this one customer has "
+                "too many samples to fit a single message</i>"
+            )
+        return head + "\n<blockquote expandable>" + "\n".join(inner) + "</blockquote>"
 
-    # Telegram hard-caps messages at 4096 chars; _footer adds ~40 more.
-    for cap in (12, 8, 6, 4, 3, 2, 1):
-        text = _render(cap)
-        if len(text) <= 3900:
-            break
+    # V1.17.19 — never truncate a customer's list with "type X to see all".
+    # Instead, pack WHOLE customer groups (all their rows) into pages under
+    # Telegram's 4096-char limit, so every customer shown displays every
+    # sample. Page boundaries are computed greedily up front; `page` indexes
+    # into them, so the existing rppg: Prev/Next/First callbacks still work.
+    # Only a lone customer whose own full list exceeds one message is capped.
+    _BUDGET = 3600  # header + footer + nav eat the rest of the 4096
+    pages: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_len = 0
+    for g in glist:
+        blen = len(_group_block(g)) + 2  # +2 for the spacer line
+        if blen > _BUDGET:
+            # A single customer that can't fit a message on its own gets a
+            # page to itself (row-capped at render time below).
+            if cur:
+                pages.append(cur)
+                cur, cur_len = [], 0
+            pages.append([g])
+            continue
+        if cur and cur_len + blen > _BUDGET:
+            pages.append(cur)
+            cur, cur_len = [], 0
+        cur.append(g)
+        cur_len += blen
+    if cur:
+        pages.append(cur)
+    if not pages:
+        pages = [[]]
+
+    total_pages = len(pages)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    page_groups = pages[page]
+
+    out = [
+        f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
+        f"<i>Page {page + 1}/{total_pages} · {len(glist)} customers · "
+        f"{len(rows)} samples total · newest first</i>",
+        "<i>Tap a grey block to expand or hide it.</i>",
+        "",
+    ]
+    for g in page_groups:
+        block = _group_block(g)
+        # Last-resort cap for the single-customer-too-big page only.
+        if len(block) + 2 > _BUDGET:
+            cap = len(g["rows"])
+            while cap > 1 and len(_group_block(g, cap)) + 2 > _BUDGET:
+                cap -= 1
+            block = _group_block(g, cap)
+        out.append(block)
+        out.append("")
+    if sync_footer:
+        out.append(f"<i>{sync_footer}</i>")
+    text = "\n".join(out).rstrip()
 
     rep_hash = _cust_hash(rep_name)
     pnav: list[tuple[str, str]] = []
@@ -4544,7 +4572,7 @@ async def _show_rep_samples(
             pnav.append(("⏮ First", f"rppg:0:{rep_hash}"))
         pnav.append(("◀ Prev", f"rppg:{page - 1}:{rep_hash}"))
     if page < total_pages - 1:
-        next_custs = min(per_page, len(glist) - (cust_start + len(page_groups)))
+        next_custs = len(pages[page + 1])
         pnav.append(
             (f"Next {next_custs} customer{'s' if next_custs != 1 else ''} ▶",
              f"rppg:{page + 1}:{rep_hash}")

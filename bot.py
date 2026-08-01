@@ -4505,65 +4505,46 @@ async def _show_rep_samples(
             )
         if cap is not None and n > cap:
             inner.append(
-                f"<i>… and {n - cap} older not shown — this one customer has "
-                "too many samples to fit a single message</i>"
+                f"<i>… +{n - cap} older sample{'s' if n - cap != 1 else ''} "
+                "(too many to fit here)</i>"
             )
         return head + "\n<blockquote expandable>" + "\n".join(inner) + "</blockquote>"
 
-    # V1.17.19 — never truncate a customer's list with "type X to see all".
-    # Instead, pack WHOLE customer groups (all their rows) into pages under
-    # Telegram's 4096-char limit, so every customer shown displays every
-    # sample. Page boundaries are computed greedily up front; `page` indexes
-    # into them, so the existing rppg: Prev/Next/First callbacks still work.
-    # Only a lone customer whose own full list exceeds one message is capped.
+    # V1.17.20 — show 10 customers per page (a useful overview), each with
+    # ALL its samples when they fit. Only when 10 full lists would blow
+    # Telegram's 4096-char limit do we apply the SMALLEST uniform row cap
+    # that makes the page fit — and even then no "type X to see all" prompt,
+    # just a plain "+N older" note. Fixed 10-per-page keeps the rppg: page
+    # index → Prev/Next/First callbacks unchanged.
     _BUDGET = 3600  # header + footer + nav eat the rest of the 4096
-    pages: list[list[dict]] = []
-    cur: list[dict] = []
-    cur_len = 0
-    for g in glist:
-        blen = len(_group_block(g)) + 2  # +2 for the spacer line
-        if blen > _BUDGET:
-            # A single customer that can't fit a message on its own gets a
-            # page to itself (row-capped at render time below).
-            if cur:
-                pages.append(cur)
-                cur, cur_len = [], 0
-            pages.append([g])
-            continue
-        if cur and cur_len + blen > _BUDGET:
-            pages.append(cur)
-            cur, cur_len = [], 0
-        cur.append(g)
-        cur_len += blen
-    if cur:
-        pages.append(cur)
-    if not pages:
-        pages = [[]]
-
-    total_pages = len(pages)
+    _PER_PAGE = 10
+    total_pages = max(1, (len(glist) + _PER_PAGE - 1) // _PER_PAGE)
     page = max(0, min(int(page or 0), total_pages - 1))
-    page_groups = pages[page]
+    page_groups = glist[page * _PER_PAGE:(page + 1) * _PER_PAGE]
 
-    out = [
-        f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
-        f"<i>Page {page + 1}/{total_pages} · {len(glist)} customers · "
-        f"{len(rows)} samples total · newest first</i>",
-        "<i>Tap a grey block to expand or hide it.</i>",
-        "",
-    ]
-    for g in page_groups:
-        block = _group_block(g)
-        # Last-resort cap for the single-customer-too-big page only.
-        if len(block) + 2 > _BUDGET:
-            cap = len(g["rows"])
-            while cap > 1 and len(_group_block(g, cap)) + 2 > _BUDGET:
-                cap -= 1
-            block = _group_block(g, cap)
-        out.append(block)
-        out.append("")
-    if sync_footer:
-        out.append(f"<i>{sync_footer}</i>")
-    text = "\n".join(out).rstrip()
+    def _render(cap: int | None) -> str:
+        out = [
+            f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
+            f"<i>Page {page + 1}/{total_pages} · {len(glist)} customers · "
+            f"{len(rows)} samples total · newest first</i>",
+            "<i>Tap a grey block to expand or hide it.</i>",
+            "",
+        ]
+        for g in page_groups:
+            out.append(_group_block(g, cap))
+            out.append("")
+        if sync_footer:
+            out.append(f"<i>{sync_footer}</i>")
+        return "\n".join(out).rstrip()
+
+    # Prefer showing EVERY sample (cap=None); shrink the uniform per-customer
+    # cap only as far as needed to fit all 10 customers under the limit.
+    text = _render(None)
+    if len(text) > 3900:
+        for cap in (12, 8, 6, 4, 3, 2, 1):
+            text = _render(cap)
+            if len(text) <= 3900:
+                break
 
     rep_hash = _cust_hash(rep_name)
     pnav: list[tuple[str, str]] = []
@@ -4572,7 +4553,7 @@ async def _show_rep_samples(
             pnav.append(("⏮ First", f"rppg:0:{rep_hash}"))
         pnav.append(("◀ Prev", f"rppg:{page - 1}:{rep_hash}"))
     if page < total_pages - 1:
-        next_custs = len(pages[page + 1])
+        next_custs = min(_PER_PAGE, len(glist) - (page + 1) * _PER_PAGE)
         pnav.append(
             (f"Next {next_custs} customer{'s' if next_custs != 1 else ''} ▶",
              f"rppg:{page + 1}:{rep_hash}")

@@ -4588,14 +4588,34 @@ async def _show_rep_samples(
 
     # Prefer showing EVERY sample (cap=None); shrink the uniform per-customer
     # cap only as far as needed to fit all 10 customers under the limit.
+    final_cap: int | None = None
     text = _render(None)
     if len(text) > 3900:
         for cap in (12, 8, 6, 4, 3, 2, 1):
             text = _render(cap)
             if len(text) <= 3900:
+                final_cap = cap
                 break
 
     rep_hash = _cust_hash(rep_name)
+
+    # Any customer whose full list was trimmed to fit gets a dedicated
+    # "📂 See all N" button that opens JUST that customer's samples,
+    # paginated — so a rich customer's 100+ samples are reachable even
+    # though they can't all fit in this overview message.
+    capped_btns: list[list[tuple[str, str]]] = []
+    if final_cap is not None:
+        for g in page_groups:
+            n = len(g["rows"])
+            if n > final_cap:
+                cname = g["name"]
+                label = f"📂 See all {n} · {cname}"
+                if len(label) > 40:
+                    label = label[:39] + "…"
+                capped_btns.append(
+                    [(label, f"repc:0:{rep_hash}:{_cust_hash(cname)}")]
+                )
+
     pnav: list[tuple[str, str]] = []
     if page > 0:
         if page > 1:
@@ -4609,6 +4629,7 @@ async def _show_rep_samples(
         )
 
     btn_rows = []
+    btn_rows.extend(capped_btns)
     if pnav:
         btn_rows.append(pnav)
     btn_rows.append([("🏠 Main menu", "menu:home")])
@@ -4621,6 +4642,98 @@ async def _rep_name_from_hash(target_hash: str) -> str | None:
         if _cust_hash(name) == target_hash:
             return name
     return None
+
+
+_REP_CUST_PAGE_SIZE = 15
+
+
+async def _show_rep_customer_samples(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    rep_name: str,
+    cust_hash: str,
+    page: int = 0,
+) -> None:
+    """Drill-down: ALL of one rep's samples to ONE customer, paginated.
+
+    Reached from the '📂 See all N' button the rep view shows for a rich
+    customer whose full list couldn't fit the grouped overview. 15 per page,
+    newest first — so a customer with 100+ samples is fully browsable.
+    State is entirely in the callback (repc:<page>:<rep_hash>:<cust_hash>),
+    so it survives worker switches like the other paginated views.
+    """
+    try:
+        rows = await _load_lastsample_rows("self", rep_name)
+    except Exception as e:  # noqa: BLE001
+        await send(
+            update,
+            f"😕 Couldn't read Full Sample Listing: {_friendly_fetch_error(e)}",
+        )
+        return
+
+    cutoff = (_sgt_now() - timedelta(days=730)).date()
+    rows = [r for r in rows if r.get("_date") and r["_date"] >= cutoff]
+
+    # Regroup by customer and pick the one whose hash matches — same hashing
+    # the button used, so no name has to travel through the callback payload.
+    groups: dict[str, dict] = {}
+    for r in rows:
+        cust = (r.get("Customer Name") or "—").strip() or "—"
+        groups.setdefault(_cust_hash(cust), {"name": cust, "rows": []})["rows"].append(r)
+    g = groups.get(cust_hash)
+    if not g:
+        await send(
+            update,
+            "🤔 Couldn't find that customer under this rep anymore — the list "
+            "may have changed. Type the rep's name again to refresh.",
+            kb([[("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    g_rows = sorted(g["rows"], key=lambda r: r["_date"], reverse=True)
+    total = len(g_rows)
+    total_pages = max(1, (total + _REP_CUST_PAGE_SIZE - 1) // _REP_CUST_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    start = page * _REP_CUST_PAGE_SIZE
+    end = min(start + _REP_CUST_PAGE_SIZE, total)
+    pref = await _user_pref_currency(update)
+
+    lines = [
+        f"🏢 <b>{h(g['name'])}</b>",
+        f"<i>Samples from {h(rep_name)} · {start + 1}–{end} of {total} "
+        "· newest first</i>",
+        "",
+    ]
+    for i, r in enumerate(g_rows[start:end], start + 1):
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        name = (r.get("Product Name") or "—").strip()
+        code = (r.get("Product Code") or "—").strip().upper()
+        price_raw = (r.get("R&D Price") or "").strip()
+        price = _format_price_for_currency(price_raw, pref) if price_raw else "—"
+        lines.append(f"{i}. <b>{h(name)}</b>")
+        lines.append(f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}")
+
+    rep_hash = _cust_hash(rep_name)
+    nav: list[tuple[str, str]] = []
+    if page > 0:
+        if page > 1:
+            nav.append(("⏮ First", f"repc:0:{rep_hash}:{cust_hash}"))
+        nav.append(("◀ Prev", f"repc:{page - 1}:{rep_hash}:{cust_hash}"))
+    if page < total_pages - 1:
+        left = total - end
+        nav.append((f"Next {min(_REP_CUST_PAGE_SIZE, left)} ▶",
+                    f"repc:{page + 1}:{rep_hash}:{cust_hash}"))
+
+    back_label = f"⬅ Back to {rep_name}"
+    if len(back_label) > 30:
+        back_label = back_label[:29] + "…"
+    btn_rows: list[list[tuple[str, str]]] = []
+    if nav:
+        btn_rows.append(nav)
+    btn_rows.append([(back_label, f"rppg:0:{rep_hash}"),
+                     ("🏠 Main menu", "menu:home")])
+    await send(update, "\n".join(lines), kb(btn_rows))
 
 
 async def _smart_route_text(
@@ -6176,6 +6289,31 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         await _show_rep_samples(update, ctx, rep_name, page=rep_page)
+        return
+
+    # Drill-down into ONE customer of a rep (the '📂 See all N' button).
+    #   repc:<page>:<rep_hash>:<cust_hash>
+    if data.startswith("repc:"):
+        parts = data.split(":", 3)
+        if len(parts) < 4:
+            return
+        try:
+            rc_page = int(parts[1])
+        except ValueError:
+            return
+        rc_rep_hash, rc_cust_hash = parts[2].strip(), parts[3].strip()
+        rc_rep_name = await _rep_name_from_hash(rc_rep_hash)
+        if not rc_rep_name:
+            await send(
+                update,
+                "🤔 Couldn't match that rep anymore — please type the name "
+                "again.",
+                kb([[("🏠 Main menu", "menu:home")]]),
+            )
+            return
+        await _show_rep_customer_samples(
+            update, ctx, rc_rep_name, rc_cust_hash, page=rc_page
+        )
         return
 
     # /lastsample customer pagination — user tapped First / Prev / Next on

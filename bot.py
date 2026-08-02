@@ -8886,6 +8886,11 @@ def main():
                             sheets.BANGKOK_FSL_TAB))
             )
             log.info("FSL tabs pre-warmed")
+            # Seed the rep-name last-known-good cache at boot, so even the
+            # VERY FIRST sales-name search after a deploy is protected if
+            # Google Sheets happens to be hiccuping at that moment.
+            seeded = await _active_rep_names()
+            log.info("Rep-name cache pre-warmed (%d names)", len(seeded))
         except Exception as e:  # noqa: BLE001
             log.warning("FSL warmup failed (will lazy-load): %s", e)
 

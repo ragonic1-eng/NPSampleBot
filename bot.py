@@ -4553,9 +4553,12 @@ async def _show_rep_samples(
                 f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}"
             )
         if cap is not None and n > cap:
+            # The '+N older' line is backed by the tappable button below the
+            # message (Telegram can't make body text itself clickable). Tapping
+            # it pages through ALL n in this same message.
             inner.append(
-                f"<i>… +{n - cap} older sample{'s' if n - cap != 1 else ''} "
-                "(too many to fit here)</i>"
+                f"<i>👇 +{n - cap} older — tap “{h(g['name'][:22])}” below to "
+                f"page through all {n}</i>"
             )
         return head + "\n<blockquote expandable>" + "\n".join(inner) + "</blockquote>"
 
@@ -4609,7 +4612,8 @@ async def _show_rep_samples(
             n = len(g["rows"])
             if n > final_cap:
                 cname = g["name"]
-                label = f"📂 See all {n} · {cname}"
+                older = n - final_cap
+                label = f"➕ {older} older · {cname}"
                 if len(label) > 40:
                     label = label[:39] + "…"
                 capped_btns.append(
@@ -4644,7 +4648,7 @@ async def _rep_name_from_hash(target_hash: str) -> str | None:
     return None
 
 
-_REP_CUST_PAGE_SIZE = 15
+_REP_CUST_PAGE_SIZE = 30
 
 
 async def _show_rep_customer_samples(

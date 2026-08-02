@@ -122,3 +122,24 @@ def test_awb_price_leak_passes_real_awbs():
     for good in ("1234567890", "JD014600003217", "HAND CARRY", "HC",
                  "", "1Z999AA10123456784"):
         assert not _awb_is_price_leak(good), good
+
+
+# ---------- transient Sheets outage detection (sales-name silent-fail) ----------
+
+from bot import _is_transient_data_error  # noqa: E402
+
+
+def test_transient_data_error_flags_google_outages():
+    class APIError(Exception):
+        pass
+    for e in (APIError("[503]: The service is currently unavailable."),
+              Exception("[429]: rateLimitExceeded"),
+              Exception("500 backendError"),
+              Exception("APIError: [502]")):
+        assert _is_transient_data_error(e), e
+
+
+def test_transient_data_error_ignores_real_bugs():
+    for e in (ValueError("no such column"), KeyError("Sales"),
+              TypeError("bad operand")):
+        assert not _is_transient_data_error(e), e

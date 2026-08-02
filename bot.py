@@ -4354,7 +4354,26 @@ def _route_strip_fillers(text: str) -> str:
     return stripped or text.strip()
 
 
-async def _active_rep_names() -> list[str]:
+def _is_transient_data_error(e: BaseException) -> bool:
+    """True for a temporary Google Sheets/back-end outage (503, 500, 429…).
+
+    The router's probes swallow read failures and return empty, which is
+    indistinguishable from a genuine 'no match'. When a rep types a sales
+    name during a Sheets 503, that meant they got a confusing 'nothing
+    found' — or, if a later read also failed, silence. Detecting the
+    transient class lets the router say 'data source busy, try again'
+    instead. Matched on the error text so we don't need to import gspread.
+    """
+    s = f"{type(e).__name__}: {e}"
+    return any(
+        tok in s
+        for tok in ("APIError", "503", "500", "502", "429",
+                    "unavailable", "Unavailable", "RESOURCE_EXHAUSTED",
+                    "rateLimitExceeded", "backendError", "internalError")
+    )
+
+
+async def _active_rep_names(errors: list | None = None) -> list[str]:
     """Distinct rep names the router recognizes when typed.
 
     Union of:
@@ -4379,6 +4398,8 @@ async def _active_rep_names() -> list[str]:
         users = await asyncio.to_thread(sheets.load_users)
     except Exception as e:  # noqa: BLE001
         log.debug("rep-name probe: load_users failed: %s", e)
+        if errors is not None and _is_transient_data_error(e):
+            errors.append(e)
         users = []
     for row in users:
         active = str(sheets._row_get_loose(row, "Active")).strip().lower()
@@ -4391,6 +4412,8 @@ async def _active_rep_names() -> list[str]:
             rows = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
         except Exception as e:  # noqa: BLE001 — probe stays best-effort
             log.debug("rep-name probe: FSL tab %r failed: %s", tab, e)
+            if errors is not None and _is_transient_data_error(e):
+                errors.append(e)
             continue
         for r in rows:
             _add((r.get("Sales") or "").strip())
@@ -4607,6 +4630,12 @@ async def _smart_route_text(
 
     probe = _route_strip_fillers(text)
 
+    # Shared sink: any probe that fails with a TRANSIENT data-source error
+    # (Google Sheets 503/500/429…) records it here, so the router can tell a
+    # real 'no match' apart from 'the sheet was momentarily down' and give the
+    # rep a 'try again' instead of a confusing miss or silence.
+    data_errors: list = []
+
     # --- probes: three independent cached sheets, loaded CONCURRENTLY so
     # the cold path costs one round-trip, not three (V1.17.x perf pass).
     async def _cust_probe() -> list[dict]:
@@ -4615,6 +4644,8 @@ async def _smart_route_text(
             return matcher.top_customer_master(probe, master, limit=3)
         except Exception as e:  # noqa: BLE001
             log.warning("smart route: customer probe failed: %s", e)
+            if _is_transient_data_error(e):
+                data_errors.append(e)
             return []
 
     async def _prod_probe() -> list[dict]:
@@ -4640,13 +4671,30 @@ async def _smart_route_text(
             )
         except Exception as e:  # noqa: BLE001
             log.warning("smart route: product probe failed: %s", e)
+            if _is_transient_data_error(e):
+                data_errors.append(e)
             return []
 
     rep_names, cust_hits, prod_hits = await asyncio.gather(
-        _active_rep_names(), _cust_probe(), _prod_probe()
+        _active_rep_names(data_errors), _cust_probe(), _prod_probe()
     )
     rep_hits, rep_strong = _match_rep_names(probe, rep_names)
     cust_strong = bool(cust_hits) and cust_hits[0].get("score", 0) >= 90
+
+    # Data source hiccuped AND nothing matched → this is almost certainly the
+    # outage talking, not a real miss. Tell the rep to retry rather than
+    # dead-ending on a confusing 'no match' (or, if step 5's read also fails,
+    # on silence). A name that WOULD match but whose sheet read 503'd lands
+    # here — exactly the "typed a sales name, got nothing" symptom.
+    if data_errors and not rep_hits and not cust_hits and not prod_hits:
+        await send(
+            update,
+            "📡 <b>My data source (Google Sheets) is briefly unavailable.</b>\n\n"
+            "This is a temporary hiccup on Google's side, not your search. "
+            "Please try again in a few seconds.",
+            kb([[("🔄 Try again", "menu:home")]]),
+        )
+        return
 
     # 2) Unambiguous rep → straight to their samples.
     if rep_strong and len(rep_hits) == 1 and not cust_strong:

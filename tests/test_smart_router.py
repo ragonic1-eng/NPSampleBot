@@ -143,3 +143,37 @@ def test_transient_data_error_ignores_real_bugs():
     for e in (ValueError("no such column"), KeyError("Sales"),
               TypeError("bad operand")):
         assert not _is_transient_data_error(e), e
+
+
+# ---------- rep-name recognition survives a Sheets outage (LKG cache) ----------
+
+import asyncio  # noqa: E402
+import bot as _botmod  # noqa: E402
+
+
+def test_rep_names_last_known_good_survives_outage(monkeypatch):
+    import sheets
+
+    good = [
+        {"MMS Name": "Alex", "Active": "Y"},
+        {"MMS Name": "Leo", "Active": "Y"},
+    ]
+    monkeypatch.setattr(sheets, "load_users", lambda *a, **k: good)
+    monkeypatch.setattr(sheets, "load_fsl_rows_all", lambda *a, **k: [])
+    _botmod._REP_NAMES_LKG = []
+
+    # 1) healthy read seeds the cache
+    names = asyncio.get_event_loop().run_until_complete(_botmod._active_rep_names([]))
+    assert "Alex" in names and "Leo" in names
+
+    # 2) every read now 503s — must still serve the cached names, not []
+    def boom(*a, **k):
+        raise Exception("APIError: [503]: The service is currently unavailable.")
+    monkeypatch.setattr(sheets, "load_users", boom)
+    monkeypatch.setattr(sheets, "load_fsl_rows_all", boom)
+    errs = []
+    degraded = asyncio.get_event_loop().run_until_complete(
+        _botmod._active_rep_names(errs)
+    )
+    assert "Alex" in degraded, "outage wiped rep-name recognition"
+    assert errs, "transient error should still be flagged for the router"

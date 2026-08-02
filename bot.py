@@ -4373,6 +4373,15 @@ def _is_transient_data_error(e: BaseException) -> bool:
     )
 
 
+# Last-known-good rep-name list. Recognizing a typed sales name needs a live
+# Sheets read (Authorized Users + 3 FSL tabs); a transient 503 there used to
+# return an EMPTY list, so for that window the bot couldn't recognize ANY rep
+# — the "bot can't read sales names" outage. We now keep the last successful
+# list in memory forever and serve it when a refresh degrades, so a Sheets
+# hiccup can never strip name recognition once it has loaded once.
+_REP_NAMES_LKG: list[str] = []
+
+
 async def _active_rep_names(errors: list | None = None) -> list[str]:
     """Distinct rep names the router recognizes when typed.
 
@@ -4385,8 +4394,10 @@ async def _active_rep_names(errors: list | None = None) -> list[str]:
     Authorized names are added first so their capitalization wins on
     duplicates. FSL reads ride the 90s row cache — near-free when warm.
     """
+    global _REP_NAMES_LKG
     names: list[str] = []
     seen: set[str] = set()
+    had_failure = False  # any read failed → don't overwrite the good cache
 
     def _add(name: str) -> None:
         key = " ".join(name.lower().split())
@@ -4398,6 +4409,7 @@ async def _active_rep_names(errors: list | None = None) -> list[str]:
         users = await asyncio.to_thread(sheets.load_users)
     except Exception as e:  # noqa: BLE001
         log.debug("rep-name probe: load_users failed: %s", e)
+        had_failure = True
         if errors is not None and _is_transient_data_error(e):
             errors.append(e)
         users = []
@@ -4412,11 +4424,25 @@ async def _active_rep_names(errors: list | None = None) -> list[str]:
             rows = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
         except Exception as e:  # noqa: BLE001 — probe stays best-effort
             log.debug("rep-name probe: FSL tab %r failed: %s", tab, e)
+            had_failure = True
             if errors is not None and _is_transient_data_error(e):
                 errors.append(e)
             continue
         for r in rows:
             _add((r.get("Sales") or "").strip())
+
+    # A clean, non-empty read becomes the new last-known-good. A degraded read
+    # (any tab failed) never overwrites it, and serves whichever list is more
+    # complete — so a Sheets outage can't erase name recognition mid-day.
+    if names and not had_failure:
+        _REP_NAMES_LKG = names
+        return names
+    if _REP_NAMES_LKG and len(_REP_NAMES_LKG) >= len(names):
+        log.warning(
+            "rep-name probe degraded (had_failure=%s, fresh=%d) — serving "
+            "%d cached names", had_failure, len(names), len(_REP_NAMES_LKG),
+        )
+        return _REP_NAMES_LKG
     return names
 
 

@@ -177,3 +177,68 @@ def test_rep_names_last_known_good_survives_outage(monkeypatch):
     )
     assert "Alex" in degraded, "outage wiped rep-name recognition"
     assert errs, "transient error should still be flagged for the router"
+
+
+# ---------- rep view: small customers are never capped (Ikan Mas bug) ----------
+
+import datetime as _dt2  # noqa: E402
+
+
+def _mkrow(cust, i, days):
+    d = _dt2.date(2026, 8, 2) - _dt2.timedelta(days=days)
+    return {"Customer Name": cust, "Product Code": f"S-{i:04d}",
+            "Product Name": f"SHRIMP POWDER {i}", "R&D Price": "IDR 242,810",
+            "Sample Date Out": d.strftime("%d/%b/%Y"), "_date": d}
+
+
+def test_small_customer_not_capped_when_sharing_page_with_big_one(monkeypatch):
+    """A 7-sample customer must show all 7 and get NO button, even when it
+    shares a rep's page with a 90-sample customer."""
+    rows = [_mkrow("Ikan Mas (UD)", i, 3 + i) for i in range(7)]
+    rows += [_mkrow("Big Co", 500 + i, i) for i in range(90)]
+
+    async def fl(scope, name):
+        return rows
+
+    async def pref(u):
+        return None
+
+    async def foot():
+        return ""
+
+    monkeypatch.setattr(_botmod, "_load_lastsample_rows", fl)
+    monkeypatch.setattr(_botmod, "_user_pref_currency", pref)
+    monkeypatch.setattr(_botmod, "_last_sync_footer", foot)
+    monkeypatch.setattr(_botmod, "_sgt_now", lambda: _dt2.datetime(2026, 8, 2))
+
+    captured = {}
+
+    async def cap_send(update, text, markup=None):
+        captured["text"] = text
+        captured["btns"] = [
+            b.text for row in (markup.inline_keyboard if markup else []) for b in row
+        ]
+
+    monkeypatch.setattr(_botmod, "send", cap_send)
+
+    class Chat:
+        async def send_action(self, *a):
+            pass
+
+    class Upd:
+        effective_chat = Chat()
+        effective_user = type("U", (), {"id": 1, "username": "a"})()
+        effective_message = None
+
+    class Ctx:
+        user_data = {}
+
+    asyncio.get_event_loop().run_until_complete(
+        _botmod._show_rep_samples(Upd(), Ctx(), "Leo", page=0)
+    )
+    # Ikan Mas must have NO button (all 7 fit inline) ...
+    assert not any("Ikan" in b for b in captured["btns"]), captured["btns"]
+    # ... and its 7th sample line must be present.
+    assert "7. <b>SHRIMP POWDER 6</b>" in captured["text"]
+    # The big customer DOES get a button.
+    assert any("Big Co" in b for b in captured["btns"]), captured["btns"]

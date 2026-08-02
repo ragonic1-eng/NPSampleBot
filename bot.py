@@ -4525,14 +4525,25 @@ async def _show_rep_samples(
     rep_pref_currency = await _user_pref_currency(update)
     sync_footer = await _last_sync_footer()
 
-    def _group_block(g: dict, cap: int | None = None) -> str:
-        """Render one customer's block. cap=None shows EVERY sample; a
-        cap is used only for the pathological single-customer-too-big case."""
+    # V1.17.21 — cap each customer INDIVIDUALLY, never uniformly. The old
+    # code shrank the row limit for EVERY customer on a page down to fit the
+    # biggest one, so a 7-sample customer got gutted to 1 row when it shared a
+    # page with a 200-sample customer. Now a customer with ≤ _CUST_CAP samples
+    # ALWAYS shows all of them (no button); only genuinely big customers get a
+    # "show all" button. Customers are then packed whole into pages so the
+    # message fits Telegram's 4096-char limit.
+    _CUST_CAP = 10          # ≤ this → show every sample inline, no button
+    _BUDGET = 3800          # per-message char budget for the customer blocks
+
+    def _group_block(g: dict) -> tuple[str, bool]:
+        """Return (block_text, has_more). Shows up to _CUST_CAP samples; a
+        customer with more is teased and gets a button (has_more=True)."""
         g_rows = g["rows"]
         latest = g_rows[0].get("_date")
         latest_str = latest.strftime("%d %b %Y") if latest else "—"
         n = len(g_rows)
-        shown = g_rows if cap is None else g_rows[:cap]
+        has_more = n > _CUST_CAP
+        shown = g_rows[:_CUST_CAP]
         head = (
             f"🏢 <b>{h(g['name'])}</b> — {n} sample{'s' if n != 1 else ''} "
             f"· latest {h(latest_str)}"
@@ -4552,73 +4563,67 @@ async def _show_rep_samples(
             inner.append(
                 f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}"
             )
-        if cap is not None and n > cap:
-            # The '+N older' line is backed by the tappable button below the
-            # message (Telegram can't make body text itself clickable). Tapping
-            # it pages through ALL n in this same message.
+        if has_more:
             inner.append(
-                f"<i>👇 +{n - cap} older — tap “{h(g['name'][:22])}” below to "
-                f"page through all {n}</i>"
+                f"<i>👇 tap the “{h(g['name'][:22])}” button below to see all "
+                f"{n}</i>"
             )
-        return head + "\n<blockquote expandable>" + "\n".join(inner) + "</blockquote>"
+        return (
+            head + "\n<blockquote expandable>" + "\n".join(inner) + "</blockquote>",
+            has_more,
+        )
 
-    # V1.17.20 — show 10 customers per page (a useful overview), each with
-    # ALL its samples when they fit. Only when 10 full lists would blow
-    # Telegram's 4096-char limit do we apply the SMALLEST uniform row cap
-    # that makes the page fit — and even then no "type X to see all" prompt,
-    # just a plain "+N older" note. Fixed 10-per-page keeps the rppg: page
-    # index → Prev/Next/First callbacks unchanged.
-    _BUDGET = 3600  # header + footer + nav eat the rest of the 4096
-    _PER_PAGE = 10
-    total_pages = max(1, (len(glist) + _PER_PAGE - 1) // _PER_PAGE)
+    # Pre-render each customer once, then greedily pack WHOLE customers into
+    # pages under the char budget — variable count per page, newest-first
+    # order preserved. `page` indexes into the page list, so the rppg:
+    # Prev/Next/First callbacks are unchanged.
+    blocks = [(g, *_group_block(g)) for g in glist]  # (group, text, has_more)
+    pages: list[list[tuple]] = []
+    cur: list[tuple] = []
+    cur_len = 0
+    for g, blk, more in blocks:
+        blen = len(blk) + 2
+        if cur and cur_len + blen > _BUDGET:
+            pages.append(cur)
+            cur, cur_len = [], 0
+        cur.append((g, blk, more))
+        cur_len += blen
+    if cur:
+        pages.append(cur)
+    if not pages:
+        pages = [[]]
+
+    total_pages = len(pages)
     page = max(0, min(int(page or 0), total_pages - 1))
-    page_groups = glist[page * _PER_PAGE:(page + 1) * _PER_PAGE]
+    page_items = pages[page]
 
-    def _render(cap: int | None) -> str:
-        out = [
-            f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
-            f"<i>Page {page + 1}/{total_pages} · {len(glist)} customers · "
-            f"{len(rows)} samples total · newest first</i>",
-            "<i>Tap a grey block to expand or hide it.</i>",
-            "",
-        ]
-        for g in page_groups:
-            out.append(_group_block(g, cap))
-            out.append("")
-        if sync_footer:
-            out.append(f"<i>{sync_footer}</i>")
-        return "\n".join(out).rstrip()
-
-    # Prefer showing EVERY sample (cap=None); shrink the uniform per-customer
-    # cap only as far as needed to fit all 10 customers under the limit.
-    final_cap: int | None = None
-    text = _render(None)
-    if len(text) > 3900:
-        for cap in (12, 8, 6, 4, 3, 2, 1):
-            text = _render(cap)
-            if len(text) <= 3900:
-                final_cap = cap
-                break
+    out = [
+        f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
+        f"<i>Page {page + 1}/{total_pages} · {len(glist)} customers · "
+        f"{len(rows)} samples total · newest first</i>",
+        "<i>Tap a grey block to expand or hide it.</i>",
+        "",
+    ]
+    for _g, blk, _more in page_items:
+        out.append(blk)
+        out.append("")
+    if sync_footer:
+        out.append(f"<i>{sync_footer}</i>")
+    text = "\n".join(out).rstrip()
 
     rep_hash = _cust_hash(rep_name)
 
-    # Any customer whose full list was trimmed to fit gets a dedicated
-    # "📂 See all N" button that opens JUST that customer's samples,
-    # paginated — so a rich customer's 100+ samples are reachable even
-    # though they can't all fit in this overview message.
+    # One button per big customer ON THIS PAGE. Tapping shows that customer's
+    # full list — all at once when it fits one message, so the rep doesn't
+    # have to scroll and click again.
     capped_btns: list[list[tuple[str, str]]] = []
-    if final_cap is not None:
-        for g in page_groups:
-            n = len(g["rows"])
-            if n > final_cap:
-                cname = g["name"]
-                older = n - final_cap
-                label = f"➕ {older} older · {cname}"
-                if len(label) > 40:
-                    label = label[:39] + "…"
-                capped_btns.append(
-                    [(label, f"repc:0:{rep_hash}:{_cust_hash(cname)}")]
-                )
+    for g, _blk, more in page_items:
+        if more:
+            cname = g["name"]
+            label = f"➕ Show all {len(g['rows'])} · {cname}"
+            if len(label) > 40:
+                label = label[:39] + "…"
+            capped_btns.append([(label, f"repc:0:{rep_hash}:{_cust_hash(cname)}")])
 
     pnav: list[tuple[str, str]] = []
     if page > 0:
@@ -4626,7 +4631,7 @@ async def _show_rep_samples(
             pnav.append(("⏮ First", f"rppg:0:{rep_hash}"))
         pnav.append(("◀ Prev", f"rppg:{page - 1}:{rep_hash}"))
     if page < total_pages - 1:
-        next_custs = min(_PER_PAGE, len(glist) - (page + 1) * _PER_PAGE)
+        next_custs = len(pages[page + 1])
         pnav.append(
             (f"Next {next_custs} customer{'s' if next_custs != 1 else ''} ▶",
              f"rppg:{page + 1}:{rep_hash}")
@@ -4646,9 +4651,6 @@ async def _rep_name_from_hash(target_hash: str) -> str | None:
         if _cust_hash(name) == target_hash:
             return name
     return None
-
-
-_REP_CUST_PAGE_SIZE = 30
 
 
 async def _show_rep_customer_samples(
@@ -4696,11 +4698,44 @@ async def _show_rep_customer_samples(
 
     g_rows = sorted(g["rows"], key=lambda r: r["_date"], reverse=True)
     total = len(g_rows)
-    total_pages = max(1, (total + _REP_CUST_PAGE_SIZE - 1) // _REP_CUST_PAGE_SIZE)
-    page = max(0, min(int(page or 0), total_pages - 1))
-    start = page * _REP_CUST_PAGE_SIZE
-    end = min(start + _REP_CUST_PAGE_SIZE, total)
     pref = await _user_pref_currency(update)
+
+    # Pre-render every sample line, then pack as many as FIT into each page by
+    # character budget — so a customer that fits one message shows ALL of it in
+    # a single tap (no Next to click). Only a customer too big for one message
+    # spills onto further pages.
+    entries: list[str] = []
+    for r in g_rows:
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        name = (r.get("Product Name") or "—").strip()
+        code = (r.get("Product Code") or "—").strip().upper()
+        price_raw = (r.get("R&D Price") or "").strip()
+        price = _format_price_for_currency(price_raw, pref) if price_raw else "—"
+        entries.append(
+            f"<b>{h(name)}</b>\n"
+            f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}"
+        )
+
+    _DD_BUDGET = 3600  # header + footer + nav take the rest of the 4096
+    bounds: list[tuple[int, int]] = []  # (start, end) index per page
+    i = 0
+    while i < total:
+        acc, j = 0, i
+        while j < total:
+            add = len(entries[j]) + 6  # number prefix + newline
+            if j > i and acc + add > _DD_BUDGET:
+                break
+            acc += add
+            j += 1
+        bounds.append((i, j))
+        i = j
+    if not bounds:
+        bounds = [(0, 0)]
+
+    total_pages = len(bounds)
+    page = max(0, min(int(page or 0), total_pages - 1))
+    start, end = bounds[page]
 
     lines = [
         f"🏢 <b>{h(g['name'])}</b>",
@@ -4708,15 +4743,8 @@ async def _show_rep_customer_samples(
         "· newest first</i>",
         "",
     ]
-    for i, r in enumerate(g_rows[start:end], start + 1):
-        d = r.get("_date")
-        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
-        name = (r.get("Product Name") or "—").strip()
-        code = (r.get("Product Code") or "—").strip().upper()
-        price_raw = (r.get("R&D Price") or "").strip()
-        price = _format_price_for_currency(price_raw, pref) if price_raw else "—"
-        lines.append(f"{i}. <b>{h(name)}</b>")
-        lines.append(f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}")
+    for i, entry in enumerate(entries[start:end], start + 1):
+        lines.append(f"{i}. {entry}")
 
     rep_hash = _cust_hash(rep_name)
     nav: list[tuple[str, str]] = []
@@ -4725,8 +4753,7 @@ async def _show_rep_customer_samples(
             nav.append(("⏮ First", f"repc:0:{rep_hash}:{cust_hash}"))
         nav.append(("◀ Prev", f"repc:{page - 1}:{rep_hash}:{cust_hash}"))
     if page < total_pages - 1:
-        left = total - end
-        nav.append((f"Next {min(_REP_CUST_PAGE_SIZE, left)} ▶",
+        nav.append((f"Next {bounds[page + 1][1] - bounds[page + 1][0]} ▶",
                     f"repc:{page + 1}:{rep_hash}:{cust_hash}"))
 
     back_label = f"⬅ Back to {rep_name}"

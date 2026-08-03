@@ -1054,12 +1054,17 @@ def _match_lastsample_product(row: dict, query: str) -> bool:
 
 
 def _filter_lastsample_products(rows: list[dict], query: str) -> list[dict]:
-    """Filter `rows` to product matches and return them sorted date-desc."""
+    """Filter `rows` to product matches and return them sorted date-desc.
+
+    V1.17.22 — collapses same (code, day, customer) repeats into one entry at
+    the latest-synced R&D price, so a code search shows each shipment once
+    instead of 41 near-identical cost snapshots.
+    """
     matches = [r for r in rows if _match_lastsample_product(r, query)]
     from datetime import date as _date
     SENTINEL = _date(1900, 1, 1)
     matches.sort(key=lambda r: r.get("_date") or SENTINEL, reverse=True)
-    return matches
+    return _collapse_samples(matches)
 
 
 async def _load_lastsample_rows(scope: str, mms_name: str = "") -> list[dict]:
@@ -3839,6 +3844,9 @@ async def _show_lastsample_results(
         if price_str:
             meta_parts.append("R&amp;D " + h(price_str))
         meta_parts.append(h(date_str))
+        _dup = r.get("_dup_count", 1)
+        if _dup > 1:
+            meta_parts.append(f"×{_dup}")
         lines.append("   " + " · ".join(meta_parts))
         # Line 3: customer (always) + sales rep (only in all-scope).
         cust_line = f"   👤 {h(customer)}"
@@ -4486,11 +4494,12 @@ def _collapse_samples(rows: list[dict]) -> list[dict]:
     Input is assumed newest-first by _date; output preserves that order.
     """
     out: list[dict] = []
-    pos: dict[tuple[str, str], int] = {}
+    pos: dict[tuple[str, str, str], int] = {}
     for r in rows:
         code = (r.get("Product Code") or "").strip().upper()
         date_str = str(r.get("Sample Date Out") or "").strip().lstrip("0")
-        key = (code, date_str)
+        cust = " ".join(str(r.get("Customer Name") or "").lower().split())
+        key = (code, date_str, cust)
         ingested = str(r.get("Ingested At UTC") or "")
         if key in pos:
             rep = out[pos[key]]
@@ -4816,6 +4825,114 @@ async def _show_rep_customer_samples(
     await send(update, "\n".join(lines), kb(btn_rows))
 
 
+async def _show_rep_samples_filtered(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    rep_name: str,
+    filter_text: str,
+) -> None:
+    """Compound rep search: 'rich <4.5 usd' / 'rich KMDD'.
+
+    Shows ``rep_name``'s last-2-years samples narrowed by the remainder of
+    the query: a budget cap ('<4.5 usd', 'below 3') and/or a keyword matched
+    against product name/code AND customer name. Same-day repeats collapse
+    to the latest R&D price. Flat list, newest first, packed to one message
+    (char budget); if more match, the tail count is stated plainly.
+    """
+    try:
+        rows = await _load_lastsample_rows("self", rep_name)
+    except Exception as e:  # noqa: BLE001
+        await send(
+            update,
+            f"😕 Couldn't read Full Sample Listing: {_friendly_fetch_error(e)}",
+        )
+        return
+
+    cutoff = (_sgt_now() - timedelta(days=730)).date()
+    rows = [r for r in rows if r.get("_date") and r["_date"] >= cutoff]
+
+    kw, cap = matcher.parse_seasoning_query(filter_text)
+    kw = (kw or "").strip()
+
+    def _keep(r: dict) -> bool:
+        if kw:
+            cust = (r.get("Customer Name") or "").strip()
+            if not (_match_lastsample_product(r, kw)
+                    or _smart_text_match(kw, cust)):
+                return False
+        if cap is not None:
+            usd = matcher._parse_price((r.get("R&D Price") or "").strip())
+            if usd > cap:
+                return False
+        return True
+
+    matches = [r for r in rows if _keep(r)]
+    matches.sort(key=lambda r: r["_date"], reverse=True)
+    matches = _collapse_samples(matches)
+    pref = await _user_pref_currency(update)
+
+    crit_bits = []
+    if kw:
+        crit_bits.append(f"“{h(kw)}”")
+    if cap is not None:
+        crit_bits.append(f"under ${cap:g} USD")
+    crit = " · ".join(crit_bits) or h(filter_text)
+
+    if not matches:
+        await send(
+            update,
+            f"📭 <b>No samples from {h(rep_name)} match {crit}</b> in the "
+            "past 2 years.\n\n<i>Try fewer words, or just the rep's name for "
+            "everything they sent.</i>",
+            kb([[(f"👔 All of {rep_name[:20]}'s samples",
+                  f"rep:{_cust_hash(rep_name)}")],
+                [("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    lines = [
+        f"👔 <b>{h(rep_name)}</b> — samples matching {crit}",
+        f"<i>{len(matches)} match{'es' if len(matches) != 1 else ''} · "
+        "newest first</i>",
+        "",
+    ]
+    _BUDGET_CHARS = 3600
+    used = sum(len(x) for x in lines)
+    shown = 0
+    for i, r in enumerate(matches, 1):
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        name = (r.get("Product Name") or "—").strip()
+        code = (r.get("Product Code") or "—").strip().upper()
+        price_raw = (r.get("R&D Price") or "").strip()
+        price = _format_price_for_currency(price_raw, pref) if price_raw else "—"
+        dup = r.get("_dup_count", 1)
+        dup_badge = f" ·×{dup}" if dup > 1 else ""
+        cust = (r.get("Customer Name") or "—").strip()
+        entry = (
+            f"{i}. <b>{h(name)}</b>\n"
+            f"     <code>{h(code)}</code> · {h(date_str)} · "
+            f"💲 R&amp;D {h(price)}{dup_badge}\n"
+            f"     👤 {h(cust)}"
+        )
+        if used + len(entry) > _BUDGET_CHARS:
+            lines.append(
+                f"<i>… and {len(matches) - shown} more — add another word "
+                "(e.g. the customer) to narrow further.</i>"
+            )
+            break
+        lines.append(entry)
+        used += len(entry)
+        shown += 1
+
+    await send(
+        update, "\n".join(lines),
+        kb([[(f"👔 All of {rep_name[:20]}'s samples",
+              f"rep:{_cust_hash(rep_name)}"),
+             ("🏠 Main menu", "menu:home")]]),
+    )
+
+
 async def _smart_route_text(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -4919,6 +5036,24 @@ async def _smart_route_text(
     if rep_strong and len(rep_hits) == 1 and not cust_strong:
         await _show_rep_samples(update, ctx, rep_hits[0])
         return
+
+    # 2b) V1.17.22 — compound rep query: 'rich <4.5 usd' (rep + budget) or
+    # 'rich KMDD' (rep + customer/product keyword). The LEADING word(s) name
+    # a rep; the remainder filters their samples. Only fires on a STRONG
+    # unique rep match of the head, so flavour phrases like 'singapore laksa'
+    # (no rep called Singapore) fall through to product search untouched.
+    if not rep_strong:
+        toks = probe.split()
+        for k in (2, 1):
+            if len(toks) > k:
+                head_hits, head_strong = _match_rep_names(
+                    " ".join(toks[:k]), rep_names
+                )
+                if head_strong and len(head_hits) == 1:
+                    await _show_rep_samples_filtered(
+                        update, ctx, head_hits[0], " ".join(toks[k:])
+                    )
+                    return
 
     # 3) Unambiguous customer → straight to their sample history.
     if cust_strong and not rep_hits and not prod_hits:
@@ -5736,6 +5871,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         #       the same search.
         active = (ctx.user_data.get("lastsample_active_query") or "").strip()
         text_stripped = text.strip()
+        # (c) V1.17.22 — a rep NAME breaks the refinement chain too. After a
+        # code search, typing 'rich' means "show me Rich's samples", not
+        # "refine the old query with the word rich" (which found nothing and
+        # dead-ended). Same principle as (a) for codes.
+        _rn_hits, _rn_strong = _match_rep_names(
+            _route_strip_fillers(text_stripped), await _active_rep_names()
+        )
+        if _rn_strong:
+            ctx.user_data.pop("awaiting_lastsample_query", None)
+            await _smart_route_text(update, ctx, text_stripped)
+            return
         if _PP_CODE_RE.search(text_stripped.upper()):
             active = ""  # (a)
         if text_stripped == active:

@@ -296,3 +296,28 @@ def test_collapse_normalises_date_format():
     ]
     out = _botmod._collapse_samples(rows)
     assert len(out) == 1 and out[0]["_dup_count"] == 2
+
+
+# ---------- code search collapses same-day snapshots (J-YC381-03 UX) ---------
+
+def test_lastsample_product_filter_collapses_same_day_rows():
+    import datetime as d
+    day = d.date(2026, 3, 9)
+    rows = [
+        {"Product Code": "J-YC381-03", "Product Name": "TOASTED ONION POWDER",
+         "Customer Name": "Intika (CV)", "Sample Date Out": "9/Mar/2026",
+         "R&D Price": f"IDR {65000 + i}", "Ingested At UTC": f"2026-05-{20+i:02d}",
+         "_date": day}
+        for i in range(5)
+    ] + [
+        {"Product Code": "J-YC381-03", "Product Name": "TOASTED ONION POWDER",
+         "Customer Name": "OTHER CUSTOMER", "Sample Date Out": "9/Mar/2026",
+         "R&D Price": "IDR 60,000", "Ingested At UTC": "2026-05-20",
+         "_date": day},
+    ]
+    out = _botmod._filter_lastsample_products(rows, "J-YC381-03")
+    # 5 same-customer snapshots -> 1; different customer stays separate.
+    assert len(out) == 2
+    intika = [r for r in out if r["Customer Name"] == "Intika (CV)"][0]
+    assert intika["_dup_count"] == 5
+    assert intika["R&D Price"] == "IDR 65004"   # latest-synced snapshot wins

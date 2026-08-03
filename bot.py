@@ -3203,7 +3203,7 @@ async def _run_seasoning_search(
         # markup if a sheet cell contains < > & chars.
         meta_parts: list[str] = [f"<code>{h(code)}</code>"]
         if price_str:
-            meta_parts.append(h(price_str))
+            meta_parts.append("R&amp;D " + h(price_str))
         meta_parts.append(h(date_str))
         if category:
             meta_parts.append(h(category))
@@ -3837,7 +3837,7 @@ async def _show_lastsample_results(
         # Line 2: code · price · date — meta line, bullet-separated.
         meta_parts: list[str] = [f"<code>{h(code)}</code>"]
         if price_str:
-            meta_parts.append(h(price_str))
+            meta_parts.append("R&amp;D " + h(price_str))
         meta_parts.append(h(date_str))
         lines.append("   " + " · ".join(meta_parts))
         # Line 3: customer (always) + sales rep (only in all-scope).
@@ -4472,6 +4472,42 @@ def _match_rep_names(text: str, rep_names: list[str]) -> tuple[list[str], bool]:
     return weak, False
 
 
+def _collapse_samples(rows: list[dict]) -> list[dict]:
+    """Collapse repeated (product code + send-out date) rows into one.
+
+    The same product to the same customer on the same day is recorded many
+    times, each with a slightly different R&D COST snapshot (MMS recomputes it
+    every read). Reps don't want to see that cost fluctuation — they want the
+    product once, at the LATEST price MMS gave us. So for each (code, date) we
+    keep a single entry carrying the value from the most-recently-synced row
+    (max 'Ingested At UTC', which sorts lexicographically as it's ISO-ish),
+    plus '_dup_count' so the UI can show a '×N' badge.
+
+    Input is assumed newest-first by _date; output preserves that order.
+    """
+    out: list[dict] = []
+    pos: dict[tuple[str, str], int] = {}
+    for r in rows:
+        code = (r.get("Product Code") or "").strip().upper()
+        date_str = str(r.get("Sample Date Out") or "").strip().lstrip("0")
+        key = (code, date_str)
+        ingested = str(r.get("Ingested At UTC") or "")
+        if key in pos:
+            rep = out[pos[key]]
+            rep["_dup_count"] += 1
+            # Keep the most-recently-synced price (closest to current MMS).
+            if ingested > rep.get("_ingested", ""):
+                rep["_ingested"] = ingested
+                rep["R&D Price"] = r.get("R&D Price")
+        else:
+            rr = dict(r)
+            rr["_dup_count"] = 1
+            rr["_ingested"] = ingested
+            pos[key] = len(out)
+            out.append(rr)
+    return out
+
+
 async def _show_rep_samples(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -4520,6 +4556,10 @@ async def _show_rep_samples(
         key = " ".join(cust.lower().split())
         g = groups.setdefault(key, {"name": cust, "rows": []})
         g["rows"].append(r)
+    # Collapse same product + same day into one entry at the latest price, so
+    # the rep sees each product once, not the MMS cost fluctuation.
+    for g in groups.values():
+        g["rows"] = _collapse_samples(g["rows"])
     glist = list(groups.values())
 
     rep_pref_currency = await _user_pref_currency(update)
@@ -4559,9 +4599,12 @@ async def _show_rep_samples(
                 _format_price_for_currency(price_raw, rep_pref_currency)
                 if price_raw else "—"
             )
+            dup = r.get("_dup_count", 1)
+            dup_badge = f" ·×{dup}" if dup > 1 else ""
             inner.append(f"{j}. <b>{h(name)}</b>")
             inner.append(
-                f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}"
+                f"     <code>{h(code)}</code> · {h(date_str)} · "
+                f"💲 R&amp;D {h(price)}{dup_badge}"
             )
         if has_more:
             inner.append(
@@ -4697,6 +4740,9 @@ async def _show_rep_customer_samples(
         return
 
     g_rows = sorted(g["rows"], key=lambda r: r["_date"], reverse=True)
+    # Collapse same product + same day to one entry at the latest price — the
+    # rep wants each product once, not the MMS cost fluctuation.
+    g_rows = _collapse_samples(g_rows)
     total = len(g_rows)
     pref = await _user_pref_currency(update)
 
@@ -4712,9 +4758,12 @@ async def _show_rep_customer_samples(
         code = (r.get("Product Code") or "—").strip().upper()
         price_raw = (r.get("R&D Price") or "").strip()
         price = _format_price_for_currency(price_raw, pref) if price_raw else "—"
+        dup = r.get("_dup_count", 1)
+        dup_badge = f" ·×{dup}" if dup > 1 else ""
         entries.append(
             f"<b>{h(name)}</b>\n"
-            f"     <code>{h(code)}</code> · {h(date_str)} · 💲 {h(price)}"
+            f"     <code>{h(code)}</code> · {h(date_str)} · "
+            f"💲 R&amp;D {h(price)}{dup_badge}"
         )
 
     _DD_BUDGET = 3600  # header + footer + nav take the rest of the 4096

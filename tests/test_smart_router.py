@@ -242,3 +242,57 @@ def test_small_customer_not_capped_when_sharing_page_with_big_one(monkeypatch):
     assert "7. <b>SHRIMP POWDER 6</b>" in captured["text"]
     # The big customer DOES get a button.
     assert any("Big Co" in b for b in captured["btns"]), captured["btns"]
+
+
+# ---------- collapse same-day price fluctuation to latest (J-YC381-03) --------
+
+def test_collapse_samples_keeps_latest_price_per_code_date():
+    import datetime as d
+    day = d.date(2026, 3, 9)
+    rows = [
+        {"Product Code": "J-YC381-03", "Product Name": "TOASTED ONION",
+         "Sample Date Out": "9/Mar/2026", "R&D Price": "IDR 64,558",
+         "Ingested At UTC": "2026-05-24 09:41 UTC", "_date": day},
+        {"Product Code": "J-YC381-03", "Product Name": "TOASTED ONION",
+         "Sample Date Out": "9/Mar/2026", "R&D Price": "IDR 66,250",
+         "Ingested At UTC": "2026-05-27 10:01 UTC", "_date": day},   # latest sync
+        {"Product Code": "J-YC381-03", "Product Name": "TOASTED ONION",
+         "Sample Date Out": "9/Mar/2026", "R&D Price": "IDR 65,000",
+         "Ingested At UTC": "2026-05-25 09:41 UTC", "_date": day},
+    ]
+    out = _botmod._collapse_samples(rows)
+    assert len(out) == 1
+    assert out[0]["R&D Price"] == "IDR 66,250"   # newest ingested wins
+    assert out[0]["_dup_count"] == 3
+
+
+def test_collapse_keeps_different_dates_and_codes_separate():
+    import datetime as d
+    rows = [
+        {"Product Code": "J-1", "Sample Date Out": "9/Mar/2026",
+         "R&D Price": "IDR 1", "Ingested At UTC": "2026-05-01 00:00 UTC",
+         "_date": d.date(2026, 3, 9)},
+        {"Product Code": "J-1", "Sample Date Out": "10/Mar/2026",
+         "R&D Price": "IDR 2", "Ingested At UTC": "2026-05-01 00:00 UTC",
+         "_date": d.date(2026, 3, 10)},           # same code, diff day -> separate
+        {"Product Code": "J-2", "Sample Date Out": "9/Mar/2026",
+         "R&D Price": "IDR 3", "Ingested At UTC": "2026-05-01 00:00 UTC",
+         "_date": d.date(2026, 3, 9)},            # diff code -> separate
+    ]
+    out = _botmod._collapse_samples(rows)
+    assert len(out) == 3
+    assert all(r["_dup_count"] == 1 for r in out)
+
+
+def test_collapse_normalises_date_format():
+    """'9/Mar' and '09/Mar' are the same day -> collapse together."""
+    import datetime as d
+    day = d.date(2026, 3, 9)
+    rows = [
+        {"Product Code": "J-1", "Sample Date Out": "9/Mar/2026", "R&D Price": "IDR 1",
+         "Ingested At UTC": "2026-05-01 00:00 UTC", "_date": day},
+        {"Product Code": "J-1", "Sample Date Out": "09/Mar/2026", "R&D Price": "IDR 2",
+         "Ingested At UTC": "2026-05-02 00:00 UTC", "_date": day},
+    ]
+    out = _botmod._collapse_samples(rows)
+    assert len(out) == 1 and out[0]["_dup_count"] == 2

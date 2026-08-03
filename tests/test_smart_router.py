@@ -321,3 +321,64 @@ def test_lastsample_product_filter_collapses_same_day_rows():
     intika = [r for r in out if r["Customer Name"] == "Intika (CV)"][0]
     assert intika["_dup_count"] == 5
     assert intika["R&D Price"] == "IDR 65004"   # latest-synced snapshot wins
+
+
+# ---------- 'eric noodle' = noodle PRODUCTS, not noodle-named customers ------
+
+def test_rep_keyword_prefers_product_name_over_customer(monkeypatch):
+    import datetime as d
+
+    def mk(cust, code, name):
+        return {"Customer Name": cust, "Product Code": code,
+                "Product Name": name, "R&D Price": "USD 4.00",
+                "Sample Date Out": "1/Jul/2026", "Sales": "Eric",
+                "Country": "India", "_date": d.date(2026, 7, 1),
+                "Ingested At UTC": "x"}
+
+    rows = [
+        mk("Excel Foods", "S-1", "CHICKEN NOODLE SOUP SEASONING"),
+        mk("Kwality Noodles Industries", "S-2", "CHEESE SEASONING"),
+    ]
+
+    async def fl(scope, name=""):
+        return rows
+
+    async def pref(u):
+        return None
+
+    monkeypatch.setattr(_botmod, "_load_lastsample_rows", fl)
+    monkeypatch.setattr(_botmod, "_user_pref_currency", pref)
+    monkeypatch.setattr(_botmod, "_sgt_now", lambda: __import__("datetime").datetime(2026, 8, 2))
+    captured = {}
+
+    async def cs(update, text, markup=None):
+        captured["text"] = text
+
+    monkeypatch.setattr(_botmod, "send", cs)
+
+    class Chat:
+        async def send_action(self, *a):
+            pass
+
+    class Upd:
+        effective_chat = Chat()
+        effective_user = type("U", (), {"id": 1, "username": "a"})()
+        effective_message = None
+        callback_query = None
+
+    class Ctx:
+        user_data = {}
+
+    # 'noodle' matches a product name -> customer-name matches must be excluded
+    asyncio.get_event_loop().run_until_complete(
+        _botmod._show_rep_samples_filtered(Upd(), Ctx(), "Eric", "noodle")
+    )
+    assert "CHICKEN NOODLE SOUP" in captured["text"]
+    assert "CHEESE SEASONING" not in captured["text"]
+
+    # 'kwality' matches no product -> falls back to customer, labelled so
+    asyncio.get_event_loop().run_until_complete(
+        _botmod._show_rep_samples_filtered(Upd(), Ctx(), "Eric", "kwality")
+    )
+    assert "CHEESE SEASONING" in captured["text"]
+    assert "customer" in captured["text"]

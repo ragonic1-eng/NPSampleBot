@@ -4861,14 +4861,9 @@ async def _show_rep_samples_filtered(
     kw = (kw or "").strip()
     country_lc = (country or "").strip().lower()
 
-    def _keep(r: dict) -> bool:
+    def _base_keep(r: dict) -> bool:
         if country_lc:
             if (r.get("Country") or "").strip().lower() != country_lc:
-                return False
-        if kw:
-            cust = (r.get("Customer Name") or "").strip()
-            if not (_match_lastsample_product(r, kw)
-                    or _smart_text_match(kw, cust)):
                 return False
         if cap is not None:
             usd = matcher._parse_price((r.get("R&D Price") or "").strip())
@@ -4876,14 +4871,34 @@ async def _show_rep_samples_filtered(
                 return False
         return True
 
-    matches = [r for r in rows if _keep(r)]
+    # V1.17.24 — keyword matches PRODUCT NAME first, customer only as a
+    # fallback. 'eric noodle' means noodle SEASONINGS; matching customers
+    # too flooded the list with cheese/sour-cream rows just because the
+    # buyer was 'Kwality Noodles Industries'. When nothing product-matches
+    # (e.g. 'rich KMDD' — KMDD is a customer), fall back to customer match
+    # so those queries keep working.
+    prod_matches: list[dict] = []
+    cust_matches: list[dict] = []
+    for r in rows:
+        if not _base_keep(r):
+            continue
+        if not kw:
+            prod_matches.append(r)
+        elif _match_lastsample_product(r, kw):
+            prod_matches.append(r)
+        elif _smart_text_match(kw, (r.get("Customer Name") or "").strip()):
+            cust_matches.append(r)
+    via_customer = not prod_matches and bool(cust_matches)
+    matches = prod_matches or cust_matches
     matches.sort(key=lambda r: r["_date"], reverse=True)
     matches = _collapse_samples(matches)
     pref = await _user_pref_currency(update)
 
     crit_bits = []
     if kw:
-        crit_bits.append(f"“{h(kw)}”")
+        crit_bits.append(
+            f"customer “{h(kw)}”" if via_customer else f"“{h(kw)}”"
+        )
     if country:
         _flag = _COUNTRY_FLAG.get(country.upper(), "")
         crit_bits.append(f"sent to {_flag + ' ' if _flag else ''}{h(country)}")

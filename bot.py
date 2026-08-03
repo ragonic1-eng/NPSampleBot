@@ -4830,17 +4830,23 @@ async def _show_rep_samples_filtered(
     ctx: ContextTypes.DEFAULT_TYPE,
     rep_name: str,
     filter_text: str,
+    country: str | None = None,
 ) -> None:
-    """Compound rep search: 'rich <4.5 usd' / 'rich KMDD'.
+    """Compound search: 'rich <4.5 usd' / 'rich KMDD' / 'cheese to vietnam'.
 
-    Shows ``rep_name``'s last-2-years samples narrowed by the remainder of
-    the query: a budget cap ('<4.5 usd', 'below 3') and/or a keyword matched
-    against product name/code AND customer name. Same-day repeats collapse
-    to the latest R&D price. Flat list, newest first, packed to one message
-    (char budget); if more match, the tail count is stated plainly.
+    ``rep_name`` scopes to one rep's samples; empty string means ALL reps
+    (used for country-destination queries with no rep, e.g. 'to vietnam').
+    Narrows by any mix of: budget cap ('<4.5 usd'), destination ``country``
+    (FSL Country column), and a keyword matched against product name/code
+    AND customer name. Same-day repeats collapse to the latest R&D price.
+    Flat list, newest first, packed to one message (char budget); if more
+    match, the tail count is stated plainly.
     """
     try:
-        rows = await _load_lastsample_rows("self", rep_name)
+        if rep_name:
+            rows = await _load_lastsample_rows("self", rep_name)
+        else:
+            rows = await _load_lastsample_rows("all")
     except Exception as e:  # noqa: BLE001
         await send(
             update,
@@ -4853,8 +4859,12 @@ async def _show_rep_samples_filtered(
 
     kw, cap = matcher.parse_seasoning_query(filter_text)
     kw = (kw or "").strip()
+    country_lc = (country or "").strip().lower()
 
     def _keep(r: dict) -> bool:
+        if country_lc:
+            if (r.get("Country") or "").strip().lower() != country_lc:
+                return False
         if kw:
             cust = (r.get("Customer Name") or "").strip()
             if not (_match_lastsample_product(r, kw)
@@ -4874,24 +4884,30 @@ async def _show_rep_samples_filtered(
     crit_bits = []
     if kw:
         crit_bits.append(f"“{h(kw)}”")
+    if country:
+        _flag = _COUNTRY_FLAG.get(country.upper(), "")
+        crit_bits.append(f"sent to {_flag + ' ' if _flag else ''}{h(country)}")
     if cap is not None:
         crit_bits.append(f"under ${cap:g} USD")
     crit = " · ".join(crit_bits) or h(filter_text)
 
+    whose = f"from {h(rep_name)} " if rep_name else ""
+    rep_btn_rows = (
+        [[(f"👔 All of {rep_name[:20]}'s samples", f"rep:{_cust_hash(rep_name)}")]]
+        if rep_name else []
+    )
     if not matches:
         await send(
             update,
-            f"📭 <b>No samples from {h(rep_name)} match {crit}</b> in the "
-            "past 2 years.\n\n<i>Try fewer words, or just the rep's name for "
-            "everything they sent.</i>",
-            kb([[(f"👔 All of {rep_name[:20]}'s samples",
-                  f"rep:{_cust_hash(rep_name)}")],
-                [("🏠 Main menu", "menu:home")]]),
+            f"📭 <b>No samples {whose}match {crit}</b> in the past 2 years."
+            "\n\n<i>Try fewer words, or a different country/keyword.</i>",
+            kb(rep_btn_rows + [[("🏠 Main menu", "menu:home")]]),
         )
         return
 
+    head_who = f"👔 <b>{h(rep_name)}</b>" if rep_name else "🌐 <b>All reps</b>"
     lines = [
-        f"👔 <b>{h(rep_name)}</b> — samples matching {crit}",
+        f"{head_who} — samples matching {crit}",
         f"<i>{len(matches)} match{'es' if len(matches) != 1 else ''} · "
         "newest first</i>",
         "",
@@ -4909,11 +4925,13 @@ async def _show_rep_samples_filtered(
         dup = r.get("_dup_count", 1)
         dup_badge = f" ·×{dup}" if dup > 1 else ""
         cust = (r.get("Customer Name") or "—").strip()
+        sales = (r.get("Sales") or "").strip()
+        by = f"  <i>· sent by {h(sales)}</i>" if (not rep_name and sales) else ""
         entry = (
             f"{i}. <b>{h(name)}</b>\n"
             f"     <code>{h(code)}</code> · {h(date_str)} · "
             f"💲 R&amp;D {h(price)}{dup_badge}\n"
-            f"     👤 {h(cust)}"
+            f"     👤 {h(cust)}{by}"
         )
         if used + len(entry) > _BUDGET_CHARS:
             lines.append(
@@ -4925,11 +4943,13 @@ async def _show_rep_samples_filtered(
         used += len(entry)
         shown += 1
 
+    tail_btns = (
+        [(f"👔 All of {rep_name[:20]}'s samples", f"rep:{_cust_hash(rep_name)}")]
+        if rep_name else []
+    )
     await send(
         update, "\n".join(lines),
-        kb([[(f"👔 All of {rep_name[:20]}'s samples",
-              f"rep:{_cust_hash(rep_name)}"),
-             ("🏠 Main menu", "menu:home")]]),
+        kb([tail_btns + [("🏠 Main menu", "menu:home")]]),
     )
 
 
@@ -5029,6 +5049,28 @@ async def _smart_route_text(
             "This is a temporary hiccup on Google's side, not your search. "
             "Please try again in a few seconds.",
             kb([[("🔄 Try again", "menu:home")]]),
+        )
+        return
+
+    # 2a) V1.17.23 — destination-country filter: 'cheese to vietnam',
+    # 'rich to china', 'to indonesia <4 usd'. Requires the preposition, so a
+    # bare country word stays a flavour ('singapore laksa'). If the words
+    # before the country name a rep, scope to them; else search all reps.
+    # Parse on the RAW text — _route_strip_fillers deletes 'to'/'for', which
+    # are exactly the prepositions the country trigger needs.
+    raw_nc, dest_country = matcher.parse_country_filter(text)
+    if dest_country:
+        probe_nc = _route_strip_fillers(raw_nc) if raw_nc.strip() else ""
+        nc_toks = probe_nc.split()
+        c_rep, c_rest = "", probe_nc
+        for k in (2, 1):
+            if len(nc_toks) >= k:
+                hh, hs = _match_rep_names(" ".join(nc_toks[:k]), rep_names)
+                if hs and len(hh) == 1:
+                    c_rep, c_rest = hh[0], " ".join(nc_toks[k:])
+                    break
+        await _show_rep_samples_filtered(
+            update, ctx, c_rep, c_rest, country=dest_country
         )
         return
 

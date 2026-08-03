@@ -164,6 +164,46 @@ def parse_code_prefix(query: str) -> tuple[str, str | None]:
     return cleaned, prefix
 
 
+# Destination countries seen in the FSL 'Country' column. The trigger REQUIRES
+# a preposition ("to vietnam", "sent to china") — a bare country word stays a
+# flavour ("singapore laksa", "thai tom yum"), same principle as the factory
+# prefix requiring the word "code".
+_DEST_COUNTRIES = {
+    "vietnam": "Vietnam", "singapore": "Singapore", "indonesia": "Indonesia",
+    "thailand": "Thailand", "malaysia": "Malaysia", "philippines": "Philippines",
+    "india": "India", "japan": "Japan", "china": "China", "korea": "Korea",
+    "south korea": "Korea", "bangladesh": "Bangladesh", "myanmar": "Myanmar",
+    "cambodia": "Cambodia", "taiwan": "Taiwan", "hong kong": "Hong Kong",
+    "usa": "USA", "america": "USA", "australia": "Australia", "uae": "UAE",
+    "dubai": "UAE", "laos": "Laos", "sri lanka": "Sri Lanka",
+    "pakistan": "Pakistan", "nepal": "Nepal", "brunei": "Brunei",
+    "new zealand": "New Zealand",
+}
+_DEST_RE = re.compile(
+    r"\b(?:sent\s+to|to|for)\s+("
+    + "|".join(sorted(_DEST_COUNTRIES, key=len, reverse=True))
+    + r")\b",
+    re.IGNORECASE,
+)
+
+
+def parse_country_filter(query: str) -> tuple[str, str | None]:
+    """Pull a destination-country filter out of a query.
+
+    "cheese to vietnam"   → ("cheese", "Vietnam")
+    "rich sent to china"  → ("rich", "China")
+    "to indonesia"        → ("", "Indonesia")
+    "singapore laksa"     → ("singapore laksa", None)   # flavour, not a filter
+    """
+    q = (query or "").strip()
+    m = _DEST_RE.search(q)
+    if not m:
+        return q, None
+    country = _DEST_COUNTRIES.get(m.group(1).lower())
+    cleaned = re.sub(r"\s+", " ", _DEST_RE.sub(" ", q)).strip()
+    return cleaned, country
+
+
 def code_has_prefix(code: Any, prefix: str) -> bool:
     """True when `code` belongs to the `prefix` factory (S-/J-/B-/T-)."""
     c = str(code or "").strip().upper()

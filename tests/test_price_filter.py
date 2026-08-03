@@ -231,3 +231,25 @@ def test_recency_respects_budget_and_prefix_filters():
     assert res
     assert all(r["code"].startswith("B-") for r in res)
     assert all(r["_price_num"] <= 4.0 for r in res)
+
+
+# ---------- destination-country filter ("to vietnam") ----------
+
+def test_country_filter_requires_preposition():
+    # bare country words are flavours — pinned; the filter needs 'to'/'for'
+    assert matcher.parse_country_filter("singapore laksa") == ("singapore laksa", None)
+    assert matcher.parse_country_filter("thai tom yum") == ("thai tom yum", None)
+
+
+def test_country_filter_parses_destinations():
+    assert matcher.parse_country_filter("cheese to vietnam") == ("cheese", "Vietnam")
+    assert matcher.parse_country_filter("rich sent to china") == ("rich", "China")
+    assert matcher.parse_country_filter("to indonesia") == ("", "Indonesia")
+    assert matcher.parse_country_filter("sesame for japan") == ("sesame", "Japan")
+
+
+def test_country_filter_composes_with_budget():
+    cleaned, country = matcher.parse_country_filter("cheese to vietnam <4.5usd")
+    assert country == "Vietnam"
+    kw, cap = matcher.parse_seasoning_query(cleaned)
+    assert kw == "cheese" and cap == 4.5

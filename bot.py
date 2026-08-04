@@ -1311,6 +1311,17 @@ async def _close_catalog_codes(code: str, limit: int = 3) -> list[str]:
         return []
 
 
+# One consistent freshness warning for every sample-listing view. The R&D
+# price on a listed row is the value RECORDED when that sample was raised —
+# a historical snapshot, deliberately preserved (it's what was quoted then).
+# MMS recomputes R&D cost continuously, so today's figure can differ. /pp is
+# the live path; every listing points reps there so a snapshot is never
+# mistaken for the current price.
+_PRICE_ASOF_HINT = (
+    "   <i>💲 prices are as of the sample date — type the code for "
+    "today's MMS price</i>"
+)
+
 _COUNTRY_FLAG = {
     "SINGAPORE": "🇸🇬", "INDONESIA": "🇮🇩", "THAILAND": "🇹🇭",
     "MALAYSIA": "🇲🇾", "VIETNAM": "🇻🇳", "PHILIPPINES": "🇵🇭",
@@ -3819,6 +3830,7 @@ async def _show_lastsample_results(
         header_bits.append(f"   <i>matching “{h(query)}”</i>")
     if with_prev:
         header_bits.append(f"   <i>(refined query)</i>")
+    header_bits.append(_PRICE_ASOF_HINT)
     lines: list[str] = header_bits + [""]
 
     # V1.13.11 — per-rep currency override for /lastsample rows.
@@ -4013,6 +4025,7 @@ def _render_my_samples_page(
     lines: list[str] = [
         "👤 <b>My samples — last 12 months</b>",
         f"<i>Showing {start + 1}–{end} of {total} · newest first</i>",
+        _PRICE_ASOF_HINT,
         "",
     ]
 
@@ -4269,6 +4282,7 @@ async def _show_customer_samples(
     lines = [
         f"📋 <b>Samples to {h(customer_name)}:</b>"
         f"{title_suffix}{page_marker}",
+        _PRICE_ASOF_HINT,
         "",
     ]
     # Continuous numbering: row 11 on page 2 displays as '11.'
@@ -4654,6 +4668,7 @@ async def _show_rep_samples(
         f"<i>Page {page + 1}/{total_pages} · {len(glist)} customers · "
         f"{len(rows)} samples total · newest first</i>",
         "<i>Tap a grey block to expand or hide it.</i>",
+        _PRICE_ASOF_HINT,
         "",
     ]
     for _g, blk, _more in page_items:
@@ -4799,6 +4814,7 @@ async def _show_rep_customer_samples(
         f"🏢 <b>{h(g['name'])}</b>",
         f"<i>Samples from {h(rep_name)} · {start + 1}–{end} of {total} "
         "· newest first</i>",
+        _PRICE_ASOF_HINT,
         "",
     ]
     for i, entry in enumerate(entries[start:end], start + 1):
@@ -4925,6 +4941,7 @@ async def _show_rep_samples_filtered(
         f"{head_who} — samples matching {crit}",
         f"<i>{len(matches)} match{'es' if len(matches) != 1 else ''} · "
         "newest first</i>",
+        _PRICE_ASOF_HINT,
         "",
     ]
     _BUDGET_CHARS = 3600

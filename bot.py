@@ -1333,13 +1333,16 @@ _COUNTRY_FLAG = {
 
 
 def _origin_line(country: str, customer: str, sent_date=None) -> str:
-    """One-line '📍 last requested from <country> · for <customer> · 📅 <date>'.
+    """Multi-line 'last requested' block for /pp — one fact per row:
+
+        📍 Last requested from: 🇨🇳 China
+        🏢 Customer: FUJIAN ZHAOLU TRADING CO., LTD
+        📅 Sent: 14 Jul 2026
 
     All fields come from the most-recent FSL row for the product, so this
-    answers 'who last asked for this, from which country, and when' — what a
-    rep needs to gauge whether a sample is live and who owns it.
-    ``sent_date`` accepts a datetime.date or the raw sheet string; renders
-    whatever is present; empty string if nothing is known.
+    answers 'who last asked for this, from which country, and when'.
+    ``sent_date`` accepts a datetime.date or the raw sheet string; rows
+    with unknown values are omitted; empty string if nothing is known.
     """
     country = (country or "").strip()
     customer = (customer or "").strip()
@@ -1349,19 +1352,17 @@ def _origin_line(country: str, customer: str, sent_date=None) -> str:
             date_str = sent_date.strftime("%d %b %Y")
         except AttributeError:
             date_str = str(sent_date).strip()
-    if not country and not customer and not date_str:
-        return ""
-    parts = []
+    lines = []
     if country:
         flag = _COUNTRY_FLAG.get(country.upper(), "")
-        parts.append(f"{flag + ' ' if flag else ''}{h(country)}")
+        lines.append(
+            f"📍 <b>Last requested from:</b> {flag + ' ' if flag else ''}{h(country)}"
+        )
     if customer:
-        parts.append(f"for {h(customer)}")
+        lines.append(f"🏢 <b>Customer:</b> {h(customer)}")
     if date_str:
-        parts.append(f"📅 {h(date_str)}")
-    return "📍 last requested " + (
-        "from " + " · ".join(parts) if country else " · ".join(parts)
-    )
+        lines.append(f"📅 <b>Sent:</b> {h(date_str)}")
+    return "\n".join(lines)
 
 
 async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
@@ -5238,11 +5239,18 @@ async def _smart_route_text(
                     f"{last_str}"
                 )
                 # V1.17.x — who last requested it + from where (most-recent
-                # sample row). Indented under the product so the list stays
-                # scannable.
-                _origin = _origin_line(s.get("country") or "", s.get("customer") or "")
-                if _origin:
-                    lines.append(f"      {_origin}")
+                # sample row). Compact single line here — the list view is
+                # dense; the roomy one-fact-per-row block belongs to /pp.
+                _oc = (s.get("country") or "").strip()
+                _ocu = (s.get("customer") or "").strip()
+                if _oc or _ocu:
+                    _oflag = _COUNTRY_FLAG.get(_oc.upper(), "")
+                    _obits = []
+                    if _oc:
+                        _obits.append(f"{_oflag + ' ' if _oflag else ''}{h(_oc)}")
+                    if _ocu:
+                        _obits.append(h(_ocu))
+                    lines.append("      📍 " + " · ".join(_obits))
                 if p_code:
                     label = f"{i}. {p_code} · {s['name']}"
                     if len(label) > 40:

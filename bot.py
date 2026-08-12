@@ -29,6 +29,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType, ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1825,8 +1826,18 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Sent as a PHOTO — [-1] is the largest of Telegram's re-encoded
             # sizes, still capped near 1280px on the long edge.
             src_id, was_compressed = msg.photo[-1].file_id, True
-        tg_file = await ctx.bot.get_file(src_id)
-        buf = await tg_file.download_as_bytearray()
+        # One retry: Telegram's file endpoints intermittently stall past the
+        # read timeout; the second attempt almost always succeeds.
+        for attempt in (1, 2):
+            try:
+                tg_file = await ctx.bot.get_file(src_id, read_timeout=30, connect_timeout=10)
+                buf = await tg_file.download_as_bytearray(read_timeout=60, connect_timeout=10)
+                break
+            except TelegramError:
+                if attempt == 2:
+                    raise
+                log.warning("photo fetch attempt 1 timed out — retrying")
+                await asyncio.sleep(1.5)
     except Exception as e:  # noqa: BLE001
         log.exception("Photo download failed")
         await _cleanup()
@@ -9274,7 +9285,18 @@ def main():
         # Non-fatal — same pattern as the Jakarta bootstrap.
         log.exception("ensure_bangkok_tab failed: %s", e)
 
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    # Defaults are read_timeout=5s + pool of 1 — too tight for photo/file
+    # downloads (telegram.error.TimedOut on get_file, seen 2026-08-12).
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .connect_timeout(10.0)
+        .pool_timeout(10.0)
+        .connection_pool_size(16)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))

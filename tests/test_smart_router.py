@@ -382,3 +382,11 @@ def test_rep_keyword_prefers_product_name_over_customer(monkeypatch):
     )
     assert "CHEESE SEASONING" in captured["text"]
     assert "customer" in captured["text"]
+
+
+def test_origin_line_includes_sent_date():
+    import datetime as d
+    out = _origin_line("China", "FUJIAN ZHAOLU", d.date(2026, 7, 14))
+    assert "14 Jul 2026" in out and "📅" in out
+    # date-less rows keep the old shape, no dangling separator
+    assert "📅" not in _origin_line("China", "FUJIAN ZHAOLU")

@@ -1332,17 +1332,24 @@ _COUNTRY_FLAG = {
 }
 
 
-def _origin_line(country: str, customer: str) -> str:
-    """One-line '📍 last requested from <country> · for <customer>'.
+def _origin_line(country: str, customer: str, sent_date=None) -> str:
+    """One-line '📍 last requested from <country> · for <customer> · 📅 <date>'.
 
-    Both fields come from the most-recent FSL row for the product, so this
-    answers 'who last asked for this, and from which country' — the two
-    things a rep needs to gauge whether a sample is live and who owns it.
-    Renders whatever is present; empty string if neither is known.
+    All fields come from the most-recent FSL row for the product, so this
+    answers 'who last asked for this, from which country, and when' — what a
+    rep needs to gauge whether a sample is live and who owns it.
+    ``sent_date`` accepts a datetime.date or the raw sheet string; renders
+    whatever is present; empty string if nothing is known.
     """
     country = (country or "").strip()
     customer = (customer or "").strip()
-    if not country and not customer:
+    date_str = ""
+    if sent_date is not None:
+        try:
+            date_str = sent_date.strftime("%d %b %Y")
+        except AttributeError:
+            date_str = str(sent_date).strip()
+    if not country and not customer and not date_str:
         return ""
     parts = []
     if country:
@@ -1350,6 +1357,8 @@ def _origin_line(country: str, customer: str) -> str:
         parts.append(f"{flag + ' ' if flag else ''}{h(country)}")
     if customer:
         parts.append(f"for {h(customer)}")
+    if date_str:
+        parts.append(f"📅 {h(date_str)}")
     return "📍 last requested " + (
         "from " + " · ".join(parts) if country else " · ".join(parts)
     )
@@ -1442,7 +1451,8 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
                 f"<b>R&amp;D Price:</b> {fsl_price_display}"
             )
             origin = _origin_line(
-                fsl_row.get("Country") or "", fsl_row.get("Customer Name") or ""
+                fsl_row.get("Country") or "", fsl_row.get("Customer Name") or "",
+                fsl_row.get("_date") or fsl_row.get("Sample Date Out"),
             )
             if origin:
                 body += f"\n{origin}"
@@ -1633,6 +1643,7 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             _origin = _origin_line(
                 _origin_row.get("Country") or "",
                 _origin_row.get("Customer Name") or "",
+                _origin_row.get("_date") or _origin_row.get("Sample Date Out"),
             )
             if _origin:
                 body += f"\n{_origin}"

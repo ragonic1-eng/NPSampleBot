@@ -26,6 +26,8 @@ from telegram import (
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Update,
 )
 from telegram.constants import ChatType, ParseMode
@@ -35,6 +37,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -1423,13 +1426,38 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         # V1.17.x — single-code lookups get two bonus buttons under the
         # price: jump straight to the last sample of THIS code (own /
         # any rep). Batch pastes stay button-free — they're price sweeps.
-        def _price_kb():
+        def _price_kb(product_name: str = "", price_usd: str = ""):
             if len(codes) != 1:
                 return None
-            return kb([
+            rows: list[list[tuple[str, str]]] = [
                 [("📦 My last sample of this code", f"lsx:s:{code}")],
                 [("🌐 Any rep's last sample", f"lsx:a:{code}")],
-            ])
+                [("🔔 Watch this price", f"watch:add:{code}")],
+            ]
+            # V1.17.29 — one-tap quotation handoff. Opens quote_web with the
+            # rep's name + this code/name/price pre-filled, so 'price check'
+            # flows straight into 'send quote' without retyping. Only shown
+            # when we have QUOTE_WEB_URL and a name to send.
+            if config.QUOTE_WEB_URL and product_name:
+                from urllib.parse import urlencode
+                sales = _resolve_quote_sales_name(update.effective_user) or ""
+                params = {"code": code, "name": product_name}
+                if sales:
+                    params["sales"] = sales
+                if price_usd:
+                    params["price"] = price_usd
+                sep = "&" if "?" in config.QUOTE_WEB_URL else "?"
+                url = f"{config.QUOTE_WEB_URL}{sep}{urlencode(params)}"
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                # Kept as its own group so the URL button (which uses url= not
+                # callback_data=) can sit alongside the callback buttons.
+                url_row = [InlineKeyboardButton("📄 Quote this product", url=url)]
+                cb_rows = [
+                    [InlineKeyboardButton(txt, callback_data=cb) for txt, cb in row]
+                    for row in rows
+                ]
+                return InlineKeyboardMarkup(cb_rows + [url_row])
+            return kb(rows)
 
         # Helper: render an FSL-only reply (3 lines, no RMC). Used both
         # when MMS doesn't have the variant and when MMS returned a
@@ -1458,7 +1486,14 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             )
             if origin:
                 body += f"\n{origin}"
-            await _replace(body, markup=_price_kb())
+            await _replace(
+                body,
+                markup=_price_kb(
+                    product_name=fsl_name,
+                    price_usd=(f"{fsl_price_for_audit:.2f}"
+                               if fsl_price_for_audit is not None else ""),
+                ),
+            )
             _audit(
                 query=asked_code,
                 result="Found (FSL)",
@@ -1649,7 +1684,13 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
             )
             if _origin:
                 body += f"\n{_origin}"
-        await _replace(body, markup=_price_kb())
+        _price_str = (
+            f"{product.rd_price_usd:.2f}" if product.rd_price_usd is not None else ""
+        )
+        await _replace(
+            body,
+            markup=_price_kb(product_name=product.name or "", price_usd=_price_str),
+        )
         # For audit, log the FSL fallback as a numeric only if it parses
         # cleanly to a float — non-USD currency text isn't comparable, so
         # leave it None there.
@@ -6434,6 +6475,70 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _run_pp_for_codes(update, [sugg_code])
         return
 
+    # 🔔 Watch this price. watch:add:<code> — adds a subscription; the daily
+    # cron (_watch_check_job) DMs the user when MMS moves >=1%.
+    if data.startswith("watch:add:"):
+        wcode = data.split(":", 2)[2].strip().upper()
+        if not (wcode and _PP_CODE_RE.fullmatch(wcode)):
+            return
+        u = update.effective_user
+        if not u:
+            return
+        try:
+            outcome = await asyncio.to_thread(
+                sheets.add_price_watch, u.id, u.username or "", wcode
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("watch add failed for %s: %s", wcode, e)
+            await send(
+                update,
+                f"⚠️ Couldn't set up the watch for <code>{h(wcode)}</code> "
+                f"— {_friendly_fetch_error(e)}",
+            )
+            return
+        if outcome == "added":
+            msg = (
+                f"🔔 <b>Watching <code>{h(wcode)}</code></b>\n\n"
+                "I'll DM you if the R&amp;D price moves by 1% or more.\n"
+                f"To stop, tap the button or send <code>/unwatch {h(wcode)}</code>."
+            )
+        elif outcome == "exists":
+            msg = (
+                f"🔔 You're already watching <code>{h(wcode)}</code>.\n"
+                f"<code>/unwatch {h(wcode)}</code> to stop, "
+                "<code>/watches</code> to list."
+            )
+        else:
+            msg = "⚠️ Couldn't understand that code."
+        await send(
+            update, msg,
+            kb([[("🛑 Stop watching", f"watch:rm:{wcode}"),
+                 ("📋 My watches", "watch:list")]]),
+        )
+        return
+
+    if data.startswith("watch:rm:"):
+        wcode = data.split(":", 2)[2].strip().upper()
+        u = update.effective_user
+        if not (wcode and u):
+            return
+        try:
+            removed = await asyncio.to_thread(sheets.remove_price_watch, u.id, wcode)
+        except Exception as e:  # noqa: BLE001
+            await send(update, f"⚠️ Remove failed: {_friendly_fetch_error(e)}")
+            return
+        await send(
+            update,
+            f"🛑 Stopped watching <code>{h(wcode)}</code>."
+            if removed else f"You weren't watching <code>{h(wcode)}</code>.",
+            kb([[("📋 My watches", "watch:list"), ("🏠 Main menu", "menu:home")]]),
+        )
+        return
+
+    if data == "watch:list":
+        await cmd_watches(update, ctx)
+        return
+
     # /lastsample "Find another" button. Two flavours:
     #   lastsample:again      → reprompt for the rep-scoped search
     #   lastsample:again_all  → reprompt for the admin all-reps search
@@ -8964,6 +9069,485 @@ async def _daily_sample_digest_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("daily_digest: send failed: %s", e)
 
 
+# --------------------------- price watchlist (V1.17.26) --------------------
+
+async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/watch <code> — subscribe to R&D-price change alerts for one code."""
+    if not await _authorized(update):
+        return
+    args = (ctx.args or [])
+    if not args:
+        await send(
+            update,
+            "🔔 <b>Watch a product price</b>\n\n"
+            "Send <code>/watch S-668U1</code> and I'll DM you if the "
+            "R&amp;D price moves by 1% or more.\n\n"
+            "Or run <code>/pp &lt;code&gt;</code> and tap the 🔔 button.",
+        )
+        return
+    code = args[0].strip().upper()
+    if not _PP_CODE_RE.fullmatch(code):
+        await send(update, f"⚠️ <code>{h(code)}</code> doesn't look like a product code.")
+        return
+    u = update.effective_user
+    outcome = await asyncio.to_thread(
+        sheets.add_price_watch, u.id, u.username or "", code
+    )
+    if outcome == "added":
+        await send(
+            update,
+            f"🔔 Watching <code>{h(code)}</code>. First price check runs "
+            "in the next daily sweep.",
+            kb([[("🛑 Stop watching", f"watch:rm:{code}"),
+                 ("📋 My watches", "watch:list")]]),
+        )
+    else:
+        await send(update, f"🔔 Already watching <code>{h(code)}</code>.")
+
+
+async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update):
+        return
+    args = (ctx.args or [])
+    if not args:
+        await send(update, "Send <code>/unwatch S-668U1</code>.")
+        return
+    code = args[0].strip().upper()
+    u = update.effective_user
+    removed = await asyncio.to_thread(sheets.remove_price_watch, u.id, code)
+    await send(
+        update,
+        f"🛑 Stopped watching <code>{h(code)}</code>." if removed
+        else f"You weren't watching <code>{h(code)}</code>.",
+    )
+
+
+async def cmd_watches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _authorized(update):
+        return
+    u = update.effective_user
+    items = await asyncio.to_thread(sheets.list_price_watches, u.id)
+    if not items:
+        await send(
+            update,
+            "📋 <b>No price watches yet.</b>\n\n"
+            "Run <code>/pp &lt;code&gt;</code> and tap 🔔, or send "
+            "<code>/watch &lt;code&gt;</code>.",
+        )
+        return
+    lines = [f"📋 <b>Your price watches ({len(items)})</b>", ""]
+    btns: list[list[tuple[str, str]]] = []
+    for w in items[:20]:
+        code = (w.get("Product Code") or "").strip().upper()
+        last = (w.get("Last Price USD") or "").strip()
+        checked = (w.get("Last Checked UTC") or "").strip() or "never"
+        last_str = f"USD {last}" if last else "(no reading yet)"
+        lines.append(f"• <code>{h(code)}</code> · last {h(last_str)} · {h(checked)}")
+        btns.append([(f"🛑 Stop watching {code}", f"watch:rm:{code}")])
+    if len(items) > 20:
+        lines.append(f"\n<i>… and {len(items) - 20} more</i>")
+    btns.append([("🏠 Main menu", "menu:home")])
+    await send(update, "\n".join(lines), kb(btns))
+
+
+async def _watch_check_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily: fetch MMS R&D price for every watch. DM the watcher if the
+    price moved >= sheets.WATCH_THRESHOLD_PCT since the last reading."""
+    try:
+        watches = await asyncio.to_thread(sheets.list_price_watches, None)
+    except Exception as e:  # noqa: BLE001
+        log.warning("watch check: read watches failed: %s", e)
+        return
+    if not watches:
+        return
+    # Group by code so the same MMS lookup covers all subscribers.
+    by_code: dict[str, list[dict]] = {}
+    for w in watches:
+        c = (w.get("Product Code") or "").strip().upper()
+        if c:
+            by_code.setdefault(c, []).append(w)
+    client = mms_product.get_client()
+    checked, notified = 0, 0
+    for code, subs in by_code.items():
+        try:
+            product = await asyncio.to_thread(client.fetch_product, code)
+            new_usd = product.rd_price_usd
+        except Exception as e:  # noqa: BLE001
+            log.info("watch check: MMS lookup failed for %s: %s", code, e)
+            continue
+        checked += 1
+        if new_usd is None:
+            continue
+        for sub in subs:
+            row_num = sub.get("row_number")
+            prior_raw = (sub.get("Last Price USD") or "").strip()
+            try:
+                prior = float(prior_raw) if prior_raw else None
+            except ValueError:
+                prior = None
+            try:
+                await asyncio.to_thread(sheets.update_watch_price, row_num, new_usd)
+            except Exception as e:  # noqa: BLE001
+                log.warning("watch check: write failed for row %s: %s", row_num, e)
+                continue
+            if prior is None:
+                continue  # first reading — no baseline to compare
+            move_pct = abs(new_usd - prior) / prior * 100 if prior else 0
+            if move_pct < sheets.WATCH_THRESHOLD_PCT:
+                continue
+            uid = sub.get("Telegram User ID", "").strip()
+            if not uid.isdigit():
+                continue
+            arrow = "🔺" if new_usd > prior else "🔻"
+            body = (
+                f"{arrow} <b>Price move on <code>{h(code)}</code></b>\n\n"
+                f"Was: USD {prior:.2f}\n"
+                f"Now: USD {new_usd:.2f} ({(new_usd - prior) / prior * 100:+.1f}%)\n\n"
+                "<i>Type the code for the full /pp result.</i>"
+            )
+            try:
+                await ctx.bot.send_message(
+                    chat_id=int(uid), text=body, parse_mode=ParseMode.HTML,
+                    reply_markup=kb([
+                        [(f"💲 Look up {code}", f"pp:{code}")],
+                        [("🛑 Stop watching", f"watch:rm:{code}")],
+                    ]),
+                )
+                notified += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("watch DM to %s failed: %s", uid, e)
+    log.info("watch check: %d codes checked, %d alerts sent", checked, notified)
+
+
+async def _schedule_watch_check(application: Application) -> None:
+    from datetime import time as _time
+    jq = application.job_queue
+    if jq is None:
+        log.warning("JobQueue not available — price watch check NOT scheduled.")
+        return
+    sgt = ZoneInfo("Asia/Singapore")
+    jq.run_daily(
+        _watch_check_job,
+        time=_time(hour=8, minute=30, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4),
+        name="price_watch_check",
+    )
+    log.info("price watch check scheduled: 08:30 SGT, Mon-Fri")
+
+
+# --------------------------- follow-up nudges (V1.17.27) -------------------
+
+async def _followup_nudges_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Weekly: for each ACTIVE rep with a Telegram User ID, find samples they
+    sent 14+ days ago where no NEWER sample went to that same customer. DM
+    them a compact 'worth a follow-up call?' list. Silent when nothing due."""
+    try:
+        users = await asyncio.to_thread(sheets.load_users, True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("followup nudges: load_users failed: %s", e)
+        return
+    # rep-name -> telegram id, only active reps with a numeric ID
+    tg_by_rep: dict[str, int] = {}
+    for row in users:
+        active = str(sheets._row_get_loose(row, "Active")).strip().lower()
+        if active not in {"y", "yes", "true", "1"}:
+            continue
+        mms = str(sheets._row_get_loose(row, "MMS Name")).strip()
+        tid = str(sheets._row_get_loose(row, "Telegram User ID")).strip()
+        if mms and tid.isdigit():
+            tg_by_rep[mms] = int(tid)
+    if not tg_by_rep:
+        return
+    # Pull all samples once (LKG-cached).
+    try:
+        all_rows = []
+        for tab in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB):
+            all_rows.extend(await asyncio.to_thread(sheets.load_fsl_rows_all, tab))
+    except Exception as e:  # noqa: BLE001
+        log.warning("followup nudges: FSL read failed: %s", e)
+        return
+    # newest date per (rep, customer) — anything a rep sent that customer.
+    latest_per_pair: dict[tuple[str, str], "date"] = {}
+    for r in all_rows:
+        d = r.get("_date")
+        if not d:
+            continue
+        rep = (r.get("Sales") or "").strip()
+        cust = " ".join((r.get("Customer Name") or "").lower().split())
+        if not rep or not cust:
+            continue
+        k = (rep.lower(), cust)
+        prev = latest_per_pair.get(k)
+        if prev is None or d > prev:
+            latest_per_pair[k] = d
+    today = _sgt_now().date()
+    cutoff_old = today - timedelta(days=14)
+    cutoff_dead = today - timedelta(days=120)  # too old to bother nudging
+    per_rep: dict[str, list[dict]] = {}
+    for r in all_rows:
+        d = r.get("_date")
+        rep = (r.get("Sales") or "").strip()
+        cust_name = (r.get("Customer Name") or "").strip()
+        cust = " ".join(cust_name.lower().split())
+        if not (d and rep and cust and rep in tg_by_rep):
+            continue
+        if not (cutoff_dead <= d <= cutoff_old):
+            continue
+        # Only nudge for the MOST RECENT sample to this customer — no newer
+        # follow-up already exists. Older stale rows would be spam.
+        if latest_per_pair.get((rep.lower(), cust)) != d:
+            continue
+        per_rep.setdefault(rep, []).append(r)
+    sent = 0
+    for rep, rows in per_rep.items():
+        # date-asc, so oldest (most overdue) leads. Cap to a readable list.
+        rows.sort(key=lambda x: x["_date"])
+        top = rows[:8]
+        lines = [
+            f"👋 <b>Hey {h(rep)} — follow-up nudges</b>",
+            f"<i>{len(rows)} customer{'s' if len(rows) != 1 else ''} "
+            "you sent samples to 14+ days ago with no newer activity. "
+            "Worth a check-in call?</i>",
+            "",
+        ]
+        for r in top:
+            days_ago = (today - r["_date"]).days
+            code = (r.get("Product Code") or "—").strip().upper()
+            name = (r.get("Product Name") or "—").strip()
+            cust = (r.get("Customer Name") or "—").strip()
+            lines.append(
+                f"• <b>{h(cust)}</b> — <code>{h(code)}</code> · "
+                f"{h(name[:40])} · <i>{days_ago}d ago</i>"
+            )
+        if len(rows) > len(top):
+            lines.append(f"\n<i>… and {len(rows) - len(top)} more</i>")
+        try:
+            await ctx.bot.send_message(
+                chat_id=tg_by_rep[rep], text="\n".join(lines),
+                parse_mode=ParseMode.HTML,
+            )
+            sent += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("followup DM to %s (%s) failed: %s",
+                        rep, tg_by_rep[rep], e)
+    log.info("followup nudges: %d reps notified", sent)
+
+
+async def _schedule_followup_nudges(application: Application) -> None:
+    from datetime import time as _time
+    jq = application.job_queue
+    if jq is None:
+        log.warning("JobQueue not available — followup nudges NOT scheduled.")
+        return
+    sgt = ZoneInfo("Asia/Singapore")
+    # Monday 09:00 SGT.
+    jq.run_daily(
+        _followup_nudges_job,
+        time=_time(hour=9, minute=0, tzinfo=sgt),
+        days=(0,),
+        name="followup_nudges_weekly",
+    )
+    log.info("followup nudges scheduled: Mondays 09:00 SGT")
+
+
+# --------------------------- monthly auto-report (V1.17.28) ----------------
+
+async def _monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Post a monthly summary to DAILY_DIGEST_CHAT_ID on the 1st (weekday
+    equivalent) of each month — covers the PRIOR calendar month."""
+    if not config.DAILY_DIGEST_CHAT_ID:
+        return
+    # Only fire on the 1st, 2nd, or 3rd (whichever is the first weekday).
+    today = _sgt_now().date()
+    if today.day > 3:
+        return
+    from calendar import monthrange
+    # Compute prior month bounds.
+    if today.month == 1:
+        y, m = today.year - 1, 12
+    else:
+        y, m = today.year, today.month - 1
+    from datetime import date as _dt_date
+    m_start = _dt_date(y, m, 1)
+    m_end = _dt_date(y, m, monthrange(y, m)[1])
+    # Also the month BEFORE that for new-customer detection.
+    if m == 1:
+        py, pm = y - 1, 12
+    else:
+        py, pm = y, m - 1
+    prev_start = _dt_date(py, pm, 1)
+    try:
+        all_rows = []
+        for tab in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB):
+            all_rows.extend(await asyncio.to_thread(sheets.load_fsl_rows_all, tab))
+    except Exception as e:  # noqa: BLE001
+        log.warning("monthly report: FSL read failed: %s", e)
+        return
+    from collections import Counter
+    per_rep: Counter = Counter()
+    per_product: Counter = Counter()
+    per_customer: Counter = Counter()
+    customers_this_month: set = set()
+    customers_prior: set = set()
+    total = 0
+    for r in all_rows:
+        d = r.get("_date")
+        if not d:
+            continue
+        rep = (r.get("Sales") or "").strip()
+        code = (r.get("Product Code") or "").strip().upper()
+        name = (r.get("Product Name") or "").strip()
+        cust = " ".join((r.get("Customer Name") or "").lower().split())
+        if d < prev_start:
+            continue
+        if d < m_start:
+            if cust:
+                customers_prior.add(cust)
+            continue
+        if d > m_end:
+            continue
+        total += 1
+        if rep:
+            per_rep[rep] += 1
+        if code:
+            per_product[(code, name)] += 1
+        if cust:
+            per_customer[cust] += 1
+            customers_this_month.add(cust)
+    if total == 0:
+        return
+    new_custs = customers_this_month - customers_prior
+    label = m_start.strftime("%B %Y")
+    lines = [
+        f"📊 <b>Monthly report — {h(label)}</b>",
+        f"<i>{total} samples · {len(customers_this_month)} unique customers "
+        f"· {len(new_custs)} NEW customers</i>",
+        "",
+        "<b>By rep</b>",
+    ]
+    for rep, cnt in per_rep.most_common(10):
+        lines.append(f"  • {h(rep)} — {cnt}")
+    lines.append("\n<b>Top products</b>")
+    for (code, name), cnt in per_product.most_common(10):
+        lines.append(
+            f"  • <code>{h(code)}</code> {h(name[:30])} — {cnt}×"
+        )
+    lines.append("\n<b>Top customers</b>")
+    top_custs = per_customer.most_common(10)
+    # Recover the display-cased name from an original row.
+    cust_display: dict[str, str] = {}
+    for r in all_rows:
+        k = " ".join((r.get("Customer Name") or "").lower().split())
+        if k and k not in cust_display:
+            cust_display[k] = (r.get("Customer Name") or "").strip()
+    for cust, cnt in top_custs:
+        lines.append(f"  • {h(cust_display.get(cust, cust))} — {cnt}×")
+    if new_custs:
+        lines.append(f"\n<b>New customers this month</b> ({len(new_custs)})")
+        for cust in list(new_custs)[:10]:
+            lines.append(f"  • {h(cust_display.get(cust, cust))}")
+        if len(new_custs) > 10:
+            lines.append(f"  <i>… and {len(new_custs) - 10} more</i>")
+    try:
+        await ctx.bot.send_message(
+            chat_id=int(config.DAILY_DIGEST_CHAT_ID),
+            text="\n".join(lines), parse_mode=ParseMode.HTML,
+        )
+        log.info("monthly report posted for %s", label)
+    except Exception as e:  # noqa: BLE001
+        log.warning("monthly report post failed: %s", e)
+
+
+async def _schedule_monthly_report(application: Application) -> None:
+    from datetime import time as _time
+    jq = application.job_queue
+    if jq is None:
+        return
+    sgt = ZoneInfo("Asia/Singapore")
+    # Fire every weekday morning; the job itself no-ops except on day 1-3.
+    jq.run_daily(
+        _monthly_report_job,
+        time=_time(hour=9, minute=15, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4),
+        name="monthly_report",
+    )
+    log.info("monthly report scheduled: 09:15 SGT, day 1-3 of month")
+
+
+# --------------------------- inline mode (V1.17.30) ------------------------
+
+async def on_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle `@NPSampleBot cheese` in ANY chat.
+
+    STRICT auth: never answers if the querying user isn't on the allowlist —
+    otherwise anyone on Telegram could probe the catalog. Auth-check here
+    silently answers with an empty result (no error message can be shown in
+    an inline dropdown), which also prevents info leaks to strangers.
+    """
+    iq = update.inline_query
+    if not iq:
+        return
+    user = update.effective_user
+    query = (iq.query or "").strip()
+    if not user:
+        await iq.answer([], cache_time=1)
+        return
+    try:
+        ok = await asyncio.to_thread(sheets.is_user_authorized, user.id, user.username)
+    except Exception:  # noqa: BLE001 — inline can't show a nice message
+        ok = False
+    if not ok:
+        await iq.answer([], cache_time=1, is_personal=True)
+        return
+    if len(query) < 2:
+        await iq.answer([], cache_time=5, is_personal=True)
+        return
+    try:
+        catalog = await asyncio.to_thread(sheets.load_seasonings)
+    except Exception:  # noqa: BLE001
+        await iq.answer([], cache_time=1, is_personal=True)
+        return
+    hits = matcher.top_seasonings(query, catalog, limit=5)
+    results: list[InlineQueryResultArticle] = []
+    for i, s in enumerate(hits):
+        p_code = str(s.get("code") or "").strip().upper()
+        p_name = str(s.get("name") or "").strip()
+        price = str(s.get("price") or "").strip() or "—"
+        cust = str(s.get("customer") or "").strip()
+        country = str(s.get("country") or "").strip()
+        # The message the rep POSTS by picking a result. Product code first
+        # so a downstream reply of just this message re-runs /pp cleanly.
+        msg_lines = [
+            f"<b>{h(p_name)}</b>",
+            f"<code>{h(p_code)}</code> · 💲 R&amp;D {h(price)}",
+        ]
+        if country or cust:
+            _flag = _COUNTRY_FLAG.get(country.upper(), "")
+            bits = []
+            if country:
+                bits.append(f"{_flag + ' ' if _flag else ''}{h(country)}")
+            if cust:
+                bits.append(h(cust))
+            msg_lines.append("📍 last sent: " + " · ".join(bits))
+        msg_lines.append(
+            "<i>Reply with the code to get today's live MMS price.</i>"
+        )
+        results.append(
+            InlineQueryResultArticle(
+                id=f"prod-{p_code}-{i}",
+                title=f"{p_name[:60]}",
+                description=f"{p_code} · {price}"
+                + (f" · {country}" if country else ""),
+                input_message_content=InputTextMessageContent(
+                    "\n".join(msg_lines), parse_mode=ParseMode.HTML,
+                ),
+            )
+        )
+    # cache_time=30 so Telegram reuses this result for 30s for the same user
+    # typing the same query — is_personal=True keeps it OFF other users.
+    await iq.answer(results, cache_time=30, is_personal=True)
+
+
 async def _schedule_daily_digest(application: Application) -> None:
     """Schedule the daily digest at 18:00 Asia/Singapore, weekdays only."""
     from datetime import time as _time
@@ -9312,6 +9896,10 @@ def main():
     app.add_handler(CommandHandler("syncawb", cmd_syncawb))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
+    app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("unwatch", cmd_unwatch))
+    app.add_handler(CommandHandler("watches", cmd_watches))
+    app.add_handler(InlineQueryHandler(on_inline_query))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("lastsample", cmd_lastsample))
     app.add_handler(CommandHandler("alllastsample", cmd_alllastsample))
@@ -9341,6 +9929,8 @@ def main():
             BotCommand("scan", "📷 Scan a photo for product code(s)"),
             BotCommand("lastsample", "🔎 Find your last sample — /lastsample <keyword>"),
             BotCommand("alllastsample", "🌐 Search any rep's samples — /alllastsample <keyword>"),
+            BotCommand("watch", "🔔 Watch a code's price — /watch S-668U1"),
+            BotCommand("watches", "📋 List your price watches"),
             BotCommand("help", "Show all commands"),
         ]
         try:
@@ -9378,6 +9968,9 @@ def main():
         await _schedule_weekly_mms_sync(application)
         await _schedule_daily_digest(application)
         await _schedule_awb_sync(application)
+        await _schedule_watch_check(application)
+        await _schedule_followup_nudges(application)
+        await _schedule_monthly_report(application)
         asyncio.create_task(_warm_fsl_tabs())
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))

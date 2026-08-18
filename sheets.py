@@ -1966,3 +1966,112 @@ def upsert_sample_master(
             values=existing_rows,
         )
     return added, updated
+
+
+# ---------- Price watchlist (V1.17.26) ---------------------------------------
+# One row per (rep, code) subscription. Lives in OPS_SHEET_ID so it survives
+# Railway ephemeral-disk restarts. The daily job (bot._watch_check_job) reads
+# every row, re-fetches MMS, and rewrites Last Price / Last Checked. If the
+# new price differs from Last Price by >= WATCH_THRESHOLD_PCT it DMs the
+# watcher and updates Last Price so the next check compares against the new
+# baseline (no repeat alerts for the same move).
+
+TAB_WATCHES = "Price Watches"
+WATCH_COLS = [
+    "Telegram User ID",  # who to notify (numeric string)
+    "Telegram Username",  # for the human column
+    "Product Code",       # uppercased
+    "Last Price USD",     # float or "" if never fetched
+    "Last Checked UTC",   # ISO stamp or ""
+    "Added UTC",          # ISO stamp
+]
+WATCH_THRESHOLD_PCT = 1.0  # notify on >= 1% move either direction
+
+
+def _ensure_watch_tab():
+    sh = _open_ops()
+    try:
+        return sh.worksheet(TAB_WATCHES)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TAB_WATCHES, rows=500, cols=len(WATCH_COLS))
+        ws.append_row(WATCH_COLS)
+        return ws
+
+
+def add_price_watch(tg_user_id: int, tg_username: str, code: str) -> str:
+    """Idempotently add a watch. Returns 'added' or 'exists'."""
+    code = (code or "").strip().upper()
+    if not code:
+        return "invalid"
+    ws = _ensure_watch_tab()
+    values = ws.get_all_values()
+    header = values[0] if values else WATCH_COLS
+    idx = {h: i for i, h in enumerate(header)}
+    uid_s = str(tg_user_id)
+    for r in values[1:]:
+        r += [""] * (len(header) - len(r))
+        if r[idx["Telegram User ID"]] == uid_s and \
+                r[idx["Product Code"]].strip().upper() == code:
+            return "exists"
+    import datetime as _dt
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    row = [""] * len(header)
+    row[idx["Telegram User ID"]] = uid_s
+    row[idx["Telegram Username"]] = (tg_username or "").lstrip("@")
+    row[idx["Product Code"]] = code
+    row[idx["Added UTC"]] = stamp
+    ws.append_row(row)
+    return "added"
+
+
+def remove_price_watch(tg_user_id: int, code: str) -> bool:
+    code = (code or "").strip().upper()
+    ws = _ensure_watch_tab()
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return False
+    header = values[0]
+    idx = {h: i for i, h in enumerate(header)}
+    uid_s = str(tg_user_id)
+    for i, r in enumerate(values[1:], 2):
+        r += [""] * (len(header) - len(r))
+        if r[idx["Telegram User ID"]] == uid_s and \
+                r[idx["Product Code"]].strip().upper() == code:
+            ws.delete_rows(i)
+            return True
+    return False
+
+
+def list_price_watches(tg_user_id: int | None = None) -> list[dict]:
+    """List watches. tg_user_id=None returns every watch (for the cron job).
+    Each dict carries the tab column names verbatim + a 'row_number' for
+    subsequent update calls."""
+    ws = _ensure_watch_tab()
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    header = values[0]
+    out: list[dict] = []
+    for i, r in enumerate(values[1:], 2):
+        r += [""] * (len(header) - len(r))
+        row = {header[j]: r[j] for j in range(len(header))}
+        row["row_number"] = i
+        if tg_user_id is None or row.get("Telegram User ID") == str(tg_user_id):
+            out.append(row)
+    return out
+
+
+def update_watch_price(row_number: int, new_price_usd: float | None) -> None:
+    """Write Last Price + Last Checked for a watch row. new_price_usd=None
+    leaves the price blank but still stamps a check time (so we don't hammer
+    a code MMS can't answer)."""
+    import datetime as _dt
+    ws = _ensure_watch_tab()
+    header = ws.row_values(1)
+    idx = {h: i for i, h in enumerate(header)}
+    price_col = gspread.utils.rowcol_to_a1(row_number, idx["Last Price USD"] + 1)
+    check_col = gspread.utils.rowcol_to_a1(row_number, idx["Last Checked UTC"] + 1)
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    price_str = f"{new_price_usd:.4f}" if new_price_usd is not None else ""
+    ws.update(range_name=price_col, values=[[price_str]], value_input_option="RAW")
+    ws.update(range_name=check_col, values=[[stamp]], value_input_option="RAW")

@@ -1385,11 +1385,22 @@ def find_fsl_product_by_code(code: str) -> dict | None:
 _FSL_ROWS_CACHE: dict[tuple, tuple[float, list]] = {}
 _FSL_CACHE_TTL_SEC = 90
 
+# Last-known-good: the SAME cache tuples above, but WITHOUT a TTL. When a
+# refresh fails or comes back empty (Google 503, transient auth blip), we
+# serve the last successful payload from here instead of returning [] to the
+# caller — which used to look like "no match" to the rep. Cleared only by
+# _invalidate_fsl_cache after a write (append_fsl_rows / write_awb_updates),
+# where an empty return really WOULD mean the tab is now empty.
+_FSL_ROWS_LKG: dict[tuple, list] = {}
+
 
 def _invalidate_fsl_cache() -> None:
     """Clear the FSL row cache. Called after any write so the next read
-    sees fresh data instead of pre-write snapshot."""
+    sees fresh data instead of pre-write snapshot. Also clears LKG — after
+    a WRITE, staleness matters more than resilience: we want to see the
+    row we just added, not the pre-write snapshot forever."""
     _FSL_ROWS_CACHE.clear()
+    _FSL_ROWS_LKG.clear()
 
 
 def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
@@ -1400,6 +1411,11 @@ def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
     Each row includes a parsed ``_date`` for sorting.
 
     90s TTL cache — see _FSL_ROWS_CACHE docstring.
+
+    V1.17.25 — last-known-good resilience: a network read that fails, or
+    returns 0 rows (which is what a Google 503 typically looks like from
+    gspread), degrades to the last successful payload instead of []. So a
+    transient outage can't blank out search for the whole 90s window.
     """
     import time as _time
     cache_key = ("all", tab)
@@ -1408,14 +1424,36 @@ def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
     if cached and now - cached[0] < _FSL_CACHE_TTL_SEC:
         return cached[1]
 
-    sh = _open_seasoning_master()
+    def _serve_lkg(reason: str) -> list[dict[str, str]]:
+        prior = _FSL_ROWS_LKG.get(cache_key)
+        if prior:
+            log.warning(
+                "load_fsl_rows_all(%r) %s — serving %d cached rows",
+                tab, reason, len(prior),
+            )
+            # Re-arm the TTL slot so we don't retry the failing read for
+            # every subsequent search until the window rolls over.
+            _FSL_ROWS_CACHE[cache_key] = (now, prior)
+            return prior
+        return []
+
     try:
-        ws = sh.worksheet(tab)
-    except gspread.WorksheetNotFound:
-        return []
-    values = ws.get_all_values()
+        sh = _open_seasoning_master()
+        try:
+            ws = sh.worksheet(tab)
+        except gspread.WorksheetNotFound:
+            return []
+        values = ws.get_all_values()
+    except Exception as e:  # noqa: BLE001 — anything from the network layer
+        return _serve_lkg(f"read failed ({type(e).__name__})")
+
     if len(values) < 2:
-        return []
+        # Genuine empty is indistinguishable from a soft 503 that returned
+        # only the header row. If we already have a good copy, prefer it —
+        # a WRITE would have invalidated LKG, so a stale LKG here means the
+        # tab really did have rows a moment ago.
+        return _serve_lkg("empty response")
+
     out: list[dict[str, str]] = []
     for r in values[1:]:
         padded = r + [""] * (len(FSL_HEADER) - len(r))
@@ -1423,6 +1461,7 @@ def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
         row["_date"] = _parse_iso_date(row.get("Sample Date Out", ""))
         out.append(row)
     _FSL_ROWS_CACHE[cache_key] = (now, out)
+    _FSL_ROWS_LKG[cache_key] = out
     return out
 
 

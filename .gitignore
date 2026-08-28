@@ -20,3 +20,15 @@ SETUP.md
 run.bat
 
 .vercel
+
+# env backups / sync scratch (contain secrets)
+.env.backup-*
+.env.railway-raw
+.env.railway-err
+.env.*
+
+# scratch files from debugging (may hold credentials / session data)
+sa_oneline.txt
+_mms_*.html
+_mms_*.txt
+*_backfill_log*.txt

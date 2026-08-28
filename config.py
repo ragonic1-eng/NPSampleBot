@@ -1,7 +1,17 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# override=False: a REAL environment variable beats the local .env file.
+#
+# This used to be override=True, which meant a stale .env on the dev machine
+# silently clobbered correct values injected by the environment. Concretely:
+# `railway run python sync_engine.py` injects the live MMS_USER/MMS_PASSWORD,
+# but the old .env (still carrying the pre-rotation password and the
+# capitalised "Alex" that MMS rejects) overwrote them, so every local sync or
+# backfill died with "MMS login failed (check creds)" while Railway itself was
+# perfectly fine. Nothing changes in production — there is no .env on Railway
+# (it's gitignored and never deployed); .env now only fills gaps locally.
+load_dotenv(override=False)
 
 # Bot version — only bump when the user explicitly asks.
 BOT_VERSION = "V1.17.19"

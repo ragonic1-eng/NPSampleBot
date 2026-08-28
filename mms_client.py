@@ -624,7 +624,9 @@ def fetch_all_samples_by_request_date(
     filtering. Same per-chunk retry + dedup + per-chunk-fatal-soft
     error handling as the dispatched-date path."""
     out: list[SampleRow] = []
-    seen: set[tuple[str, str]] = set()
+    # (sreq_code, product_code, ship_date) — see the V1.17.31 note in
+    # fetch_all_samples: omitting the date drops repeat shipments.
+    seen: set[tuple[str, str, str]] = set()
     failed_chunks: list[tuple[dt.date, dt.date, str]] = []
     for a, b in monthly_chunks(date_from, date_to, months_per_chunk=3):
         chunk: list[SampleRow] | None = None
@@ -655,7 +657,7 @@ def fetch_all_samples_by_request_date(
                 _fmt_date(a), _fmt_date(b), len(chunk),
             )
         for r in chunk:
-            key = (r.sample_request_code, r.product_code)
+            key = (r.sample_request_code, r.product_code, r.sample_date_out)
             if key in seen:
                 continue
             seen.add(key)
@@ -709,7 +711,17 @@ def fetch_all_samples(
     caller's perspective).
     """
     out: list[SampleRow] = []
-    seen: set[tuple[str, str]] = set()  # (sample_request_code, product_code)
+    # De-dupe key MUST include the ship date. This set exists only to drop
+    # rows seen twice because monthly_chunks windows can overlap — a true
+    # duplicate carries the same ship date too.
+    #
+    # V1.17.31 bugfix: the key used to be (sample_request_code, product_code)
+    # with NO date, which silently discarded every REPEAT shipment of the same
+    # product under a standing sample request. Real case: SR S-11RS43-002 for
+    # APACIFIC shipped S-B18L9-01 (HOKKAIDO MILK) on 12/May and again on
+    # 24/Aug — only May survived, so the bot swore the August sample never
+    # went out. 169 rows were being lost across a single Mar–Aug sync.
+    seen: set[tuple[str, str, str]] = set()
     failed_chunks: list[tuple[dt.date, dt.date, str]] = []
     for a, b in monthly_chunks(date_from, date_to, months_per_chunk=3):
         chunk: list[SampleRow] | None = None
@@ -741,7 +753,7 @@ def fetch_all_samples(
                 _fmt_date(a), _fmt_date(b), len(chunk),
             )
         for r in chunk:
-            key = (r.sample_request_code, r.product_code)
+            key = (r.sample_request_code, r.product_code, r.sample_date_out)
             if key in seen:
                 continue
             seen.add(key)

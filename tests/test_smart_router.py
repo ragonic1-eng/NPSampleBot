@@ -390,3 +390,63 @@ def test_origin_line_includes_sent_date():
     assert "14 Jul 2026" in out and "📅" in out
     # date-less rows keep the old shape, no dangling separator
     assert "📅" not in _origin_line("China", "FUJIAN ZHAOLU")
+
+
+# ---------- FSL-only customers are found and route directly (HungHau) --------
+
+def test_fsl_only_customer_routes_direct_despite_weak_product_noise(monkeypatch):
+    """'hung hau' must reach '(HungHau Foods Vietnam)' — a customer that
+    exists ONLY in the FSL (not the customer master) — and a threshold-noise
+    product match (score 60) must not force a disambiguation screen."""
+    import datetime as d
+    import sheets
+
+    fsl_rows = [
+        {"Customer Name": "(HungHau Foods Vietnam)", "Product Code": f"S-{i:03d}",
+         "Product Name": "FISH SEASONING", "Sales": "Leo",
+         "Sample Date Out": "1/Jul/2026", "R&D Price": "USD 4.00",
+         "_date": d.date(2026, 7, 1), "Ingested At UTC": "x"}
+        for i in range(5)
+    ]
+    monkeypatch.setattr(sheets, "load_merged_customers", lambda: [])
+    monkeypatch.setattr(sheets, "load_fsl_rows_all", lambda tab=None: fsl_rows)
+    # Product probe returns one barely-over-threshold accident, like UNAGI.
+    monkeypatch.setattr(
+        sheets, "load_seasonings",
+        lambda force=False: [{"name": "UNAGI SEASONING", "code": "S-B6TF1",
+                              "price": "SGD 6.42", "category": "Snack"}],
+    )
+
+    async def reps(errors=None):
+        return ["Leo", "Alex"]
+    monkeypatch.setattr(_botmod, "_active_rep_names", reps)
+
+    routed = {}
+
+    async def fake_ls(update, ctx, mms_name, query, prev, mode=None,
+                      scope=None, **kw):
+        routed.update(query=query, mode=mode, scope=scope)
+    monkeypatch.setattr(_botmod, "_run_lastsample_search", fake_ls)
+
+    async def fake_send(u, text, markup=None):
+        routed.setdefault("sent", []).append(text)
+    monkeypatch.setattr(_botmod, "send", fake_send)
+
+    class Chat:
+        async def send_action(self, *a):
+            pass
+
+    class Upd:
+        effective_chat = Chat()
+        effective_user = type("U", (), {"id": 1, "username": "a"})()
+        effective_message = None
+        callback_query = None
+
+    class Ctx:
+        user_data = {}
+
+    asyncio.get_event_loop().run_until_complete(
+        _botmod._smart_route_text(Upd(), Ctx(), "Hung hau")
+    )
+    assert routed.get("query") == "(HungHau Foods Vietnam)", routed
+    assert routed.get("mode") == "customer" and routed.get("scope") == "all"

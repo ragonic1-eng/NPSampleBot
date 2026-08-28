@@ -5093,12 +5093,48 @@ async def _smart_route_text(
     async def _cust_probe() -> list[dict]:
         try:
             master = await asyncio.to_thread(sheets.load_merged_customers)
-            return matcher.top_customer_master(probe, master, limit=3)
+            hits = matcher.top_customer_master(probe, master, limit=3)
         except Exception as e:  # noqa: BLE001
             log.warning("smart route: customer probe failed: %s", e)
             if _is_transient_data_error(e):
                 data_errors.append(e)
-            return []
+            hits = []
+        # V1.17.33 — ALSO probe the FSL's own customer names. The master
+        # sheet doesn't hold every customer that samples ship to: typing
+        # 'hung hau' found nothing there while '(HungHau Foods Vietnam)'
+        # sat in the FSL with 60 samples. Squish containment (space/punct
+        # stripped) counts as a STRONG match — 'hung hau' ⊂ 'hunghau...' —
+        # so those route straight to the customer view; plain fuzzy hits
+        # are weak (button only). Reads ride the LKG row cache.
+        try:
+            counts: dict[str, int] = {}
+            for _t in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB,
+                       sheets.BANGKOK_FSL_TAB):
+                for _r in await asyncio.to_thread(sheets.load_fsl_rows_all, _t):
+                    _c = (_r.get("Customer Name") or "").strip()
+                    if _c:
+                        counts[_c] = counts.get(_c, 0) + 1
+            probe_sq = re.sub(r"[^a-z0-9]", "", probe.lower())
+            fsl_hits: list[dict] = []
+            if len(probe_sq) >= 4:
+                for _name, _n in counts.items():
+                    name_sq = re.sub(r"[^a-z0-9]", "", _name.lower())
+                    if probe_sq in name_sq:
+                        fsl_hits.append({"name": _name, "score": 95, "_n": _n})
+                    elif _smart_text_match(probe, _name):
+                        fsl_hits.append({"name": _name, "score": 80, "_n": _n})
+            fsl_hits.sort(key=lambda x: (-x["score"], -x["_n"]))
+            seen_names = {" ".join(c.get("name", "").lower().split())
+                          for c in hits}
+            for fh in fsl_hits[:3]:
+                if " ".join(fh["name"].lower().split()) not in seen_names:
+                    hits.append(fh)
+            hits.sort(key=lambda x: -(x.get("score") or 0))
+        except Exception as e:  # noqa: BLE001
+            log.warning("smart route: FSL customer probe failed: %s", e)
+            if _is_transient_data_error(e):
+                data_errors.append(e)
+        return hits[:3]
 
     async def _prod_probe() -> list[dict]:
         try:
@@ -5194,7 +5230,14 @@ async def _smart_route_text(
                     return
 
     # 3) Unambiguous customer → straight to their sample history.
-    if cust_strong and not rep_hits and not prod_hits:
+    # V1.17.33 — weak product noise no longer blocks the direct route. The
+    # fuzzy pool keeps anything scoring >= 60, so 'hung hau' dragged in
+    # 'UNAGI SEASONING' at exactly 60.0 and forced a disambiguation screen
+    # in front of a customer with 60 samples. A strong customer beats
+    # threshold-level product matches; a genuinely strong product match
+    # (>= 75) still triggers the disambiguation buttons.
+    _prod_best = max((s.get("score") or 0 for s in prod_hits), default=0)
+    if cust_strong and not rep_hits and (not prod_hits or _prod_best < 75):
         await _run_lastsample_search(
             update, ctx, mms_name="", query=cust_hits[0]["name"],
             prev="", mode="customer", scope="all",
@@ -9972,6 +10015,13 @@ def main():
         await _schedule_followup_nudges(application)
         await _schedule_monthly_report(application)
         asyncio.create_task(_warm_fsl_tabs())
+        # Read-only capability API for NPMarketingBot (Eli). Inert unless
+        # SIBLING_API_TOKEN is set.
+        try:
+            from sibling_api import start_in_background
+            start_in_background()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not start capability API: %s", e)
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

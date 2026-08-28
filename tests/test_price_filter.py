@@ -253,3 +253,39 @@ def test_country_filter_composes_with_budget():
     assert country == "Vietnam"
     kw, cap = matcher.parse_seasoning_query(cleaned)
     assert kw == "cheese" and cap == 4.5
+
+
+# ---------- full-coverage promotion (hokkaido "(IN DOUGH)" bug) -------------
+
+def test_extra_descriptor_does_not_lose_to_older_plain_names():
+    """A product containing EVERY query word must not rank below older
+    products just because it carries an extra descriptor.
+
+    Real case: 'hokkaido milk' buried 'HOKKAIDO MILK SEASONING (IN DOUGH)'
+    (shipped 24 Aug) under a dozen plain 'HOKKAIDO MILK SEASONING' rows
+    from 2024-2025.
+    """
+    import datetime as d
+    cat = [
+        {"name": "HOKKAIDO MILK SEASONING", "code": "B-OLD1", "price": "USD 3.00",
+         "category": "Snack", "last_sent": d.date(2024, 7, 26)},
+        {"name": "HOKKAIDO MILK SEASONING", "code": "B-OLD2", "price": "USD 3.00",
+         "category": "Snack", "last_sent": d.date(2025, 7, 31)},
+        {"name": "HOKKAIDO MILK SEASONING (IN DOUGH)", "code": "S-NEW",
+         "price": "USD 3.00", "category": "Snack", "last_sent": d.date(2026, 8, 24)},
+    ]
+    res = matcher.top_seasonings("hokkaido milk", cat, limit=3)
+    assert res[0]["code"] == "S-NEW", [r["code"] for r in res]
+
+
+def test_full_coverage_promotion_still_excludes_non_matches():
+    """Promotion must not drag in products missing a query word."""
+    import datetime as d
+    cat = [
+        {"name": "HOKKAIDO MILK SEASONING", "code": "S-1", "price": "USD 3.00",
+         "category": "Snack", "last_sent": d.date(2024, 1, 1)},
+        {"name": "CHEESE SEASONING", "code": "S-2", "price": "USD 3.00",
+         "category": "Snack", "last_sent": d.date(2026, 8, 24)},
+    ]
+    res = matcher.top_seasonings("hokkaido milk", cat, limit=2)
+    assert res[0]["code"] == "S-1", [r["code"] for r in res]

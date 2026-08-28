@@ -360,6 +360,20 @@ def top_seasonings(
         b = fuzz.token_set_ratio(q, c, **kwargs)
         avg = (a + b) / 2
 
+        # Full-coverage promotion (V1.17.32). token_set_ratio ~100 means every
+        # word the rep typed appears in the product name — the product IS what
+        # they asked for; it just carries an extra descriptor. WRatio still
+        # docks it for those extra words (100 -> 90), dragging the average into
+        # a lower relevance band, and since the final sort is band-then-recency
+        # the item loses to ANY plain-named product no matter how old.
+        #
+        # Real case: "hokkaido milk" ranked a dozen 2024-2025 "HOKKAIDO MILK
+        # SEASONING" rows above "HOKKAIDO MILK SEASONING (IN DOUGH)" — which
+        # was the sample actually shipped last week. Treat full-coverage hits
+        # as the same relevance tier and let recency decide between them.
+        if b >= 98:
+            avg = max(avg, b)
+
         # Coverage penalty for multi-token queries.
         # Only count tokens that BOTH look meaningful (≥4 chars) AND appear
         # somewhere in the catalog vocab — that excludes filler words and

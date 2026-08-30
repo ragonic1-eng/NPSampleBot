@@ -86,6 +86,11 @@ GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 # Empty value = feature disabled. Get the chat ID by running /whichchat
 # from inside the group, then set this env var on Railway.
 DAILY_DIGEST_CHAT_ID = os.getenv("DAILY_DIGEST_CHAT_ID", "").strip()
+# Where the daily "samples sent out today" full list goes (18:00 SGT,
+# weekdays). Defaults to Alex's private chat with the bot (user request
+# 2026-08-30: one full list to the admin, not per-rep DMs). Override via
+# env var to redirect to a group chat instead.
+DISPATCH_REMINDER_CHAT_ID = os.getenv("DISPATCH_REMINDER_CHAT_ID", "626790042").strip()
 # Haiku is the default — used by ai.rerank_seasonings() for semantic
 # catalog search ranking. Plenty good for picking among 3–10 fuzzy
 # candidates and ~3x cheaper than Sonnet ($1/$5 input/output per Mtok

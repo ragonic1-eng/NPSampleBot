@@ -9495,14 +9495,10 @@ def _fetch_dispatches_for_day(day: "date") -> list:
     return [r for r in rows if r.sample_date_out_as_date() == day]
 
 
-def _dispatch_reminder_text(rows: list, day: "date") -> str:
-    """Render one reminder message for a list of SampleRows (one rep)."""
+def _dispatch_rows_body(rows: list, day: "date") -> str:
+    """Render the per-sample blocks (user-spec fields) without a header."""
     day_str = day.strftime("%d %b %Y")
-    n = len(rows)
-    lines = [
-        f"📦 <b>Sample{'s' if n != 1 else ''} sent out today</b>",
-        "",
-    ]
+    lines: list[str] = []
     for r in rows:
         code = (r.product_code or "—").strip().upper()
         lines.extend([
@@ -9517,14 +9513,15 @@ def _dispatch_reminder_text(rows: list, day: "date") -> str:
 
 
 async def _dispatch_reminder_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily: DM each rep the samples of theirs that went OUT today.
+    """Daily: send the admin ONE full list of every sample that went OUT
+    today, grouped by rep so attribution is visible at a glance.
 
-    Fields per sample (user spec): sample date out, product name, product
-    code, customer, R&D price. R&D price is passed through exactly as MMS
-    reports it (J-codes already carry IDR), so the Indonesia reps see IDR.
-    Silent when nothing was dispatched. Rows whose rep has no Telegram ID
-    on the Authorized Users tab are rolled into one message to the digest
-    chat so no dispatch goes unreported.
+    User 2026-08-30: replaced the original per-rep DM design — the admin
+    wants the whole day's dispatch list in one place, not split across
+    rep DMs. Fields per sample (user spec): sample date out, product
+    name, product code, customer, R&D price. R&D price is passed through
+    exactly as MMS reports it (J-codes already carry IDR). Silent when
+    nothing was dispatched.
     """
     today = _sgt_now().date()
     try:
@@ -9535,69 +9532,62 @@ async def _dispatch_reminder_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not rows:
         log.info("dispatch reminder: nothing sent out %s", today)
         return
-    # rep MMS name -> telegram id (same mapping as followup nudges)
-    tg_by_rep: dict[str, int] = {}
-    try:
-        users = await asyncio.to_thread(sheets.load_users, True)
-        for row in users:
-            active = str(sheets._row_get_loose(row, "Active")).strip().lower()
-            if active not in {"y", "yes", "true", "1"}:
-                continue
-            mms = str(sheets._row_get_loose(row, "MMS Name")).strip()
-            tid = str(sheets._row_get_loose(row, "Telegram User ID")).strip()
-            if mms and tid.isdigit():
-                tg_by_rep[mms.lower()] = int(tid)
-    except Exception as e:  # noqa: BLE001
-        log.warning("dispatch reminder: load_users failed: %s", e)
+    chat_id = config.DISPATCH_REMINDER_CHAT_ID
+    if not chat_id:
+        log.warning("dispatch reminder: DISPATCH_REMINDER_CHAT_ID unset — skipped")
+        return
+    for chunk in _dispatch_full_list_chunks(rows, today):
+        try:
+            await ctx.bot.send_message(
+                chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("dispatch reminder send failed: %s", e)
+            return
+    log.info("dispatch reminder: %d rows sent to %s", len(rows), chat_id)
+
+
+def _dispatch_full_list_chunks(rows: list, day: "date") -> list[str]:
+    """Render the whole day's dispatches, grouped by rep, split into
+    messages that respect Telegram's 4096-char cap (36 samples in one
+    day is a real case and blows past a single message)."""
+    day_str = day.strftime("%d %b %Y")
     per_rep: dict[str, list] = {}
-    orphans: list = []
     for r in rows:
-        rep = (r.sales or "").strip()
-        if rep.lower() in tg_by_rep:
-            per_rep.setdefault(rep, []).append(r)
-        else:
-            orphans.append(r)
-    sent = 0
-    for rep, rep_rows in per_rep.items():
-        try:
-            await ctx.bot.send_message(
-                chat_id=tg_by_rep[rep.lower()],
-                text=_dispatch_reminder_text(rep_rows, today),
-                parse_mode=ParseMode.HTML,
-            )
-            sent += 1
-        except Exception as e:  # noqa: BLE001
-            log.warning("dispatch reminder DM to %s failed: %s", rep, e)
-    if orphans and config.DAILY_DIGEST_CHAT_ID:
-        by_rep_note = ", ".join(sorted({
-            (r.sales or "?").strip() or "?" for r in orphans
-        }))
-        try:
-            await ctx.bot.send_message(
-                chat_id=config.DAILY_DIGEST_CHAT_ID,
-                text=(
-                    _dispatch_reminder_text(orphans, today)
-                    + f"\n\n<i>(sent by {h(by_rep_note)} — no Telegram ID on "
-                    "the Authorized Users tab, so posted here instead)</i>"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("dispatch reminder digest post failed: %s", e)
-    log.info(
-        "dispatch reminder: %d rows, %d reps DMed, %d without Telegram ID",
-        len(rows), sent, len(orphans),
+        per_rep.setdefault((r.sales or "?").strip() or "?", []).append(r)
+    header = (
+        f"📦 <b>Samples sent out — {day_str}</b>\n"
+        f"<i>{len(rows)} sample{'s' if len(rows) != 1 else ''} · "
+        f"{len(per_rep)} rep{'s' if len(per_rep) != 1 else ''}</i>"
     )
+    blocks: list[str] = []
+    for rep in sorted(per_rep, key=str.lower):
+        rep_rows = per_rep[rep]
+        blocks.append(
+            f"👔 <b>{h(rep)}</b> — {len(rep_rows)} "
+            f"sample{'s' if len(rep_rows) != 1 else ''}\n"
+            + _dispatch_rows_body(rep_rows, day)
+        )
+    chunks: list[str] = []
+    cur = header
+    for b in blocks:
+        if len(cur) + len(b) + 2 > 3800:
+            chunks.append(cur)
+            cur = b
+        else:
+            cur = f"{cur}\n\n{b}"
+    chunks.append(cur)
+    return chunks
 
 
 async def cmd_sentout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Manual dispatch-reminder check — admin-only.
 
-    /sentout              → your view of what went out today (all reps)
+    /sentout              → the full sent-out list for today (all reps)
     /sentout 2026-08-28   → same, for a specific date (testing / catch-up)
 
-    Shows the result directly in this chat rather than DMing reps, so the
-    admin can preview without spamming the team.
+    Shows the result directly in this chat — identical rendering to the
+    scheduled daily message.
     """
     if not await _authorized(update):
         return
@@ -9621,16 +9611,12 @@ async def cmd_sentout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await send(update, f"📭 Nothing sent out on {day.strftime('%d %b %Y')}.")
         return
-    # Group by rep so the admin sees who would receive what.
-    per_rep: dict[str, list] = {}
-    for r in rows:
-        per_rep.setdefault((r.sales or "?").strip() or "?", []).append(r)
-    chunks = []
-    for rep in sorted(per_rep):
-        chunks.append(f"👔 <b>{h(rep)}</b>")
-        chunks.append(_dispatch_reminder_text(per_rep[rep], day))
-        chunks.append("")
-    await send(update, "\n".join(chunks).rstrip())
+    # Same renderer as the scheduled job — what you preview is exactly
+    # what the daily 18:00 message will look like.
+    chunks = _dispatch_full_list_chunks(rows, day)
+    for i, chunk in enumerate(chunks):
+        # Footer only on the last chunk to avoid repeating it.
+        await send(update, chunk, with_footer=(i == len(chunks) - 1))
 
 
 async def _schedule_dispatch_reminder(application: Application) -> None:

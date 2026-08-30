@@ -3688,17 +3688,39 @@ async def _run_lastsample_search(
                 ("🔎 Find another", again_cb),
                 ("🏠 Main menu", "menu:home"),
             ])
-            intro = [
-                f"🤔 <b>No products matched {h(query)}.</b>",
-                "",
-                f"But I found <b>{len(sorted_customers)}</b> customer"
-                f"{'s' if len(sorted_customers) != 1 else ''} "
-                + (
-                    "in Full Sample Listing"
-                    if scope == "all"
-                    else "you've sent samples to"
+            # V1.17.34 — 'No products matched X' is only true (and only
+            # makes sense to say) when this call actually searched products.
+            # In mode='customer' (the disambiguation button, or the router's
+            # direct customer jump) product_candidates is forced empty by
+            # design, so the old unconditional wording claimed a product
+            # search that never ran — self-contradictory when the reply also
+            # says customers WERE found for that same name.
+            if mode == "customer":
+                found_line = (
+                    f"👤 Found <b>{len(sorted_customers)}</b> customer"
+                    f"{'s' if len(sorted_customers) != 1 else ''} "
+                    + (
+                        "in Full Sample Listing"
+                        if scope == "all"
+                        else "you've sent samples to"
+                    )
+                    + f" with <b>{h(query)}</b> in the name."
                 )
-                + f" with <b>{h(query)}</b> in the name.",
+            else:
+                found_line = (
+                    f"🤔 <b>No products matched {h(query)}.</b>"
+                    "\n\n"
+                    f"But I found <b>{len(sorted_customers)}</b> customer"
+                    f"{'s' if len(sorted_customers) != 1 else ''} "
+                    + (
+                        "in Full Sample Listing"
+                        if scope == "all"
+                        else "you've sent samples to"
+                    )
+                    + f" with <b>{h(query)}</b> in the name."
+                )
+            intro = [
+                found_line,
                 "",
                 "<b>Tap one to see their last 10 samples:</b>",
             ]
@@ -3738,21 +3760,46 @@ async def _run_lastsample_search(
         sync_tail = f"\n\n<i>{sync_footer}</i>" if sync_footer else ""
 
         all_scope_hits: list[dict] = []
-        code_in_query = _PP_CODE_RE.findall(query) if scope == "self" else []
-        if scope == "self":
+        # V1.17.34 — the all-reps peek only searches PRODUCTS, so it's
+        # meaningless (and its 'show all-reps result' button misleading) in
+        # mode='customer', which never searches products at all.
+        code_in_query = (
+            _PP_CODE_RE.findall(query) if scope == "self" and mode != "customer" else []
+        )
+        if scope == "self" and mode != "customer":
             try:
                 all_rows = await _load_lastsample_rows(scope="all")
                 all_scope_hits = _filter_lastsample_products(all_rows, query)
             except Exception as e:  # noqa: BLE001
                 log.warning("lastsample no-match all-scope peek failed: %s", e)
 
-        body_lines = [
-            "🙈 <b>No product found in your sample request list.</b>",
-            "",
-            f"Nothing {whose} has <b>{h(query)}</b> in the Product Name "
-            "or Customer Name. Double-check the spelling, or try a "
-            "different keyword.",
-        ]
+        # V1.17.34 — match the headline and "Nothing has X in ..." wording
+        # to what this call actually searched (mode's documented contract:
+        # auto=both, product=Product Name only, customer=Customer Name
+        # only). Saying 'no product found' / 'Product Name or Customer
+        # Name' when only one of the two was ever searched is misleading.
+        if mode == "product":
+            body_lines = [
+                "🙈 <b>No product found in your sample request list.</b>",
+                "",
+                f"Nothing {whose} has <b>{h(query)}</b> in the Product Name. "
+                "Double-check the spelling, or try a different keyword.",
+            ]
+        elif mode == "customer":
+            body_lines = [
+                "🙈 <b>No customer found in your sample request list.</b>",
+                "",
+                f"Nothing {whose} has <b>{h(query)}</b> in the Customer Name. "
+                "Double-check the spelling, or try a different keyword.",
+            ]
+        else:
+            body_lines = [
+                "🙈 <b>No product found in your sample request list.</b>",
+                "",
+                f"Nothing {whose} has <b>{h(query)}</b> in the Product Name "
+                "or Customer Name. Double-check the spelling, or try a "
+                "different keyword.",
+            ]
         extra_btn_rows: list[list[tuple[str, str]]] = []
 
         if scope == "self" and all_scope_hits:
@@ -5120,7 +5167,22 @@ async def _smart_route_text(
                 for _name, _n in counts.items():
                     name_sq = re.sub(r"[^a-z0-9]", "", _name.lower())
                     if probe_sq in name_sq:
-                        fsl_hits.append({"name": _name, "score": 95, "_n": _n})
+                        # V1.17.34 — a flat 95 here made 'Pran' outscore an
+                        # exact 'Pran Foods Ltd' master match by landing as a
+                        # PREFIX of the much longer, unrelated 'Prantalay
+                        # Marketing Public Company Limited' (containment says
+                        # nothing about relevance when the name dwarfs the
+                        # query). Require the query to cover a meaningful
+                        # share of the squished name — or just be long enough
+                        # to be specific on its own — before treating the
+                        # containment as a STRONG (auto-route) signal; a
+                        # short query buried in a much longer name is only a
+                        # weak hint.
+                        ratio = len(probe_sq) / len(name_sq) if name_sq else 0
+                        if ratio >= 0.3 or len(probe_sq) >= 8:
+                            fsl_hits.append({"name": _name, "score": 95, "_n": _n})
+                        else:
+                            fsl_hits.append({"name": _name, "score": 70, "_n": _n})
                     elif _smart_text_match(probe, _name):
                         fsl_hits.append({"name": _name, "score": 80, "_n": _n})
             fsl_hits.sort(key=lambda x: (-x["score"], -x["_n"]))
@@ -5168,6 +5230,16 @@ async def _smart_route_text(
     )
     rep_hits, rep_strong = _match_rep_names(probe, rep_names)
     cust_strong = bool(cust_hits) and cust_hits[0].get("score", 0) >= 90
+    # V1.17.34 — 'strong' must also be UNIQUE before the router auto-jumps
+    # straight to cust_hits[0]. A short query like 'Pran' scores >= 90
+    # against several distinct companies at once ('Pran Agro', 'Pran Ago
+    # Ltd', 'Pran Foods Ltd' all contain it) — picking just the first one
+    # silently hides the others the rep may have meant. Only skip the
+    # disambiguation step when the runner-up isn't itself a strong (>= 90)
+    # match, i.e. there's genuinely one standout candidate.
+    cust_ambiguous = (
+        len(cust_hits) > 1 and cust_hits[1].get("score", 0) >= 90
+    )
 
     # Data source hiccuped AND nothing matched → this is almost certainly the
     # outage talking, not a real miss. Tell the rep to retry rather than
@@ -5237,7 +5309,10 @@ async def _smart_route_text(
     # threshold-level product matches; a genuinely strong product match
     # (>= 75) still triggers the disambiguation buttons.
     _prod_best = max((s.get("score") or 0 for s in prod_hits), default=0)
-    if cust_strong and not rep_hits and (not prod_hits or _prod_best < 75):
+    if (
+        cust_strong and not cust_ambiguous and not rep_hits
+        and (not prod_hits or _prod_best < 75)
+    ):
         await _run_lastsample_search(
             update, ctx, mms_name="", query=cust_hits[0]["name"],
             prev="", mode="customer", scope="all",

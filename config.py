@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv(override=False)
 
 # Bot version — only bump when the user explicitly asks.
-BOT_VERSION = "V1.17.19"
+BOT_VERSION = "V1.17.20"
 
 # DHL Express + FedEx login credentials used by awb_sync to scrape recent
 # shipments. NEVER commit values to .env — set them on Railway's

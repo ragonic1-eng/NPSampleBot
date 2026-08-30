@@ -9468,6 +9468,189 @@ async def _schedule_followup_nudges(application: Application) -> None:
     log.info("followup nudges scheduled: Mondays 09:00 SGT")
 
 
+# --------------------------- sent-out-today reminder -----------------------
+
+def _fetch_dispatches_for_day(day: "date") -> list:
+    """Synchronous: pull MMS submissions whose Sample Date Out == `day`.
+
+    Queries MMS live (search_samples filters by Sample Date Out) rather
+    than reading the Submissions tabs, so the reminder never depends on
+    how recently a sheet sync ran. Rows with a blank date-out are
+    dropped — search_samples keeps them (its client filter passes
+    undated rows through), but an undated row by definition didn't go
+    out today.
+    """
+    import requests
+
+    import mms_client
+
+    user = config.MMS_USER
+    pw = config.MMS_PASSWORD
+    if not (user and pw):
+        raise RuntimeError("MMS credentials missing (MMS_USER / MMS_PASSWORD)")
+    session = requests.Session()
+    if not mms_client.login(session, user, pw):
+        raise RuntimeError("MMS login failed (check creds)")
+    rows = mms_client.search_samples(session, day, day)
+    return [r for r in rows if r.sample_date_out_as_date() == day]
+
+
+def _dispatch_reminder_text(rows: list, day: "date") -> str:
+    """Render one reminder message for a list of SampleRows (one rep)."""
+    day_str = day.strftime("%d %b %Y")
+    n = len(rows)
+    lines = [
+        f"📦 <b>Sample{'s' if n != 1 else ''} sent out today</b>",
+        "",
+    ]
+    for r in rows:
+        code = (r.product_code or "—").strip().upper()
+        lines.extend([
+            f"Sample date out: <b>{day_str}</b>",
+            f"Product name: <b>{h((r.product_name or '—').strip())}</b>",
+            f"Product code: <code>{h(code)}</code>",
+            f"For customer: <b>{h((r.customer_name or '—').strip())}</b>",
+            f"R&amp;D price: {h((r.rd_price or '—').strip())}",
+            "",
+        ])
+    return "\n".join(lines).rstrip()
+
+
+async def _dispatch_reminder_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily: DM each rep the samples of theirs that went OUT today.
+
+    Fields per sample (user spec): sample date out, product name, product
+    code, customer, R&D price. R&D price is passed through exactly as MMS
+    reports it (J-codes already carry IDR), so the Indonesia reps see IDR.
+    Silent when nothing was dispatched. Rows whose rep has no Telegram ID
+    on the Authorized Users tab are rolled into one message to the digest
+    chat so no dispatch goes unreported.
+    """
+    today = _sgt_now().date()
+    try:
+        rows = await asyncio.to_thread(_fetch_dispatches_for_day, today)
+    except Exception as e:  # noqa: BLE001
+        log.warning("dispatch reminder: MMS fetch failed: %s", e)
+        return
+    if not rows:
+        log.info("dispatch reminder: nothing sent out %s", today)
+        return
+    # rep MMS name -> telegram id (same mapping as followup nudges)
+    tg_by_rep: dict[str, int] = {}
+    try:
+        users = await asyncio.to_thread(sheets.load_users, True)
+        for row in users:
+            active = str(sheets._row_get_loose(row, "Active")).strip().lower()
+            if active not in {"y", "yes", "true", "1"}:
+                continue
+            mms = str(sheets._row_get_loose(row, "MMS Name")).strip()
+            tid = str(sheets._row_get_loose(row, "Telegram User ID")).strip()
+            if mms and tid.isdigit():
+                tg_by_rep[mms.lower()] = int(tid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("dispatch reminder: load_users failed: %s", e)
+    per_rep: dict[str, list] = {}
+    orphans: list = []
+    for r in rows:
+        rep = (r.sales or "").strip()
+        if rep.lower() in tg_by_rep:
+            per_rep.setdefault(rep, []).append(r)
+        else:
+            orphans.append(r)
+    sent = 0
+    for rep, rep_rows in per_rep.items():
+        try:
+            await ctx.bot.send_message(
+                chat_id=tg_by_rep[rep.lower()],
+                text=_dispatch_reminder_text(rep_rows, today),
+                parse_mode=ParseMode.HTML,
+            )
+            sent += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("dispatch reminder DM to %s failed: %s", rep, e)
+    if orphans and config.DAILY_DIGEST_CHAT_ID:
+        by_rep_note = ", ".join(sorted({
+            (r.sales or "?").strip() or "?" for r in orphans
+        }))
+        try:
+            await ctx.bot.send_message(
+                chat_id=config.DAILY_DIGEST_CHAT_ID,
+                text=(
+                    _dispatch_reminder_text(orphans, today)
+                    + f"\n\n<i>(sent by {h(by_rep_note)} — no Telegram ID on "
+                    "the Authorized Users tab, so posted here instead)</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("dispatch reminder digest post failed: %s", e)
+    log.info(
+        "dispatch reminder: %d rows, %d reps DMed, %d without Telegram ID",
+        len(rows), sent, len(orphans),
+    )
+
+
+async def cmd_sentout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Manual dispatch-reminder check — admin-only.
+
+    /sentout              → your view of what went out today (all reps)
+    /sentout 2026-08-28   → same, for a specific date (testing / catch-up)
+
+    Shows the result directly in this chat rather than DMing reps, so the
+    admin can preview without spamming the team.
+    """
+    if not await _authorized(update):
+        return
+    if not _is_update_sample_owner(update.effective_user):
+        await send(update, "🛑 This command is admin-only.")
+        return
+    day = _sgt_now().date()
+    if ctx.args:
+        try:
+            day = datetime.strptime(ctx.args[0], "%Y-%m-%d").date()
+        except ValueError:
+            await send(update, "🤏 Date must be YYYY-MM-DD, e.g. /sentout 2026-08-28")
+            return
+    await send(update, f"🔎 Checking MMS for samples sent out {day.strftime('%d %b %Y')}…",
+               with_footer=False)
+    try:
+        rows = await asyncio.to_thread(_fetch_dispatches_for_day, day)
+    except Exception as e:  # noqa: BLE001
+        await send(update, f"😕 MMS fetch failed: {h(str(e)[:200])}")
+        return
+    if not rows:
+        await send(update, f"📭 Nothing sent out on {day.strftime('%d %b %Y')}.")
+        return
+    # Group by rep so the admin sees who would receive what.
+    per_rep: dict[str, list] = {}
+    for r in rows:
+        per_rep.setdefault((r.sales or "?").strip() or "?", []).append(r)
+    chunks = []
+    for rep in sorted(per_rep):
+        chunks.append(f"👔 <b>{h(rep)}</b>")
+        chunks.append(_dispatch_reminder_text(per_rep[rep], day))
+        chunks.append("")
+    await send(update, "\n".join(chunks).rstrip())
+
+
+async def _schedule_dispatch_reminder(application: Application) -> None:
+    from datetime import time as _time
+    jq = application.job_queue
+    if jq is None:
+        log.warning("JobQueue not available — dispatch reminder NOT scheduled.")
+        return
+    sgt = ZoneInfo("Asia/Singapore")
+    # 18:00 SGT Mon-Fri — after the 17:40 MMS sync window, end of the
+    # working day when the day's dispatches are all logged in MMS.
+    jq.run_daily(
+        _dispatch_reminder_job,
+        time=_time(hour=18, minute=0, tzinfo=sgt),
+        days=(0, 1, 2, 3, 4),
+        name="dispatch_reminder_daily",
+    )
+    log.info("dispatch reminder scheduled: Mon-Fri 18:00 SGT")
+
+
 # --------------------------- monthly auto-report (V1.17.28) ----------------
 
 async def _monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -10012,6 +10195,7 @@ def main():
     app.add_handler(CommandHandler("whichchat", cmd_whichchat))
     app.add_handler(CommandHandler("sampleupdate", cmd_sampleupdate))
     app.add_handler(CommandHandler("syncawb", cmd_syncawb))
+    app.add_handler(CommandHandler("sentout", cmd_sentout))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("watch", cmd_watch))
@@ -10088,6 +10272,7 @@ def main():
         await _schedule_awb_sync(application)
         await _schedule_watch_check(application)
         await _schedule_followup_nudges(application)
+        await _schedule_dispatch_reminder(application)
         await _schedule_monthly_report(application)
         asyncio.create_task(_warm_fsl_tabs())
         # Read-only capability API for NPMarketingBot (Eli). Inert unless

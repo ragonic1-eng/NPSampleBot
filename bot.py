@@ -6568,6 +6568,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat = update.effective_chat
 
+    # /sr draft buttons (admin-only feature; the command gate already ran
+    # when the draft was built, and drafts are keyed by random token).
+    if data.startswith("srb:"):
+        await _sr_callback(update, ctx, data)
+        return
+
     # NOTE: a kb_owner ownership check used to live here to refuse cross-user
     # button taps in groups. It was firing false positives — legitimate
     # owners getting rejected on their own buttons — so it's disabled.
@@ -9619,6 +9625,199 @@ async def cmd_sentout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send(update, chunk, with_footer=(i == len(chunks) - 1))
 
 
+# --------------------------- /sr — raise a sample request (v1, Alex-only) --
+
+def _sr_draft_text(draft: dict) -> str:
+    import sample_request as srq
+    d = draft["derived"]
+    lines = [
+        f"📋 <b>Draft sample request — {h(draft['customer'])}</b>",
+        f"SR: <code>{h(draft['sr_code'] or '— none found —')}</code> · "
+        f"{h(draft['territory'])}",
+        "",
+        f"Type: <b>{d['rtype_label']}</b>"
+        + (f" — base <code>{h(d['base_code'])}</code>" if d["base_code"] else "")
+        + " <i>(inferred from your ask)</i>",
+        f"Qty: <b>{d['qty']} g × {d['sets']} set"
+        f"{'s' if d['sets'] != 1 else ''}</b> <i>({h(d['qty_src'])})</i>",
+    ]
+    lines.append(f"Bag: <b>{h(draft['bag'] or '❓ not known yet')}</b>"
+                 + (" <i>(remembered)</i>" if draft["bag"] else ""))
+    if draft["budget"]:
+        lines.append(f"Budget: <b>{h(draft['budget'])}</b> "
+                     f"<i>({h(d.get('budget_src') or 'remembered')})</i>")
+    lines.append(f"Compliance: <b>{h(draft['compliance'] or '—')}</b>")
+    ship_bits = " · ".join(x for x in (draft["attn"], draft["contact"]) if x)
+    lines.append(f"Ship to: <b>{h(ship_bits or '❓ not known yet')}</b>")
+    if draft["addr"]:
+        lines.append(f"           {h(draft['addr'][:90])}")
+    lines.append(f"R&amp;D: <b>{h(draft['assignee'])}</b> "
+                 f"<i>({h(draft['territory'])} territory — tap ✏️ note below to change)</i>")
+    lines.append(f"Need by: <b>{h(draft['need_by'] or 'STANDARD (~1 week)')}</b>")
+    if draft.get("page_err"):
+        lines.append(f"\n⚠️ <i>{h(draft['page_err'])}</i>")
+    if draft["missing"]:
+        lines.append(
+            "\n❓ <b>First time for this customer — I need, once:</b> "
+            + ", ".join(draft["missing"])
+            + "\n<i>Resend with e.g. "
+            "…; bag: NP; attn: NAME; contact: +65…; addr: FULL ADDRESS</i>"
+        )
+    lines.append("\n<b>Will write into MMS:</b>")
+    lines.append(f"<pre>{h(srq.render_reqnote(draft))}</pre>")
+    lines.append("<i>Nothing is submitted until you tap ✅.</i>")
+    return "\n".join(lines)
+
+
+def _sr_draft_kb(draft: dict):
+    t = draft["token"]
+    rows = [[
+        ("📅 This week", f"srb:nb:{t}:5"),
+        ("📅 Next week", f"srb:nb:{t}:12"),
+        ("📅 2 weeks+", f"srb:nb:{t}:21"),
+    ]]
+    if not draft["bag"]:
+        rows.append([("👝 NP bag", f"srb:bag:{t}:NP bag"),
+                     ("👝 Empty bag", f"srb:bag:{t}:Empty bag")])
+    rows.append([("✅ Raise it in MMS", f"srb:go:{t}"),
+                 ("❌ Discard", f"srb:x:{t}")])
+    return kb(rows)
+
+
+async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Raise an MMS sample request from one line — v1, admin-only.
+
+    /sr haritage — mala crawfish 200g
+    /sr <…>; bag: empty; budget: usd 4-5; compliance: MY SG; attn: …
+    /sr dry <…>   → build the draft, never offer submission
+    /sr test      → reversible write test (additem→clear) on the probe SR
+    """
+    import sample_request as srq
+    if not await _authorized(update):
+        return
+    if not _is_update_sample_owner(update.effective_user):
+        await send(update, "🛑 /sr is limited to the admin while in trial.")
+        return
+    text = " ".join(ctx.args or []).strip()
+    if not text:
+        await send(update,
+                   "✍️ <b>Usage:</b> <code>/sr customer — what you want 200g</code>\n"
+                   "Options after ';' — bag / budget / compliance / attn / "
+                   "contact / addr / type / base / assignee.\n"
+                   "<code>/sr dry …</code> preview only · <code>/sr test</code> "
+                   "reversible MMS write test.")
+        return
+    if text.lower() == "test":
+        probe = config.MMS_PROBE_SR_CODE
+        if not probe:
+            await send(update, "🛑 MMS_PROBE_SR_CODE unset — no safe test target.")
+            return
+        await send(update, f"🧪 Testing additem→clear on <code>{h(probe)}</code>…",
+                   with_footer=False)
+        try:
+            w = srq.SRWriter()
+            if not w.login():
+                await send(update, "🛑 MMS login failed — stopping (no retry).")
+                return
+            result = await asyncio.to_thread(w.test_cycle, probe)
+        except Exception as e:  # noqa: BLE001
+            result = f"FAIL: {e}"
+        await send(update, f"🧪 <code>{h(result)}</code>")
+        return
+    dry = False
+    if text.lower().startswith("dry "):
+        dry, text = True, text[4:].strip()
+    await send(update, "🔎 Assembling the draft…", with_footer=False)
+    try:
+        draft = await asyncio.to_thread(
+            srq.build_draft, update.effective_user.id, text)
+    except Exception as e:  # noqa: BLE001
+        log.exception("sr build_draft failed")
+        await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
+        return
+    if draft.get("error") == "ambiguous":
+        names = "\n".join(
+            f"  • {h(c.get('name', ''))}" for c in draft["candidates"]) or "  (none)"
+        await send(update,
+                   f"🤔 <b>{h(draft['customer_text'])}</b> matches more than one "
+                   f"customer:\n{names}\n\nResend /sr with the fuller name.")
+        return
+    if dry:
+        draft["missing"] = draft["missing"] or []
+        await send(update, _sr_draft_text(draft) +
+                   "\n\n<i>(dry run — no submit buttons)</i>")
+        srq.DRAFTS.pop(draft["token"], None)
+        return
+    await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
+
+
+async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                       data: str) -> None:
+    import sample_request as srq
+    parts = data.split(":", 3)  # srb : verb : token [: arg]
+    verb, token = parts[1], parts[2]
+    arg = parts[3] if len(parts) > 3 else ""
+    draft = srq.DRAFTS.get(token)
+    if draft is None:
+        await send(update, "⌛ That draft has expired (bot restarted). "
+                           "Resend the /sr line — it takes one message.")
+        return
+    if verb == "x":
+        srq.DRAFTS.pop(token, None)
+        await send(update, "🗑 Draft discarded.")
+        return
+    if verb == "nb":
+        days = int(arg or 7)
+        target = (_sgt_now() + timedelta(days=days)).strftime("%d %b %Y").upper()
+        draft["need_by"] = f"BY {target}"
+        await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
+        return
+    if verb == "bag":
+        draft["bag"] = arg
+        draft["missing"] = [m for m in draft["missing"] if m != "bag"]
+        await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
+        return
+    if verb == "go":
+        if not draft["sr_code"]:
+            await send(update,
+                       "🛑 No existing SR for this customer — creating brand-new "
+                       "SRs isn't wired up yet (sampleRequestCreate.do). Raise "
+                       "the empty SR once in MMS, then /sr works for them.")
+            return
+        await send(update, "📨 Writing to MMS… (each step is verified)",
+                   with_footer=False)
+        reqnote = srq.render_reqnote(draft)
+        d = draft["derived"]
+        try:
+            w = srq.SRWriter()
+            if not w.login():
+                await send(update, "🛑 MMS login failed — stopping (no retry).")
+                return
+            result = await asyncio.to_thread(
+                w.add_item_and_request, draft["sr_code"], d["rtype"],
+                d.get("base_code", ""), reqnote, draft["assignee"],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("sr submit crashed")
+            await send(update, f"🛑 Submit crashed: {h(str(e)[:200])} — "
+                               "check the SR in MMS before retrying.")
+            return
+        if result.get("ok"):
+            srq.DRAFTS.pop(token, None)
+            await asyncio.to_thread(srq.remember_submitted, draft)
+            await send(update,
+                       f"✅ <b>Raised.</b> {h(result['detail'])} on "
+                       f"<code>{h(draft['sr_code'])}</code>.\n"
+                       f"<i>Defaults for {h(draft['customer'])} updated from "
+                       "this request.</i>")
+        else:
+            await send(update,
+                       f"🛑 <b>Not submitted:</b> {h(result.get('detail', '?'))}\n"
+                       f"<i>Draft kept — fix and tap ✅ again, or check "
+                       f"<code>{h(draft['sr_code'])}</code> in MMS.</i>")
+        return
+
+
 async def _schedule_dispatch_reminder(application: Application) -> None:
     from datetime import time as _time
     jq = application.job_queue
@@ -10182,6 +10381,7 @@ def main():
     app.add_handler(CommandHandler("sampleupdate", cmd_sampleupdate))
     app.add_handler(CommandHandler("syncawb", cmd_syncawb))
     app.add_handler(CommandHandler("sentout", cmd_sentout))
+    app.add_handler(CommandHandler("sr", cmd_sr))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("watch", cmd_watch))

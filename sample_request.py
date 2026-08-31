@@ -202,9 +202,12 @@ def _structure_body(a: Ask, body: list[str]) -> None:
     blocks: list[dict] = []
     current: dict | None = None
     intro: list[str] = []
+    first_num = 0
     for line in body:
         m = _NUM_ITEM.match(line)
         if m:
+            if not blocks:
+                first_num = int(m.group(1))
             # 'name - spec' on the same numbered line → split once
             rest = m.group(2).strip()
             parts = re.split(r"\s+[-–—]\s+", rest, 1)
@@ -215,6 +218,33 @@ def _structure_body(a: Ask, body: list[str]) -> None:
             current["spec"].append(line)
         else:
             intro.append(line)
+    if blocks and first_num == 2 and intro:
+        # The rep numbered from 2 — flavour 1 exists but unnumbered (its spec
+        # follows a 'Customer want X:' style line). Recover it, or refuse to
+        # structure at all: a 2-of-3 block list writes the wrong flavour
+        # count into MMS (the Pran 3-flavour request shipped as '2 flavours').
+        from rapidfuzz import fuzz
+        blk_sq = [re.sub(r"[^a-z0-9]", "", b["name"].lower()) for b in blocks]
+        missing = []  # leading short name-list lines matching no block
+        for line in intro:
+            s = line.strip().rstrip(".")
+            if not (0 < len(s) <= 48):
+                break
+            sq = re.sub(r"[^a-z0-9]", "", s.lower())
+            if sq and not any(fuzz.ratio(sq, b) >= 90 for b in blk_sq):
+                missing.append((s, sq))
+        hdr_idx = -1
+        if len(missing) == 1:
+            name, name_sq = missing[0]
+            for i in range(len(intro) - 1, 0, -1):
+                if name_sq in re.sub(r"[^a-z0-9]", "", intro[i].lower()):
+                    hdr_idx = i
+                    break
+        if hdr_idx > 0:
+            blocks.insert(0, {"name": name, "spec": intro[hdr_idx + 1:]})
+            intro = intro[:hdr_idx + 1]
+        else:
+            return  # can't recover flavour 1 — verbatim beats a wrong count
     if len(blocks) < 2:
         return  # nothing to structure confidently
     # Drop an intro line that just re-lists the flavour names (Alex's head
@@ -421,8 +451,11 @@ async def llm_parse(text: str) -> dict | None:
     working silently)."""
     import ai
     try:
+        # 1000, not 300: the JSON echoes the whole ask, and a 3-flavour spec
+        # alone is ~400 tokens — truncation made _json_from fail on exactly
+        # the long messages this parser exists for (regex fallback hid it).
         out, _, _ = await ai._ask(  # noqa: SLF001 — house helper
-            _PARSE_PROMPT.format(text=text), max_tokens=300)
+            _PARSE_PROMPT.format(text=text), max_tokens=1000)
         d = _json_from(out)
         if d and d.get("customer") and d.get("ask"):
             return d
@@ -597,6 +630,11 @@ def _plausible(query: str, name: str) -> bool:
     return False
 
 
+def _distinct_tokens(s: str) -> frozenset:
+    return frozenset(t for t in re.findall(r"[a-z0-9]+", s.lower())
+                     if t not in _GENERIC_TOKENS and len(t) >= 3)
+
+
 def resolve_customer(q: str) -> tuple[dict | None, list[dict]]:
     """Best customer + runner-up candidates from master + FSL names."""
     merged = sheets.load_merged_customers()
@@ -622,6 +660,19 @@ def resolve_customer(q: str) -> tuple[dict | None, list[dict]]:
     hits.sort(key=lambda x: -(x.get("score") or 0))
     if not hits:
         return None, []
+    # Dominant match: a candidate whose DISTINCTIVE tokens equal the query's
+    # exactly IS the customer — never ask. 'pran food' → {'pran'} equals
+    # 'Pran Foods Ltd' → {'pran'}, so the FSL alias '(F.B.M Technologies
+    # Ltd (Pran Foods))' ({'technologies','pran'}) can't force a pointless
+    # 'which one did you mean?'. Ties (spelling variants of the same entity)
+    # go to the best fuzzy score, then to the entry with a customer code.
+    q_set = _distinct_tokens(q)
+    if q_set:
+        exact = [x for x in hits if _distinct_tokens(x.get("name", "")) == q_set]
+        if exact:
+            exact.sort(key=lambda x: (-(x.get("score") or 0),
+                                      not x.get("code")))
+            return exact[0], hits[:3]
     strong = hits[0].get("score", 0) >= 90
     ambiguous = len(hits) > 1 and hits[1].get("score", 0) >= 90
     return (hits[0] if strong and not ambiguous else None), hits[:3]

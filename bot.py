@@ -10001,16 +10001,25 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if draft.get("error") == "ambiguous":
         # Ask like a person would, with one-tap answers.
         import secrets as _secrets
-        ptok = _secrets.token_hex(3)
         cands = [c.get("name", "") for c in draft["candidates"] if c.get("name")]
+        asked = draft.get("customer_text") or "that customer"
+        if not cands:
+            await send(update,
+                       f"😕 I couldn't find a customer matching "
+                       f"<b>{h(asked)}</b> in the master list or sample "
+                       "history — check the spelling and resend the /sr line.")
+            return
+        ptok = _secrets.token_hex(3)
         srq.DRAFTS[ptok] = {"pending_pick": True, "candidates": cands,
                             "raw_text": draft.get("raw_text", build_text),
                             "user_id": update.effective_user.id,
                             "dry": dry}
+        _SR_ACTIVE[update.effective_user.id] = ptok
         rows = [[(c[:40], f"srb:pick:{ptok}:{i}")]
                 for i, c in enumerate(cands[:4])]
         await send(update,
-                   f"🤔 Which one did you mean?",
+                   f"🤔 Which customer is <b>{h(asked)}</b>? "
+                   "Tap one (or type the name):",
                    kb(rows))
         return
     if dry:
@@ -10020,6 +10029,31 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         srq.DRAFTS.pop(draft["token"], None)
         return
     await _sr_show(update, draft, srq)
+
+
+async def _sr_build_with_customer(update, draft, name: str, srq) -> None:
+    """Rebuild a pending-pick draft with the chosen customer — shared by the
+    pick button AND a typed answer to 'which customer did you mean?'."""
+    await send(update, f"👍 {h(name)} — assembling the draft…",
+               with_footer=False)
+    try:
+        new = await asyncio.to_thread(
+            srq.build_draft, update.effective_user.id,
+            draft["raw_text"], name)
+    except Exception as e:  # noqa: BLE001
+        await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
+        return
+    if new.get("error") == "territory":
+        await send(update,
+                   f"🛑 <b>Singapore-only for now.</b> {h(name)} routes to "
+                   f"<b>{h(new['territory'])}</b> — raise that one in MMS.")
+        return
+    if draft.get("dry"):
+        await send(update, _sr_draft_text(new) +
+                   "\n\n<i>(dry run — no submit buttons)</i>")
+        srq.DRAFTS.pop(new["token"], None)
+        return
+    await _sr_show(update, new, srq)
 
 
 async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
@@ -10047,26 +10081,8 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         except (ValueError, IndexError):
             return
         srq.DRAFTS.pop(token, None)
-        await send(update, f"👍 {h(name)} — assembling the draft…",
-                   with_footer=False)
-        try:
-            new = await asyncio.to_thread(
-                srq.build_draft, update.effective_user.id,
-                draft["raw_text"], name)
-        except Exception as e:  # noqa: BLE001
-            await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
-            return
-        if new.get("error") == "territory":
-            await send(update,
-                       f"🛑 <b>Singapore-only for now.</b> {h(name)} routes to "
-                       f"<b>{h(new['territory'])}</b> — raise that one in MMS.")
-            return
-        if draft.get("dry"):
-            await send(update, _sr_draft_text(new) +
-                       "\n\n<i>(dry run — no submit buttons)</i>")
-            srq.DRAFTS.pop(new["token"], None)
-            return
-        await _sr_show(update, new, srq)
+        _SR_ACTIVE.pop(update.effective_user.id, None)
+        await _sr_build_with_customer(update, draft, name, srq)
         return
     if verb == "nb":
         days = int(arg or 7)
@@ -10096,11 +10112,32 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     token = _SR_ACTIVE.get(user.id)
     draft = srq.DRAFTS.get(token) if token else None
-    if draft is None or draft.get("pending_pick"):
+    if draft is None:
         return
     text = (update.effective_message.text or "").strip()
     if not text:
         return
+    from telegram.ext import ApplicationHandlerStop
+    if draft.get("pending_pick"):
+        # A typed answer to 'which customer did you mean?' used to fall
+        # through to product search (a confusing seasoning list mid-flow).
+        # Accept a number or a fuzzy name; anything else routes normally.
+        cands = draft.get("candidates") or []
+        name = ""
+        if text.isdigit() and 1 <= int(text) <= len(cands):
+            name = cands[int(text) - 1]
+        else:
+            from rapidfuzz import fuzz
+            sc, best = max(((fuzz.WRatio(text.lower(), c.lower()), c)
+                            for c in cands), default=(0, ""))
+            if sc >= 75:
+                name = best
+        if not name:
+            return  # not an answer — the search router can have it
+        srq.DRAFTS.pop(token, None)
+        _SR_ACTIVE.pop(user.id, None)
+        await _sr_build_with_customer(update, draft, name, srq)
+        raise ApplicationHandlerStop
     upd = await srq.llm_update(draft, text)
     if upd.get("action") == "unrelated":
         # LLM unavailable or genuinely unsure — try the deterministic
@@ -10109,7 +10146,6 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     action = upd.get("action")
     if action == "unrelated":
         return  # normal routing handles it
-    from telegram.ext import ApplicationHandlerStop
     if action == "discard":
         srq.DRAFTS.pop(token, None)
         _SR_ACTIVE.pop(user.id, None)

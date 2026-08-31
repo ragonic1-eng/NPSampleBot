@@ -461,6 +461,49 @@ def top_seasonings(
                         "_past_hits": len(pscores),
                     }
 
+    # V1.17.35 — literal-name priority. The generic-word strip exists so
+    # "seasoning"/"powder" don't inflate fuzzy scores, but it also DELETED
+    # the distinguishing word when a rep typed a product's literal name:
+    # "chicken powder" became "chicken", every chicken product token-set
+    # matched at 100, and the actual CHICKEN POWDER items (older dates)
+    # never even made the fuzzy pool — the rep got the newest chicken-
+    # anything instead. Guarantee: a query that IS a product's raw name
+    # (punctuation/space-insensitive) always surfaces and always wins.
+    # Containment ("chicken powder" ⊂ "SPECIAL CHICKEN POWDER MIX") ranks
+    # just below exact. Both sit ABOVE the 100-score fuzzy band; recency
+    # still orders within each tier. Injection scans `candidates` (already
+    # prefix/price-filtered, newest-first), so caps and factory filters
+    # are respected and the newest matches enter the pool first.
+    _raw_kw = _LONELY_CURRENCY_RE.sub(" ", _PRICE_STRIP_RE.sub(" ", query))
+    _kw_sq = re.sub(r"[^a-z0-9]", "", _raw_kw.lower())
+    if len(_kw_sq) >= 6:
+        _exact_n = _contain_n = 0
+        for _i, _s in enumerate(candidates):
+            if _exact_n >= pool and _contain_n >= pool:
+                break
+            _name_sq = re.sub(r"[^a-z0-9]", "", str(_s.get("name") or "").lower())
+            if not _name_sq or _kw_sq not in _name_sq:
+                continue
+            _is_exact = _name_sq == _kw_sq
+            if _is_exact and _exact_n >= pool:
+                continue
+            if not _is_exact and _contain_n >= pool:
+                continue
+            _e = pooled.get(_i)
+            if _e is None:
+                _e = {
+                    **_s,
+                    "score": 0.0,
+                    "_price_num": _parse_price(_s.get("price")),
+                    "_past_hits": 0,
+                }
+                pooled[_i] = _e
+            _e["score"] = max(_e["score"], 110.0 if _is_exact else 105.0)
+            if _is_exact:
+                _exact_n += 1
+            else:
+                _contain_n += 1
+
     # Dedupe by code: a product code can appear in more than one tab when
     # the workbook is mid-cleanup, or when a code lives in a category tab AND
     # in the (now-retired) "Sample Master List 2024-Present" tab from older

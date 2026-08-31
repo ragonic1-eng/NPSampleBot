@@ -1381,6 +1381,61 @@ def _code_family_root(code: str) -> str:
     return m.group(1) if m else (code or "").strip().upper()
 
 
+async def _origin_row_for(code: str) -> tuple[dict | None, str]:
+    """Most-recent FSL row for a /pp origin block, with a provenance tag.
+
+    Returns (row, kind): kind is 'exact' (the asked code), 'family' (a
+    sibling variant — e.g. asked S-668L1-02, found S-668L1-01), or 'none'
+    (the whole family has never been sampled). Lets /pp always SAY what
+    the origin block is based on instead of silently omitting it.
+    """
+    try:
+        row = await asyncio.to_thread(sheets.find_fsl_product_by_code, code)
+    except Exception as e:  # noqa: BLE001
+        log.debug("/pp origin exact lookup failed for %s: %s", code, e)
+        row = None
+    if row:
+        return row, "exact"
+    root = _code_family_root(code)
+    try:
+        tab = sheets.fsl_tab_for_code(root)
+        from datetime import date as _d
+        fam = [
+            r for r in await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
+            if (lambda c: c == root or c.startswith(root + "-"))(
+                (r.get("Product Code") or "").strip().upper()
+            )
+        ]
+        if fam:
+            return max(fam, key=lambda r: r.get("_date") or _d.min), "family"
+    except Exception as e:  # noqa: BLE001
+        log.debug("/pp origin family lookup failed for %s: %s", code, e)
+    return None, "none"
+
+
+def _origin_block_for(row: dict | None, kind: str, asked: str) -> str:
+    """Render the /pp origin block for _origin_row_for's result — including
+    the explicit empty state, so the block never just disappears."""
+    if row is None:
+        return (
+            "📭 <b>No sample history</b> — this code has never been sent "
+            "out (not in Full Sample Listing)."
+        )
+    block = _origin_line(
+        row.get("Country") or "",
+        row.get("Customer Name") or "",
+        row.get("_date") or row.get("Sample Date Out"),
+    )
+    if kind == "family":
+        found = (row.get("Product Code") or "").strip().upper()
+        note = (
+            f"📎 <i>{h(asked)} itself was never sampled — history above is "
+            f"from sibling <code>{h(found)}</code>.</i>"
+        )
+        block = f"{block}\n{note}" if block else note
+    return block
+
+
 async def _show_code_history(update: Update, ctx, code: str) -> None:
     """👥 Everyone who received this code OR a sibling variant — max 10.
 
@@ -1767,21 +1822,14 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         # FSL read is 90s-cached, so this rarely costs a network round-trip.
         # 'asked' is the exact code the rep typed (MMS may have prefix-matched
         # to a parent); origin should reflect their code, not the parent's.
-        try:
-            _origin_row = await asyncio.to_thread(
-                sheets.find_fsl_product_by_code, asked
-            )
-        except Exception as e:  # noqa: BLE001 — origin is a nice-to-have
-            _origin_row = None
-            log.debug("/pp origin lookup failed for %s: %s", asked, e)
-        if _origin_row:
-            _origin = _origin_line(
-                _origin_row.get("Country") or "",
-                _origin_row.get("Customer Name") or "",
-                _origin_row.get("_date") or _origin_row.get("Sample Date Out"),
-            )
-            if _origin:
-                body += f"\n{_origin}"
+        # V1.17.35 — the block now ALWAYS renders: exact history, sibling-
+        # variant history (labelled), or an explicit 'never sampled' line.
+        # It used to vanish silently when the code had no FSL row, which
+        # read as a formatting bug to reps comparing two /pp replies.
+        _origin_row, _origin_kind = await _origin_row_for(asked)
+        _origin = _origin_block_for(_origin_row, _origin_kind, asked)
+        if _origin:
+            body += f"\n{_origin}"
         _price_str = (
             f"{product.rd_price_usd:.2f}" if product.rd_price_usd is not None else ""
         )

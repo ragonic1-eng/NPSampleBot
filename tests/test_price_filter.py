@@ -289,3 +289,55 @@ def test_full_coverage_promotion_still_excludes_non_matches():
     ]
     res = matcher.top_seasonings("hokkaido milk", cat, limit=2)
     assert res[0]["code"] == "S-1", [r["code"] for r in res]
+
+
+# ---------- literal product name always wins (CHICKEN POWDER bug) ------------
+
+def test_literal_name_beats_generic_strip_and_recency():
+    """'chicken powder' must return products NAMED chicken powder — not the
+    newest chicken-anything. 'powder' is on the generic-strip list, which
+    reduced the query to 'chicken' and let recency pick unrelated items."""
+    import datetime as d
+    cat = [
+        {"name": "CHICKEN NOODLE SOUP 920312B/C-3", "code": "S-NEW1",
+         "price": "USD 4.57", "category": "Snack", "last_sent": d.date(2026, 8, 31)},
+        {"name": "ROASTED CHICKEN SEASONING", "code": "S-NEW2",
+         "price": "USD 3.85", "category": "Snack", "last_sent": d.date(2026, 8, 28)},
+        {"name": "CHICKEN POWDER", "code": "J-OLD1",
+         "price": "USD 4.00", "category": "Snack", "last_sent": d.date(2026, 1, 20)},
+        {"name": "CHICKEN POWDER", "code": "J-OLD2",
+         "price": "USD 4.10", "category": "Snack", "last_sent": d.date(2024, 9, 27)},
+    ]
+    res = matcher.top_seasonings("chicken powder", cat, limit=4)
+    assert res[0]["code"] == "J-OLD1", [r["code"] for r in res]   # exact, newest
+    assert res[1]["code"] == "J-OLD2", [r["code"] for r in res]   # exact, older
+    # exact-name items must BOTH outrank the fuzzy chicken matches
+    assert {r["code"] for r in res[:2]} == {"J-OLD1", "J-OLD2"}
+
+
+def test_literal_name_containment_ranks_above_fuzzy():
+    import datetime as d
+    cat = [
+        {"name": "GRILLED CHICKEN SEASONING", "code": "S-FUZZ",
+         "price": "USD 4.00", "category": "Snack", "last_sent": d.date(2026, 8, 30)},
+        {"name": "SPECIAL CHICKEN POWDER MIX", "code": "S-CONT",
+         "price": "USD 4.00", "category": "Snack", "last_sent": d.date(2025, 1, 1)},
+    ]
+    res = matcher.top_seasonings("chicken powder", cat, limit=2)
+    assert res[0]["code"] == "S-CONT", [r["code"] for r in res]
+
+
+def test_literal_injection_respects_price_cap_and_prefix():
+    import datetime as d
+    cat = [
+        {"name": "CHICKEN POWDER", "code": "J-CHEAP", "price": "USD 3.00",
+         "category": "Snack", "last_sent": d.date(2026, 1, 1)},
+        {"name": "CHICKEN POWDER", "code": "J-DEAR", "price": "USD 9.00",
+         "category": "Snack", "last_sent": d.date(2026, 6, 1)},
+        {"name": "CHICKEN POWDER", "code": "S-SG", "price": "USD 3.50",
+         "category": "Snack", "last_sent": d.date(2026, 5, 1)},
+    ]
+    res = matcher.top_seasonings("chicken powder below 4usd", cat, limit=5)
+    assert {r["code"] for r in res} == {"J-CHEAP", "S-SG"}       # cap holds
+    res = matcher.top_seasonings("chicken powder j code", cat, limit=5)
+    assert {r["code"] for r in res} == {"J-CHEAP", "J-DEAR"}     # prefix holds

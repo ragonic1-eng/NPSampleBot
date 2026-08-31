@@ -161,6 +161,159 @@ def parse_ask(text: str) -> Ask:
     return a
 
 
+# ------------------------------------------------------------- LLM parsing
+
+_PARSE_PROMPT = """You turn a salesperson's casual message into a sample-request JSON.
+The message names a customer and what seasoning/sample they want, plus any of:
+quantity (grams), sets, bag type (NP bag / empty bag), budget, compliance
+markets, ship-to contact/address, need-by timing, request type.
+
+Message: {text}
+
+Reply with ONLY a JSON object (no prose) with exactly these keys, null when
+not stated:
+{{"customer": str, "ask": str (what they want, short, keep product codes
+verbatim), "qty_g": int|null, "sets": int|null, "bag": str|null,
+"budget": str|null, "compliance": str|null, "attn": str|null,
+"contact": str|null, "addr": str|null, "need_by": str|null,
+"rtype": "new"|"rep"|"mod"|null, "base_code": str|null}}
+
+Rules: 'repeat X' → rtype rep, base_code X. 'modify/change X' → rtype mod.
+"cheap as possible" etc → budget as stated. Never invent values."""
+
+_UPDATE_PROMPT = """A salesperson is editing a draft sample request by chatting.
+Current draft:
+{draft}
+
+Their new message: {text}
+
+Classify and reply with ONLY JSON:
+{{"action": "modify"|"confirm"|"discard"|"new_request"|"unrelated",
+"fields": {{...only the draft keys that change...}},
+"question": str|null}}
+
+Draft keys allowed in fields: ask, qty (int, grams), sets (int), bag, budget,
+compliance, attn, contact, addr, need_by, assignee, rtype ("new"/"rep"/"mod"),
+base_code.
+- "confirm" = they clearly say to raise/submit/send it (e.g. "yes go ahead",
+  "raise it", "confirm", "ok send").
+- "discard" = cancel / never mind / drop it.
+- "new_request" = a different customer + different ask (a fresh request, not
+  an edit).
+- "unrelated" = clearly not about this draft (a product search, a greeting,
+  another bot task).
+- otherwise "modify" with the changed fields. "make it 200g" → qty 200.
+  "use empty bags" → bag "Empty bag". "send to the KL office ..." → addr.
+- If their edit is ambiguous, action "modify", empty fields, and put a short
+  plain-language question in "question" (like a colleague would ask,
+  e.g. "How many grams — 200?"). Never invent values."""
+
+
+def _json_from(text: str) -> dict | None:
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        import json
+        return json.loads(m.group(0))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def llm_parse(text: str) -> dict | None:
+    """Natural-language → request dict. None on any failure (caller falls
+    back to the regex parser, which also keeps the old ';key: value' syntax
+    working silently)."""
+    import ai
+    try:
+        out, _, _ = await ai._ask(  # noqa: SLF001 — house helper
+            _PARSE_PROMPT.format(text=text), max_tokens=300)
+        d = _json_from(out)
+        if d and d.get("customer") and d.get("ask"):
+            return d
+    except Exception as e:  # noqa: BLE001
+        log.warning("SR llm_parse failed: %s", e)
+    return None
+
+
+async def llm_update(draft: dict, text: str) -> dict:
+    """Interpret a reply to an active draft. Always returns an action dict;
+    on LLM failure the reply is treated as unrelated (normal routing)."""
+    import ai
+    import json as _json
+    snapshot = {
+        "customer": draft["customer"], "ask": draft["ask"].ask_text,
+        "qty": draft["derived"]["qty"], "sets": draft["derived"]["sets"],
+        "rtype": draft["derived"]["rtype"],
+        "base_code": draft["derived"]["base_code"],
+        "bag": draft["bag"], "budget": draft["budget"],
+        "compliance": draft["compliance"], "attn": draft["attn"],
+        "contact": draft["contact"], "addr": draft["addr"],
+        "assignee": draft["assignee"], "need_by": draft["need_by"],
+    }
+    try:
+        out, _, _ = await ai._ask(  # noqa: SLF001
+            _UPDATE_PROMPT.format(draft=_json.dumps(snapshot), text=text),
+            max_tokens=300)
+        d = _json_from(out)
+        if d and d.get("action") in ("modify", "confirm", "discard",
+                                     "new_request", "unrelated"):
+            return d
+    except Exception as e:  # noqa: BLE001
+        log.warning("SR llm_update failed: %s", e)
+    return {"action": "unrelated", "fields": {}, "question": None}
+
+
+def apply_fields(draft: dict, fields: dict) -> None:
+    """Merge an LLM 'modify' result into the draft in place."""
+    d = draft["derived"]
+    for k, v in (fields or {}).items():
+        if v in (None, ""):
+            continue
+        if k == "qty":
+            try:
+                d["qty"], d["qty_src"] = int(v), "you said"
+            except (TypeError, ValueError):
+                pass
+        elif k == "sets":
+            try:
+                d["sets"] = int(v)
+            except (TypeError, ValueError):
+                pass
+        elif k == "rtype" and v in ("new", "rep", "mod"):
+            d["rtype"] = v
+            d["rtype_label"] = {"new": "New", "rep": "Repeat",
+                                "mod": "Modify"}[v]
+        elif k == "base_code":
+            d["base_code"] = str(v).upper()
+        elif k == "ask":
+            draft["ask"].ask_text = str(v)
+        elif k in ("bag", "budget", "compliance", "attn", "contact",
+                   "addr", "assignee", "need_by"):
+            draft[k] = str(v)
+    draft["missing"] = [m for m, val in
+                        (("bag", draft["bag"]),
+                         ("ship-to", draft["attn"] or draft["addr"]))
+                        if not val]
+
+
+def parsed_to_text(parsed: dict) -> str:
+    """Rebuild a canonical '/sr' line from an LLM parse so build_draft's
+    existing pipeline (regex overrides included) stays the single path."""
+    bits = [f"{parsed['customer']} — {parsed['ask']}"]
+    if parsed.get("qty_g"):
+        bits[0] += f" {parsed['qty_g']}g"
+    if parsed.get("sets"):
+        bits[0] += f" x {parsed['sets']}"
+    keymap = {"bag": "bag", "budget": "budget", "compliance": "compliance",
+              "attn": "attn", "contact": "contact", "addr": "addr",
+              "rtype": "type", "base_code": "base"}
+    for k, ov in keymap.items():
+        if parsed.get(k):
+            bits.append(f"{ov}: {parsed[k]}")
+    return "; ".join(bits)
+
+
 # ----------------------------------------------------------- customer + SR
 
 def resolve_customer(q: str) -> tuple[dict | None, list[dict]]:
@@ -511,15 +664,19 @@ class SRWriter:
 
 # ------------------------------------------------------------ draft object
 
-def build_draft(user_id: int, text: str) -> dict:
+def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
     """Everything needed to render + submit. Fetches the SR page once for
-    ship-to/compliance provenance and section count."""
+    ship-to/compliance provenance and section count. `force_customer`
+    skips name resolution (the 'which one did you mean' button flow)."""
     ask = parse_ask(text)
-    best, candidates = resolve_customer(ask.customer_text)
-    if best is None:
-        return {"error": "ambiguous", "candidates": candidates,
-                "customer_text": ask.customer_text}
-    customer = best["name"]
+    if force_customer:
+        customer = force_customer
+    else:
+        best, candidates = resolve_customer(ask.customer_text)
+        if best is None:
+            return {"error": "ambiguous", "candidates": candidates,
+                    "customer_text": ask.customer_text, "raw_text": text}
+        customer = best["name"]
     hist = customer_history(customer)
     d = derive_defaults(hist, ask)
 

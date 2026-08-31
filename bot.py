@@ -9684,13 +9684,71 @@ def _sr_draft_kb(draft: dict):
     return kb(rows)
 
 
-async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Raise an MMS sample request from one line — v1, admin-only.
+# Active draft per user — lets a plain reply edit the draft like talking to
+# a colleague ("make it 200g", "use empty bags"). Module-level so the text
+# hook can find it without ctx.user_data (which is per-worker).
+_SR_ACTIVE: dict[int, str] = {}  # user_id -> draft token
 
-    /sr haritage — mala crawfish 200g
-    /sr <…>; bag: empty; budget: usd 4-5; compliance: MY SG; attn: …
-    /sr dry <…>   → build the draft, never offer submission
-    /sr test      → reversible write test (additem→clear) on the probe SR
+
+async def _sr_show(update, draft, srq):
+    """Render the draft and mark it active for conversational edits."""
+    _SR_ACTIVE[update.effective_user.id] = draft["token"]
+    await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
+
+
+async def _sr_do_submit(update, draft, token, srq) -> None:
+    """Shared submit path (✅ button AND a typed 'yes raise it')."""
+    if draft.get("prefix") != "S":
+        await send(update, "🛑 Singapore-only — this draft isn't an "
+                           "S-prefix SR, refusing to submit.")
+        return
+    if not draft["sr_code"]:
+        await send(update,
+                   "🛑 No existing SR for this customer — creating brand-new "
+                   "SRs isn't wired up yet. Raise the empty SR once in MMS, "
+                   "then this works for them.")
+        return
+    await send(update, "📨 Writing to MMS… (each step is verified)",
+               with_footer=False)
+    reqnote = srq.render_reqnote(draft)
+    d = draft["derived"]
+    try:
+        w = srq.SRWriter()
+        if not w.login():
+            await send(update, "🛑 MMS login failed — stopping (no retry).")
+            return
+        result = await asyncio.to_thread(
+            w.add_item_and_request, draft["sr_code"], d["rtype"],
+            d.get("base_code", ""), reqnote, draft["assignee"],
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("sr submit crashed")
+        await send(update, f"🛑 Submit crashed: {h(str(e)[:200])} — "
+                           "check the SR in MMS before retrying.")
+        return
+    if result.get("ok"):
+        srq.DRAFTS.pop(token, None)
+        _SR_ACTIVE.pop(update.effective_user.id, None)
+        await asyncio.to_thread(srq.remember_submitted, draft)
+        await send(update,
+                   f"✅ <b>Raised.</b> {h(result['detail'])} on "
+                   f"<code>{h(draft['sr_code'])}</code>.\n"
+                   f"<i>Defaults for {h(draft['customer'])} updated from "
+                   "this request.</i>")
+    else:
+        await send(update,
+                   f"🛑 <b>Not submitted:</b> {h(result.get('detail', '?'))}\n"
+                   f"<i>Draft kept — fix it (just reply) and confirm again, "
+                   f"or check <code>{h(draft['sr_code'])}</code> in MMS.</i>")
+
+
+async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Raise an MMS sample request by describing it naturally — admin-only.
+
+    Write it like a text to a colleague; after the draft appears, keep
+    replying to adjust it ("make it 200g", "use empty bags"), then say
+    "raise it" or tap ✅.
+    /sr dry <…> previews only · /sr test runs the reversible MMS write test.
     """
     import sample_request as srq
     if not await _authorized(update):
@@ -9701,11 +9759,17 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = " ".join(ctx.args or []).strip()
     if not text:
         await send(update,
-                   "✍️ <b>Usage:</b> <code>/sr customer — what you want 200g</code>\n"
-                   "Options after ';' — bag / budget / compliance / attn / "
-                   "contact / addr / type / base / assignee.\n"
-                   "<code>/sr dry …</code> preview only · <code>/sr test</code> "
-                   "reversible MMS write test.")
+                   "✍️ Just tell me what you need, like you'd text a "
+                   "colleague:\n\n"
+                   "• <i>/sr pran foods, bbq seasoning for chips 100g, "
+                   "budget around 4-5 usd</i>\n"
+                   "• <i>/sr haritage, repeat the mala crawfish 200g, "
+                   "need it next week</i>\n"
+                   "• <i>/sr bombay sweets, tomato seasoning for potato "
+                   "chips, cheap as possible, empty bags</i>\n\n"
+                   "I'll show you a draft — reply to change anything "
+                   "(<i>make it 200g</i>, <i>use empty bags</i>), then say "
+                   "<b>raise it</b> or tap ✅.")
         return
     if text.lower() == "test":
         probe = config.MMS_PROBE_SR_CODE
@@ -9728,13 +9792,20 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text.lower().startswith("dry "):
         dry, text = True, text[4:].strip()
     await send(update, "🔎 Assembling the draft…", with_footer=False)
+    # Natural-language first (the way Alex actually types); the old
+    # structured ';key: value' syntax still works silently underneath as
+    # the fallback and for anyone who prefers it.
+    parsed = await srq.llm_parse(text)
+    build_text = srq.parsed_to_text(parsed) if parsed else text
     try:
         draft = await asyncio.to_thread(
-            srq.build_draft, update.effective_user.id, text)
+            srq.build_draft, update.effective_user.id, build_text)
     except Exception as e:  # noqa: BLE001
         log.exception("sr build_draft failed")
         await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
         return
+    if parsed and parsed.get("need_by") and not draft.get("error"):
+        draft["need_by"] = str(parsed["need_by"]).upper()
     if draft.get("error") == "territory":
         codes_note = (
             f" (asked codes: {h(', '.join(draft['codes']))})"
@@ -9751,11 +9822,19 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                    "territories. Raise this one directly in MMS.</i>")
         return
     if draft.get("error") == "ambiguous":
-        names = "\n".join(
-            f"  • {h(c.get('name', ''))}" for c in draft["candidates"]) or "  (none)"
+        # Ask like a person would, with one-tap answers.
+        import secrets as _secrets
+        ptok = _secrets.token_hex(3)
+        cands = [c.get("name", "") for c in draft["candidates"] if c.get("name")]
+        srq.DRAFTS[ptok] = {"pending_pick": True, "candidates": cands,
+                            "raw_text": draft.get("raw_text", build_text),
+                            "user_id": update.effective_user.id,
+                            "dry": dry}
+        rows = [[(c[:40], f"srb:pick:{ptok}:{i}")]
+                for i, c in enumerate(cands[:4])]
         await send(update,
-                   f"🤔 <b>{h(draft['customer_text'])}</b> matches more than one "
-                   f"customer:\n{names}\n\nResend /sr with the fuller name.")
+                   f"🤔 Which one did you mean?",
+                   kb(rows))
         return
     if dry:
         draft["missing"] = draft["missing"] or []
@@ -9763,7 +9842,7 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                    "\n\n<i>(dry run — no submit buttons)</i>")
         srq.DRAFTS.pop(draft["token"], None)
         return
-    await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
+    await _sr_show(update, draft, srq)
 
 
 async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
@@ -9779,65 +9858,110 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
     if verb == "x":
         srq.DRAFTS.pop(token, None)
+        _SR_ACTIVE.pop(update.effective_user.id, None)
         await send(update, "🗑 Draft discarded.")
+        return
+    if verb == "pick":
+        # "Which one did you mean?" answer — rebuild with the chosen name.
+        if not draft.get("pending_pick"):
+            return
+        try:
+            name = draft["candidates"][int(arg)]
+        except (ValueError, IndexError):
+            return
+        srq.DRAFTS.pop(token, None)
+        await send(update, f"👍 {h(name)} — assembling the draft…",
+                   with_footer=False)
+        try:
+            new = await asyncio.to_thread(
+                srq.build_draft, update.effective_user.id,
+                draft["raw_text"], name)
+        except Exception as e:  # noqa: BLE001
+            await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
+            return
+        if new.get("error") == "territory":
+            await send(update,
+                       f"🛑 <b>Singapore-only for now.</b> {h(name)} routes to "
+                       f"<b>{h(new['territory'])}</b> — raise that one in MMS.")
+            return
+        if draft.get("dry"):
+            await send(update, _sr_draft_text(new) +
+                       "\n\n<i>(dry run — no submit buttons)</i>")
+            srq.DRAFTS.pop(new["token"], None)
+            return
+        await _sr_show(update, new, srq)
         return
     if verb == "nb":
         days = int(arg or 7)
         target = (_sgt_now() + timedelta(days=days)).strftime("%d %b %Y").upper()
         draft["need_by"] = f"BY {target}"
-        await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
+        await _sr_show(update, draft, srq)
         return
     if verb == "bag":
         draft["bag"] = arg
         draft["missing"] = [m for m in draft["missing"] if m != "bag"]
-        await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
+        await _sr_show(update, draft, srq)
         return
     if verb == "go":
-        # Defense in depth: the builder already refuses non-SG drafts, but
-        # never let one slip through to a write (wrong queue = the exact
-        # failure this bot fixes).
-        if draft.get("prefix") != "S":
-            await send(update, "🛑 Singapore-only — this draft isn't an "
-                               "S-prefix SR, refusing to submit.")
-            return
-        if not draft["sr_code"]:
-            await send(update,
-                       "🛑 No existing SR for this customer — creating brand-new "
-                       "SRs isn't wired up yet (sampleRequestCreate.do). Raise "
-                       "the empty SR once in MMS, then /sr works for them.")
-            return
-        await send(update, "📨 Writing to MMS… (each step is verified)",
-                   with_footer=False)
-        reqnote = srq.render_reqnote(draft)
-        d = draft["derived"]
-        try:
-            w = srq.SRWriter()
-            if not w.login():
-                await send(update, "🛑 MMS login failed — stopping (no retry).")
-                return
-            result = await asyncio.to_thread(
-                w.add_item_and_request, draft["sr_code"], d["rtype"],
-                d.get("base_code", ""), reqnote, draft["assignee"],
-            )
-        except Exception as e:  # noqa: BLE001
-            log.exception("sr submit crashed")
-            await send(update, f"🛑 Submit crashed: {h(str(e)[:200])} — "
-                               "check the SR in MMS before retrying.")
-            return
-        if result.get("ok"):
-            srq.DRAFTS.pop(token, None)
-            await asyncio.to_thread(srq.remember_submitted, draft)
-            await send(update,
-                       f"✅ <b>Raised.</b> {h(result['detail'])} on "
-                       f"<code>{h(draft['sr_code'])}</code>.\n"
-                       f"<i>Defaults for {h(draft['customer'])} updated from "
-                       "this request.</i>")
-        else:
-            await send(update,
-                       f"🛑 <b>Not submitted:</b> {h(result.get('detail', '?'))}\n"
-                       f"<i>Draft kept — fix and tap ✅ again, or check "
-                       f"<code>{h(draft['sr_code'])}</code> in MMS.</i>")
+        await _sr_do_submit(update, draft, token, srq)
         return
+
+
+async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Conversational draft editing: while a draft is active, a plain reply
+    IS an instruction about it — 'make it 200g', 'use empty bags', 'no,
+    send to the KL office', 'ok raise it'. Anything the LLM judges
+    unrelated (a search, small talk) falls through to normal routing.
+    Registered in group -1, ahead of the search router."""
+    import sample_request as srq
+    user = update.effective_user
+    if user is None or not _is_update_sample_owner(user):
+        return
+    token = _SR_ACTIVE.get(user.id)
+    draft = srq.DRAFTS.get(token) if token else None
+    if draft is None or draft.get("pending_pick"):
+        return
+    text = (update.effective_message.text or "").strip()
+    if not text:
+        return
+    upd = await srq.llm_update(draft, text)
+    action = upd.get("action")
+    if action == "unrelated":
+        return  # normal routing handles it
+    from telegram.ext import ApplicationHandlerStop
+    if action == "discard":
+        srq.DRAFTS.pop(token, None)
+        _SR_ACTIVE.pop(user.id, None)
+        await send(update, "🗑 Draft discarded.")
+        raise ApplicationHandlerStop
+    if action == "confirm":
+        await _sr_do_submit(update, draft, token, srq)
+        raise ApplicationHandlerStop
+    if action == "new_request":
+        parsed = await srq.llm_parse(text)
+        build_text = srq.parsed_to_text(parsed) if parsed else text
+        await send(update, "🔎 New request — assembling the draft…",
+                   with_footer=False)
+        try:
+            new = await asyncio.to_thread(
+                srq.build_draft, user.id, build_text)
+        except Exception as e:  # noqa: BLE001
+            await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
+            raise ApplicationHandlerStop
+        if new.get("error"):
+            await send(update, "🤔 I couldn't pin that new request down — "
+                               "start it with /sr so I don't mix it up with "
+                               "the current draft.")
+            raise ApplicationHandlerStop
+        await _sr_show(update, new, srq)
+        raise ApplicationHandlerStop
+    # modify (possibly with a clarifying question)
+    srq.apply_fields(draft, upd.get("fields") or {})
+    if upd.get("question"):
+        await send(update, f"❓ {h(str(upd['question']))}", with_footer=False)
+        raise ApplicationHandlerStop
+    await _sr_show(update, draft, srq)
+    raise ApplicationHandlerStop
 
 
 async def _schedule_dispatch_reminder(application: Application) -> None:
@@ -10492,6 +10616,11 @@ def main():
             log.warning("Could not start capability API: %s", e)
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
+    # group -1: conversational /sr draft edits run BEFORE the search router;
+    # they raise ApplicationHandlerStop only when they actually consume the
+    # message, so ordinary searches pass through untouched.
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_sr_text), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     # V1.17.3 — images sent as a FILE arrive as documents, not photos, and

@@ -9630,6 +9630,23 @@ async def cmd_sentout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def _sr_draft_text(draft: dict) -> str:
     import sample_request as srq
     d = draft["derived"]
+    src = draft.get("src", {})
+
+    def prov(key):
+        s = src.get(key, "")
+        if s == "you":
+            return " <i>(you said)</i>"
+        if s == "confirm":
+            return ""
+        return f" <i>({h(s)})</i>" if s else ""
+
+    def val(key):
+        v = draft.get(key, "")
+        if src.get(key) == "confirm":
+            return ("❓ <b>you mentioned this but I couldn't read it — "
+                    "please tell me</b>")
+        return f"<b>{h(v)}</b>" if v else "<b>—</b>"
+
     lines = [
         f"📋 <b>Draft sample request — {h(draft['customer'])}</b>",
         f"SR: <code>{h(draft['sr_code'] or '— none found —')}</code> · "
@@ -9638,34 +9655,36 @@ def _sr_draft_text(draft: dict) -> str:
         f"Type: <b>{d['rtype_label']}</b>"
         + (f" — base <code>{h(d['base_code'])}</code>" if d["base_code"] else "")
         + " <i>(inferred from your ask)</i>",
-        f"Qty: <b>{d['qty']} g × {d['sets']} set"
-        f"{'s' if d['sets'] != 1 else ''}</b> <i>({h(d['qty_src'])})</i>",
+        f"Qty: <b>{d['qty']} g"
+        + (" each" if draft["ask"].qty_each else
+           f" × {d['sets']} set{'s' if d['sets'] != 1 else ''}")
+        + f"</b> <i>({h(d['qty_src'])})</i>",
+        f"Bag: " + (val("bag") if draft["bag"] or src.get("bag") == "confirm"
+                    else "<b>❓ not known yet — just tell me: NP or empty "
+                         "bags?</b>") + prov("bag"),
+        f"Budget: {val('budget')}{prov('budget')}",
+        f"Compliance: {val('compliance')}{prov('compliance')}",
     ]
-    lines.append(f"Bag: <b>{h(draft['bag'] or '❓ not known yet')}</b>"
-                 + (" <i>(remembered)</i>" if draft["bag"] else ""))
-    if draft["budget"]:
-        lines.append(f"Budget: <b>{h(draft['budget'])}</b> "
-                     f"<i>({h(d.get('budget_src') or 'remembered')})</i>")
-    lines.append(f"Compliance: <b>{h(draft['compliance'] or '—')}</b>")
     ship_bits = " · ".join(x for x in (draft["attn"], draft["contact"]) if x)
-    lines.append(f"Ship to: <b>{h(ship_bits or '❓ not known yet')}</b>")
-    if draft["addr"]:
-        lines.append(f"           {h(draft['addr'][:90])}")
+    if ship_bits or draft["addr"]:
+        lines.append(f"Ship to: <b>{h(ship_bits) if ship_bits else ''}</b>"
+                     + prov("addr" if draft["addr"] else "attn")
+                     + " — <i>does this look right?</i>")
+        if draft["addr"]:
+            lines.append(f"           {h(draft['addr'][:90])}")
+    else:
+        lines.append("Ship to: <b>❓ I couldn't find an address anywhere — "
+                     "what's the contact and address?</b>")
     lines.append(f"R&amp;D: <b>{h(draft['assignee'])}</b> "
-                 f"<i>({h(draft['territory'])} territory — tap ✏️ note below to change)</i>")
-    lines.append(f"Need by: <b>{h(draft['need_by'] or 'STANDARD (~1 week)')}</b>")
+                 f"<i>({h(draft['territory'])} — reply to change)</i>")
+    lines.append(f"Need by: <b>{h(draft['need_by'] or 'STANDARD (~1 week)')}</b>"
+                 + prov("need_by"))
     if draft.get("page_err"):
         lines.append(f"\n⚠️ <i>{h(draft['page_err'])}</i>")
-    if draft["missing"]:
-        lines.append(
-            "\n❓ <b>First time for this customer — I need, once:</b> "
-            + ", ".join(draft["missing"])
-            + "\n<i>Resend with e.g. "
-            "…; bag: NP; attn: NAME; contact: +65…; addr: FULL ADDRESS</i>"
-        )
     lines.append("\n<b>Will write into MMS:</b>")
     lines.append(f"<pre>{h(srq.render_reqnote(draft))}</pre>")
-    lines.append("<i>Nothing is submitted until you tap ✅.</i>")
+    lines.append("<i>Reply to change anything — nothing is submitted until "
+                 "you say so or tap ✅.</i>")
     return "\n".join(lines)
 
 
@@ -9756,7 +9775,11 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_update_sample_owner(update.effective_user):
         await send(update, "🛑 /sr is limited to the admin while in trial.")
         return
-    text = " ".join(ctx.args or []).strip()
+    # Raw message text, NOT ctx.args — args are whitespace-split, which
+    # destroyed the line structure of multi-line requests (Alex's 3-flavour
+    # spec lost its Budget/Compliance/qty lines to this).
+    raw = (update.effective_message.text or "")
+    text = re.sub(r"^/sr(@\w+)?\s*", "", raw, flags=re.IGNORECASE).strip()
     if not text:
         await send(update,
                    "✍️ Just tell me what you need, like you'd text a "
@@ -9925,6 +9948,10 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
     upd = await srq.llm_update(draft, text)
+    if upd.get("action") == "unrelated":
+        # LLM unavailable or genuinely unsure — try the deterministic
+        # fallback so the conversational loop survives an empty API balance.
+        upd = srq.fallback_update(draft, text)
     action = upd.get("action")
     if action == "unrelated":
         return  # normal routing handles it

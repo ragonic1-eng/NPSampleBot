@@ -119,45 +119,167 @@ def mem_set(customer: str, key: str, value: str) -> None:
 @dataclass
 class Ask:
     customer_text: str = ""
-    ask_text: str = ""
+    ask_text: str = ""      # the request body — everything the rep wrote
     codes: list[str] = field(default_factory=list)
     qty_g: int | None = None
+    qty_each: bool = False  # "1kg for each sample"
     sets: int | None = None
-    overrides: dict[str, str] = field(default_factory=dict)
+    overrides: dict[str, str] = field(default_factory=dict)  # EXPLICIT values
+    hints: set = field(default_factory=set)  # field mentioned, value unreadable
 
 _OVR_KEYS = {"bag", "budget", "compliance", "attn", "addr", "address",
              "contact", "qty", "sets", "assignee", "type", "base"}
 
+# Markets the fallback normalizer knows (typo-tolerant via fuzzy match).
+_MARKETS = [
+    "Bangladesh", "Mexico", "Singapore", "Malaysia", "Indonesia", "Thailand",
+    "Vietnam", "Japan", "Korea", "China", "India", "Philippines", "Australia",
+    "New Zealand", "USA", "Canada", "EU", "UK", "Middle East", "Dubai", "UAE",
+    "Taiwan", "Hong Kong", "Nepal", "Myanmar", "Sri Lanka", "Pakistan",
+    "Saudi Arabia", "CODEX", "FDA", "FSANZ",
+]
+
+def _normalize_markets(s: str) -> str:
+    """'banagldesh and mexico market' → 'Bangladesh, Mexico'. Unknown tokens
+    survive title-cased rather than being dropped."""
+    from rapidfuzz import fuzz
+    s = re.sub(r"\bmarkets?\b", " ", s, flags=re.I)
+    tokens = [t.strip() for t in re.split(r",|/|&|\band\b|\+", s, flags=re.I)
+              if t.strip()]
+    out = []
+    for t in tokens:
+        best, score = "", 0
+        for m in _MARKETS:
+            sc = fuzz.ratio(t.lower(), m.lower())
+            if sc > score:
+                best, score = m, sc
+        out.append(best if score >= 80 else t.title())
+    seen, uniq = set(), []
+    for m in out:
+        if m.lower() not in seen:
+            seen.add(m.lower())
+            uniq.append(m)
+    return ", ".join(uniq)
+
+
+_BUDGET_LINE = re.compile(
+    r"budget\s*[:\-]?\s*(.+)|"
+    r"((?:<|under|below|max|less than|around|about)\s*(?:usd\s*)?\$?"
+    r"\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*(?:usd)?)|"
+    r"(cheap(?:est)?(?:\s+as\s+possible)?|no budget)", re.IGNORECASE)
+_COMPLIANCE_LINE = re.compile(
+    r"complian\w*\s*(?:for|:)?\s*(.+)", re.IGNORECASE)
+_BAG_LINE = re.compile(r"\b(np|empty)\s*(?:sample\s*)?bags?\b", re.IGNORECASE)
+_NEEDBY_LINE = re.compile(
+    r"need(?:ed)?(?:\s+it)?\s+by\s+(.+)|\b(next week|this week|asap|urgent)\b",
+    re.IGNORECASE)
+_ATTN_LINE = re.compile(r"\battn\.?\s*[:\-]?\s*(.+)", re.IGNORECASE)
+_CONTACT_LINE = re.compile(
+    r"\b(?:contact(?:\s*no\.?)?|phone|tel)\s*[:\-]?\s*(.+)", re.IGNORECASE)
+_ADDR_LINE = re.compile(r"\baddress\s*[:\-]?\s*(.+)", re.IGNORECASE)
+
+
 def parse_ask(text: str) -> Ask:
-    """'haritage — mala crawfish 200g; bag: empty; budget: usd 4-5'"""
+    """No-LLM fallback parser. Handles MULTI-LINE messages: the first line
+    (or first comma/dash segment) names the customer; every line is scanned
+    for explicit field values (budget, compliance, qty, bag, ship-to,
+    need-by) which are EXPLICIT — they always beat derived values. A field
+    keyword we can see but can't read becomes a HINT: the draft shows
+    'please confirm' instead of a confidently wrong derived number.
+    The old ';key: value' syntax still works, silently."""
     a = Ask()
-    parts = [p.strip() for p in text.split(";")]
-    head = parts[0]
-    for seg in parts[1:]:
-        if ":" in seg:
+    # legacy ';key: value' segments first (silent compatibility)
+    semi = [p.strip() for p in text.split(";")]
+    for seg in semi[1:]:
+        if ":" in seg and "\n" not in seg:
             k, v = seg.split(":", 1)
             k = k.strip().lower()
             if k in _OVR_KEYS:
                 a.overrides["addr" if k == "address" else k] = v.strip()
-    # customer — ask split: em-dash, ' - ', or first comma
-    for sep in ("—", " - ", "–"):
-        if sep in head:
-            a.customer_text, a.ask_text = [s.strip() for s in head.split(sep, 1)]
-            break
+    text = semi[0] if len(semi) > 1 else text
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return a
+    head = lines[0]
+    # customer — ask split: em/en dash, ' - ', 'Ltd- X', or first comma
+    m = re.split(r"\s*[–—]\s*|\s+-\s*|-\s+|,", head, 1)
+    if len(m) == 2:
+        a.customer_text, first_ask = m[0].strip(), m[1].strip()
     else:
-        if "," in head:
-            a.customer_text, a.ask_text = [s.strip() for s in head.split(",", 1)]
-        else:
-            words = head.split()
-            a.customer_text, a.ask_text = " ".join(words[:2]), " ".join(words[2:])
-    a.codes = [c.upper() for c in _CODE_RE.findall(a.ask_text)]
-    m = _QTY_RE.search(a.ask_text)
-    if m:
-        n = float(m.group(1))
-        a.qty_g = int(n * 1000) if m.group(2).lower() == "kg" else int(n)
-    m = _SETS_RE.search(a.ask_text)
-    if m:
-        a.sets = int(m.group(1) or m.group(2))
+        words = head.split()
+        a.customer_text, first_ask = " ".join(words[:3]), " ".join(words[3:])
+
+    body: list[str] = [first_ask] if first_ask else []
+    for line in lines[1:]:
+        consumed = False
+        bm = _BUDGET_LINE.search(line)
+        if bm and "budget" not in a.overrides:
+            val = (bm.group(1) or bm.group(2) or bm.group(3) or "").strip()
+            if val:
+                a.overrides["budget"] = val
+                consumed = True
+            else:
+                a.hints.add("budget")
+        cm = _COMPLIANCE_LINE.search(line)
+        if cm and "compliance" not in a.overrides:
+            val = _normalize_markets(cm.group(1))
+            if val:
+                a.overrides["compliance"] = val
+                consumed = True
+            else:
+                a.hints.add("compliance")
+        gm = _BAG_LINE.search(line)
+        if gm and "bag" not in a.overrides:
+            a.overrides["bag"] = ("NP bag" if gm.group(1).lower() == "np"
+                                  else "Empty bag")
+            consumed = consumed or len(line) < 40
+        nm = _NEEDBY_LINE.search(line)
+        if nm and "need_by" not in a.overrides:
+            a.overrides["need_by"] = (nm.group(1) or nm.group(2)).strip()
+        am = _ATTN_LINE.search(line)
+        if am:
+            a.overrides["attn"] = am.group(1).strip()
+            consumed = True
+        km = _CONTACT_LINE.search(line)
+        if km:
+            a.overrides["contact"] = km.group(1).strip()
+            consumed = True
+        dm = _ADDR_LINE.search(line)
+        if dm:
+            a.overrides["addr"] = dm.group(1).strip()
+            consumed = True
+        qm = _QTY_RE.search(line)
+        if qm and a.qty_g is None:
+            n = float(qm.group(1))
+            a.qty_g = int(n * 1000) if qm.group(2).lower() == "kg" else int(n)
+            if re.search(r"\beach\b|\bper\b", line, re.I):
+                a.qty_each = True
+            consumed = consumed or len(line) < 30
+        if not consumed:
+            body.append(line)
+
+    a.ask_text = "\n".join(body).strip()
+    blob = a.ask_text + " "
+    a.codes = [c.upper() for c in _CODE_RE.findall(blob)]
+    if a.qty_g is None:
+        m2 = _QTY_RE.search(blob)
+        if m2:
+            n = float(m2.group(1))
+            a.qty_g = int(n * 1000) if m2.group(2).lower() == "kg" else int(n)
+            if re.search(r"\beach\b", blob, re.I):
+                a.qty_each = True
+    m3 = _SETS_RE.search(blob)
+    if m3:
+        a.sets = int(m3.group(1) or m3.group(2))
+    # keyword-without-value → hint, never a derived fill-in
+    full = text.lower()
+    if "budget" not in a.overrides and "budget" not in a.hints \
+            and re.search(r"budget|cheap", full):
+        a.hints.add("budget")
+    if "compliance" not in a.overrides \
+            and re.search(r"complian|regulat", full):
+        a.hints.add("compliance")
     return a
 
 
@@ -264,6 +386,64 @@ async def llm_update(draft: dict, text: str) -> dict:
     return {"action": "unrelated", "fields": {}, "question": None}
 
 
+_CONFIRM_RE = re.compile(
+    r"^(ok(ay)?\b[\s,.!]*)?(yes\b[\s,.!]*)?"
+    r"(raise|submit|send|confirm|go ahead|proceed)(\s+it)?[\s.!]*$",
+    re.IGNORECASE)
+_DISCARD_RE = re.compile(
+    r"^(cancel|discard|never\s?mind|drop it|forget it)\b", re.IGNORECASE)
+_QTY_REPLY_RE = re.compile(
+    r"^(?:make it |change (?:it )?to )?(\d+(?:\.\d+)?)\s*(kg|g)\b"
+    r"(\s*each)?[\s.!]*$", re.IGNORECASE)
+
+
+def fallback_update(draft: dict, text: str) -> dict:
+    """No-LLM interpretation of a reply to an active draft — keeps the
+    conversational loop alive when the API is down or out of credits.
+    Deterministic and conservative: anything it can't clearly match is
+    'unrelated' (falls through to normal routing), never a guess."""
+    t = text.strip()
+    if _CONFIRM_RE.match(t):
+        return {"action": "confirm", "fields": {}, "question": None}
+    if _DISCARD_RE.match(t):
+        return {"action": "discard", "fields": {}, "question": None}
+    fields: dict = {}
+    qm = _QTY_REPLY_RE.match(t)
+    if qm:
+        n = float(qm.group(1))
+        fields["qty"] = int(n * 1000) if qm.group(2).lower() == "kg" else int(n)
+        if qm.group(3):
+            draft["ask"].qty_each = True
+    gm = _BAG_LINE.search(t)
+    if gm and len(t) < 60:
+        fields["bag"] = "NP bag" if gm.group(1).lower() == "np" else "Empty bag"
+    bm = _BUDGET_LINE.search(t)
+    if bm and re.search(r"budget|usd|cheap", t, re.I) and len(t) < 80:
+        val = (bm.group(1) or bm.group(2) or bm.group(3) or "").strip()
+        if val:
+            fields["budget"] = val
+    cm = _COMPLIANCE_LINE.search(t)
+    if cm:
+        val = _normalize_markets(cm.group(1))
+        if val:
+            fields["compliance"] = val
+    nm = _NEEDBY_LINE.search(t)
+    if nm and len(t) < 60:
+        fields["need_by"] = ((nm.group(1) or nm.group(2)) or "").strip().upper()
+    am = _ATTN_LINE.search(t)
+    if am:
+        fields["attn"] = am.group(1).strip()
+    km = _CONTACT_LINE.search(t)
+    if km:
+        fields["contact"] = km.group(1).strip()
+    dm = _ADDR_LINE.search(t)
+    if dm:
+        fields["addr"] = dm.group(1).strip()
+    if fields:
+        return {"action": "modify", "fields": fields, "question": None}
+    return {"action": "unrelated", "fields": {}, "question": None}
+
+
 def apply_fields(draft: dict, fields: dict) -> None:
     """Merge an LLM 'modify' result into the draft in place."""
     d = draft["derived"]
@@ -291,6 +471,9 @@ def apply_fields(draft: dict, fields: dict) -> None:
         elif k in ("bag", "budget", "compliance", "attn", "contact",
                    "addr", "assignee", "need_by"):
             draft[k] = str(v)
+            # a reply IS an explicit statement — it must never be
+            # re-overridden by derived values, and clears 'confirm' flags
+            draft.setdefault("src", {})[k] = "you"
     draft["missing"] = [m for m, val in
                         (("bag", draft["bag"]),
                          ("ship-to", draft["attn"] or draft["addr"]))
@@ -316,10 +499,36 @@ def parsed_to_text(parsed: dict) -> str:
 
 # ----------------------------------------------------------- customer + SR
 
+_GENERIC_TOKENS = {
+    "food", "foods", "ltd", "limited", "co", "company", "pte", "sdn", "bhd",
+    "inc", "corp", "corporation", "industries", "industry", "group",
+    "global", "international", "trading", "enterprise", "enterprises",
+    "manufacturing", "the", "and", "of",
+}
+
+def _plausible(query: str, name: str) -> bool:
+    """A candidate is only plausible if a DISTINCTIVE query token matches a
+    distinctive name token. Kills 'pran food' → 'AKIJ FOOD AND BEVERAGE'
+    (they share only the generic 'food') — same bug class as Prantalay."""
+    from rapidfuzz import fuzz
+    q_toks = [t for t in re.findall(r"[a-z0-9]+", query.lower())
+              if t not in _GENERIC_TOKENS and len(t) >= 3]
+    n_toks = [t for t in re.findall(r"[a-z0-9]+", name.lower())
+              if t not in _GENERIC_TOKENS and len(t) >= 3]
+    if not q_toks or not n_toks:
+        return True  # nothing distinctive to judge by — don't over-filter
+    for qt in q_toks:
+        for nt in n_toks:
+            if qt in nt or nt in qt or fuzz.ratio(qt, nt) >= 80:
+                return True
+    return False
+
+
 def resolve_customer(q: str) -> tuple[dict | None, list[dict]]:
     """Best customer + runner-up candidates from master + FSL names."""
     merged = sheets.load_merged_customers()
-    hits = matcher.top_customer_master(q, merged, limit=3)
+    hits = matcher.top_customer_master(q, merged, limit=5)
+    hits = [h for h in hits if _plausible(q, h.get("name", ""))][:3]
     qsq = re.sub(r"[^a-z0-9]", "", q.lower())
     fsl_names: Counter = Counter()
     for tab in (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB):
@@ -711,19 +920,59 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
                 "sr_code": sr_code, "territory": territory,
                 "codes": ask.codes}
 
-    # memory + overrides beat page-derived values
-    bag = ask.overrides.get("bag") or mem_get(customer, "bag")
-    compliance = (ask.overrides.get("compliance")
-                  or mem_get(customer, "compliance")
-                  or ship["compliance"] or d["country"])
-    budget = ask.overrides.get("budget") or mem_get(customer, "budget") or d["budget"]
-    attn = ask.overrides.get("attn") or ship["attn"] or mem_get(customer, "attn")
-    contact = ask.overrides.get("contact") or ship["contact"] or mem_get(customer, "contact")
-    addr = ask.overrides.get("addr") or ship["addr"] or mem_get(customer, "addr")
+    # ABSOLUTE RULE (Alex, 31 Aug — after his '<2 usd' was silently
+    # replaced by the derived 'USD 3.62-9.07' band): anything the user
+    # EXPLICITLY stated always wins over derived/remembered values. A field
+    # keyword we saw but couldn't read (hint) shows 'please confirm' and
+    # suppresses the derived proposal — a wrong confident number is far
+    # worse than a blank.
+    src: dict[str, str] = {}
+
+    def pick(key, explicit, *fallbacks):
+        if explicit:
+            src[key] = "you"
+            return explicit
+        if key in ask.hints:
+            src[key] = "confirm"
+            return ""
+        for label, val in fallbacks:
+            if val:
+                src[key] = label
+                return val
+        src[key] = ""
+        return ""
+
+    bag = pick("bag", ask.overrides.get("bag"),
+               ("remembered", mem_get(customer, "bag")))
+    compliance = pick("compliance", ask.overrides.get("compliance"),
+                      ("remembered", mem_get(customer, "compliance")),
+                      ("their last request", ship["compliance"]),
+                      ("their country", d["country"]))
+    budget = pick("budget", ask.overrides.get("budget"),
+                  ("remembered", mem_get(customer, "budget")),
+                  (d.get("budget_src") or "history", d["budget"]))
+    # Ship-to stacks every source we hold (Alex: propose and confirm, don't
+    # say 'not known yet'): explicit > SR-page logs > memory > customer
+    # master (address/receiver/phone).
+    master_rec = best if not force_customer else next(
+        (c for c in sheets.load_merged_customers()
+         if c.get("name", "").strip().lower() == customer.strip().lower()), {})
+    attn = pick("attn", ask.overrides.get("attn"),
+                ("their last request", ship["attn"]),
+                ("remembered", mem_get(customer, "attn")),
+                ("customer master", (master_rec or {}).get("receiving_person", "")))
+    contact = pick("contact", ask.overrides.get("contact"),
+                   ("their last request", ship["contact"]),
+                   ("remembered", mem_get(customer, "contact")),
+                   ("customer master", (master_rec or {}).get("receiver_number", "")))
+    addr = pick("addr", ask.overrides.get("addr"),
+                ("their last request", ship["addr"]),
+                ("remembered", mem_get(customer, "addr")),
+                ("customer master", (master_rec or {}).get("address", "")))
     if ask.overrides.get("qty"):
         m = _QTY_RE.search(ask.overrides["qty"] + "g")
         if m:
-            d["qty"] = int(float(m.group(1)))
+            d["qty"], d["qty_src"] = int(float(m.group(1))), "you specified"
     if ask.overrides.get("type") in ("new", "rep", "mod"):
         d["rtype"] = ask.overrides["type"]
         d["rtype_label"] = {"new": "New", "rep": "Repeat", "mod": "Modify"}[d["rtype"]]
@@ -739,8 +988,9 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
         "sr_code": sr_code, "territory": territory, "prefix": prefix,
         "ask": ask, "derived": d, "bag": bag, "budget": budget,
         "compliance": compliance, "attn": attn, "contact": contact,
-        "addr": addr, "assignee": assignee, "need_by": "",
-        "page_err": page_err,
+        "addr": addr, "assignee": assignee,
+        "need_by": (ask.overrides.get("need_by") or "").upper(),
+        "page_err": page_err, "src": src,
         "missing": [k for k, v in
                     (("bag", bag), ("ship-to", attn or addr))
                     if not v],
@@ -758,8 +1008,15 @@ def render_reqnote(draft: dict) -> str:
     if ask.ask_text:
         lines.append(ask.ask_text.upper() if ask.ask_text.islower()
                      else ask.ask_text)
-    lines.append(f"QTY: {d['qty']}G X {d['sets']} SET"
-                 + ("S" if d["sets"] != 1 else ""))
+    # "1kg for each sample" (multi-flavour asks) → EACH, matching the house
+    # convention: multi-flavour requests are ONE item with a flavour list
+    # (verified across the corpus — Rich's 2026 butter-range and nasi-lemak
+    # requests list up to 6 flavours in a single section).
+    if ask.qty_each:
+        lines.append(f"QTY: {d['qty']}G EACH")
+    else:
+        lines.append(f"QTY: {d['qty']}G X {d['sets']} SET"
+                     + ("S" if d["sets"] != 1 else ""))
     if draft["bag"]:
         lines.append(f"BAG: {draft['bag'].upper()}")
     if draft["budget"]:

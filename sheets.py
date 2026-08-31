@@ -174,9 +174,19 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
     sh = _get_client().open_by_key(config.SEASONING_SHEET_ID)
     cleaned: list[dict[str, Any]] = []
     per_tab: list[tuple[str, int]] = []
+    # System/backup tabs share this workbook. Reading them here burned a
+    # full get_all_records per tab on EVERY cache miss (the FSL tabs alone
+    # are tens of thousands of rows — read again below through the cached
+    # loader anyway) and risked a legacy-schema backup poisoning the
+    # catalog with frozen prices.
+    _skip = ("bk ", "submissions", "query", "rmc cache", "_sync",
+             "price watches", "sr bot memory")
     for ws in sh.worksheets():
-        if "copy" in ws.title.lower():
+        t = ws.title.lower()
+        if "copy" in t or t.startswith(_skip):
             continue
+        if ws.title in (FSL_TAB, JAKARTA_FSL_TAB, BANGKOK_FSL_TAB):
+            continue  # consumed via the cached FSL fallback below
         try:
             rows = ws.get_all_records()
         except Exception as e:  # noqa: BLE001
@@ -252,7 +262,17 @@ def load_seasonings(force: bool = False) -> list[dict[str, Any]]:
         cleaned = list(derived.values())
         per_tab.append(("<FSL fallback>", len(cleaned)))
 
-    _seasoning_cache = (now, cleaned)
+    if not cleaned and _seasoning_cache and _seasoning_cache[1]:
+        # A transient outage used to cache an EMPTY catalog for the full
+        # hour TTL — /pp suggestions, keyword search, OCR healing and the
+        # inline mode all went dark. Keep serving the previous catalog and
+        # re-arm the TTL so we retry after the window, not per-request.
+        log.warning("load_seasonings: empty load — keeping prior %d-item "
+                    "catalog", len(_seasoning_cache[1]))
+        _seasoning_cache = (now, _seasoning_cache[1])
+        return _seasoning_cache[1]
+    if cleaned:
+        _seasoning_cache = (now, cleaned)
     log.info(
         "Loaded %d seasonings across %d tabs (%s)",
         len(cleaned),
@@ -526,6 +546,9 @@ def sort_fsl_by_date(tab: str = FSL_TAB) -> int:
         # thousands of cells and makes any diff of this sheet meaningless.
         value_input_option="RAW",
     )
+    # A sort rewrites every row's physical position — any cached rows (and
+    # anything holding row NUMBERS, like the AWB writer) are now wrong.
+    _invalidate_fsl_cache()
     return len(sorted_data)
 
 
@@ -1070,19 +1093,26 @@ def load_past_submissions(force: bool = False) -> list[dict[str, str]]:
     ):
         return _past_submissions_cache[1]
 
+    def _keep_prior(why: str) -> list[dict[str, str]]:
+        # Don't cache emptiness on failure — serve the previous payload (if
+        # any) and re-arm the TTL so one 503 can't blank suggestions for
+        # the whole 30-minute window.
+        global _past_submissions_cache
+        prior = _past_submissions_cache[1] if _past_submissions_cache else []
+        log.warning("load_past_submissions: %s — serving %d cached rows",
+                    why, len(prior))
+        _past_submissions_cache = (now, prior)
+        return prior
+
     try:
         ws = _open_ops().worksheet(config.TAB_SALES_LOG)
     except Exception as e:  # noqa: BLE001
-        log.warning("load_past_submissions: %s tab missing (%s)", config.TAB_SALES_LOG, e)
-        _past_submissions_cache = (now, [])
-        return []
+        return _keep_prior(f"{config.TAB_SALES_LOG} tab missing ({e})")
 
     try:
         rows = ws.get_all_records()
     except Exception as e:  # noqa: BLE001
-        log.warning("load_past_submissions: failed to read rows: %s", e)
-        _past_submissions_cache = (now, [])
-        return []
+        return _keep_prior(f"failed to read rows: {e}")
 
     parts_keys = (
         "Seasoning Requested",
@@ -1444,8 +1474,15 @@ def load_fsl_rows_all(tab: str = FSL_TAB) -> list[dict[str, str]]:
         except gspread.WorksheetNotFound:
             return []
         values = ws.get_all_values()
-    except Exception as e:  # noqa: BLE001 — anything from the network layer
-        return _serve_lkg(f"read failed ({type(e).__name__})")
+    except Exception:
+        # No LKG to fall back on → RE-RAISE. Swallowing here returned []
+        # and made every caller's outage handling dead code: an outage right
+        # after a redeploy (cold LKG) answered searches with a confident
+        # "no samples found" and the 18:00 digest with "no samples logged
+        # today". Callers that want resilience already catch exceptions.
+        if not _FSL_ROWS_LKG.get(cache_key):
+            raise
+        return _serve_lkg("read failed")
 
     if len(values) < 2:
         # Genuine empty is indistinguishable from a soft 503 that returned
@@ -1512,13 +1549,20 @@ def load_fsl_rows_for_sales(sales_name: str, tab: str = FSL_TAB) -> list[dict[st
 
 
 def is_user_authorized(tg_user_id: int, username: str | None) -> bool:
+    # Same normalization as get_user_mms_name: _norm_tg_id handles ID cells
+    # Sheets typed as numbers ("1039554107.0"), _row_get_loose handles
+    # padded/renamed-case headers. Raw comparison here locked out users
+    # whose /pp MMS-name lookup worked fine — an "intermittent" mystery.
     uname = (username or "").lstrip("@").lower()
+    target_id = _norm_tg_id(tg_user_id)
     for row in load_users():
-        if str(row.get("Active", "")).strip().lower() not in {"y", "yes", "true", "1"}:
+        if str(_row_get_loose(row, "Active")).strip().lower() not in {
+                "y", "yes", "true", "1"}:
             continue
-        row_id = str(row.get("Telegram User ID", "")).strip()
-        row_uname = str(row.get("Telegram Username", "")).lstrip("@").lower()
-        if row_id and row_id == str(tg_user_id):
+        row_id = _norm_tg_id(_row_get_loose(row, "Telegram User ID"))
+        row_uname = str(_row_get_loose(row, "Telegram Username")
+                        ).lstrip("@").lower()
+        if row_id and row_id == target_id:
             return True
         if row_uname and row_uname == uname:
             return True
@@ -2061,17 +2105,43 @@ def list_price_watches(tg_user_id: int | None = None) -> list[dict]:
     return out
 
 
-def update_watch_price(row_number: int, new_price_usd: float | None) -> None:
-    """Write Last Price + Last Checked for a watch row. new_price_usd=None
-    leaves the price blank but still stamps a check time (so we don't hammer
-    a code MMS can't answer)."""
+def update_watch_price(tg_user_id, code: str,
+                       new_price_usd: float | None) -> None:
+    """Write Last Price + Last Checked for one user's watch on a code.
+    new_price_usd=None leaves the price blank but still stamps a check time
+    (so we don't hammer a code MMS can't answer).
+
+    Locates the row by (user, code) at write time — row NUMBERS from an
+    earlier list_price_watches snapshot go stale the moment any watch is
+    removed (delete_rows shifts everything up), and a stale number stamped
+    another user's watch with the wrong price, which then fabricated a
+    bogus price-move DM for them the next morning."""
     import datetime as _dt
+    code = (code or "").strip().upper()
     ws = _ensure_watch_tab()
-    header = ws.row_values(1)
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return
+    header = values[0]
     idx = {h: i for i, h in enumerate(header)}
-    price_col = gspread.utils.rowcol_to_a1(row_number, idx["Last Price USD"] + 1)
-    check_col = gspread.utils.rowcol_to_a1(row_number, idx["Last Checked UTC"] + 1)
-    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    price_str = f"{new_price_usd:.4f}" if new_price_usd is not None else ""
-    ws.update(range_name=price_col, values=[[price_str]], value_input_option="RAW")
-    ws.update(range_name=check_col, values=[[stamp]], value_input_option="RAW")
+    uid_s = str(tg_user_id)
+    for i, r in enumerate(values[1:], 2):
+        r += [""] * (len(header) - len(r))
+        if r[idx["Telegram User ID"]] == uid_s and \
+                r[idx["Product Code"]].strip().upper() == code:
+            stamp = _dt.datetime.now(_dt.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC")
+            updates = [{"range": gspread.utils.rowcol_to_a1(
+                            i, idx["Last Checked UTC"] + 1),
+                        "values": [[stamp]]}]
+            if new_price_usd is not None:
+                # None = MMS couldn't answer → stamp the check only. The
+                # old code wrote "" here, ERASING the baseline on every
+                # MMS hiccup so the next real move never alerted.
+                updates.append({"range": gspread.utils.rowcol_to_a1(
+                                    i, idx["Last Price USD"] + 1),
+                                "values": [[f"{new_price_usd:.4f}"]]})
+            ws.batch_update(updates, value_input_option="RAW")
+            return
+    log.warning("update_watch_price: no watch row for user %s code %s",
+                tg_user_id, code)

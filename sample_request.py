@@ -63,7 +63,10 @@ _CODE_RE = re.compile(
     r"\b[SJTB]-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,6}\b", re.IGNORECASE
 )
 _QTY_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(kg|g)\b", re.IGNORECASE)
-_SETS_RE = re.compile(r"\b[xX]\s*(\d+)\b|\b(\d+)\s*sets?\b", re.IGNORECASE)
+# 'x N' means sets ONLY when N isn't counting flavours — '200g x 3 flavours'
+# used to read as 3 SETS (a 9× over-order on a 3-flavour ask).
+_SETS_RE = re.compile(
+    r"\b[xX]\s*(\d+)\b(?!\s*flavou?rs?)|\b(\d+)\s*sets?\b", re.IGNORECASE)
 _MOD_RE = re.compile(
     r"\bmodif|\bchange\b|\badjust|\bimprove|\breduce\b|\bincrease\b|"
     r"\bless\b|\bmore\b|\bthicker|\bthinner|\bcloser to\b", re.IGNORECASE
@@ -133,8 +136,18 @@ class Ask:
     restriction: str = ""   # halal / gluten-free / non-GMO …
     structured: bool = False  # True only when block detection is CONFIDENT
 
+    def body_text(self) -> str:
+        """ask_text PLUS the structured flavour blocks — for detection scans
+        (modify-keywords etc.) that must see the whole request, not just the
+        intro left behind after _structure_body moved the blocks out."""
+        parts = [self.ask_text]
+        for f in self.flavours:
+            parts.append(f.get("name", ""))
+            parts.extend(f.get("spec", []))
+        return "\n".join(p for p in parts if p)
+
 _OVR_KEYS = {"bag", "budget", "compliance", "attn", "addr", "address",
-             "contact", "qty", "sets", "assignee", "type", "base"}
+             "contact", "qty", "sets", "assignee", "type", "base", "need_by"}
 
 # Markets the fallback normalizer knows (typo-tolerant via fuzzy match).
 _MARKETS = [
@@ -188,9 +201,19 @@ _RESTRICTION_LINE = re.compile(
     r"non.?irradiated)[^\n]*)", re.IGNORECASE)
 _NUM_ITEM = re.compile(r"^(\d+)[.)]\s*(.+)$")
 _ATTN_LINE = re.compile(r"\battn\.?\s*[:\-]?\s*(.+)", re.IGNORECASE)
+# (?![A-Za-z]) — without it 'tel' matched INSIDE 'Tellicherry'/'Telur' and
+# the rest of a spec line was consumed as CONTACT NO. and written into MMS.
 _CONTACT_LINE = re.compile(
-    r"\b(?:contact(?:\s*no\.?)?|phone|tel)\s*[:\-]?\s*(.+)", re.IGNORECASE)
-_ADDR_LINE = re.compile(r"\baddress\s*[:\-]?\s*(.+)", re.IGNORECASE)
+    r"\b(?:contact(?:\s*no\.?)?|phone|tel)(?![A-Za-z])\s*[:\-]?\s*(.+)",
+    re.IGNORECASE)
+# Line-start OR explicit colon — 'Please address the bitterness at the end'
+# is the verb, not a shipping address. Value is group(1) or group(2).
+_ADDR_LINE = re.compile(
+    r"^\s*address\b\s*[:\-]?\s*(.+)|\baddress\s*:\s*(.+)", re.IGNORECASE)
+# Lines that give a USAGE rate, not a sample size — 'dosage 15g per kg of
+# chips' must never become the request quantity.
+_DOSAGE_LINE = re.compile(
+    r"\bdosage|\busage|\bper\s+kg\b|\bper\s+100\s*g\b", re.IGNORECASE)
 
 
 def _structure_body(a: Ask, body: list[str]) -> None:
@@ -274,15 +297,21 @@ def parse_ask(text: str) -> Ask:
     'please confirm' instead of a confidently wrong derived number.
     The old ';key: value' syntax still works, silently."""
     a = Ask()
-    # legacy ';key: value' segments first (silent compatibility)
-    semi = [p.strip() for p in text.split(";")]
+    # legacy ';key: value' segments first (silent compatibility). ONLY a
+    # segment that actually looks like an override is consumed — any other
+    # ';' is ordinary punctuation and its text is KEPT. (This used to keep
+    # semi[0] only, so 'Lemon Habanero; Jalapeno; Salsa Verde' silently
+    # truncated the request to one flavour and dropped every later line.)
+    semi = text.split(";")
+    kept = [semi[0]]
     for seg in semi[1:]:
-        if ":" in seg and "\n" not in seg:
-            k, v = seg.split(":", 1)
-            k = k.strip().lower()
-            if k in _OVR_KEYS:
-                a.overrides["addr" if k == "address" else k] = v.strip()
-    text = semi[0] if len(semi) > 1 else text
+        k, sep, v = seg.partition(":")
+        key = k.strip().lower()
+        if sep and "\n" not in seg and key in _OVR_KEYS:
+            a.overrides["addr" if key == "address" else key] = v.strip()
+        else:
+            kept.append(seg)
+    text = ";".join(kept)
 
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
@@ -333,9 +362,9 @@ def parse_ask(text: str) -> Ask:
             consumed = True
         dm = _ADDR_LINE.search(line)
         if dm:
-            a.overrides["addr"] = dm.group(1).strip()
+            a.overrides["addr"] = (dm.group(1) or dm.group(2) or "").strip()
             consumed = True
-        qm = _QTY_RE.search(line)
+        qm = None if _DOSAGE_LINE.search(line) else _QTY_RE.search(line)
         if qm and a.qty_g is None:
             n = float(qm.group(1))
             a.qty_g = int(n * 1000) if qm.group(2).lower() == "kg" else int(n)
@@ -361,15 +390,26 @@ def parse_ask(text: str) -> Ask:
 
     _structure_body(a, body)
     a.ask_text = "\n".join(body).strip()
-    blob = a.ask_text + " "
-    a.codes = [c.upper() for c in _CODE_RE.findall(blob)]
+    # Codes/qty are scanned over the FULL original text, not the post-
+    # structure ask_text — structuring moves flavour blocks out of ask_text,
+    # which blinded the code/'modify' detection ('closer to S-18CS43-002'
+    # inside a numbered block yielded rtype=New with no base code). Digit
+    # requirement: every real MMS code has one; 'T-bone' does not, and it
+    # used to trigger a bogus Singapore-only refusal.
+    blob = text + " "
+    a.codes = [c.upper() for c in _CODE_RE.findall(blob)
+               if any(ch.isdigit() for ch in c)]
     if a.qty_g is None:
-        m2 = _QTY_RE.search(blob)
-        if m2:
-            n = float(m2.group(1))
-            a.qty_g = int(n * 1000) if m2.group(2).lower() == "kg" else int(n)
-            if re.search(r"\beach\b", blob, re.I):
-                a.qty_each = True
+        for _bl in blob.splitlines():
+            if _DOSAGE_LINE.search(_bl):
+                continue
+            m2 = _QTY_RE.search(_bl)
+            if m2:
+                n = float(m2.group(1))
+                a.qty_g = int(n * 1000) if m2.group(2).lower() == "kg" else int(n)
+                if re.search(r"\beach\b", blob, re.I):
+                    a.qty_each = True
+                break
     m3 = _SETS_RE.search(blob)
     if m3:
         a.sets = int(m3.group(1) or m3.group(2))
@@ -464,9 +504,12 @@ async def llm_parse(text: str) -> dict | None:
     return None
 
 
-async def llm_update(draft: dict, text: str) -> dict:
-    """Interpret a reply to an active draft. Always returns an action dict;
-    on LLM failure the reply is treated as unrelated (normal routing)."""
+async def llm_update(draft: dict, text: str) -> dict | None:
+    """Interpret a reply to an active draft. Returns None when the LLM is
+    UNAVAILABLE (caller may then try the regex fallback); a real LLM verdict
+    of 'unrelated' is returned as-is and must be respected — re-running the
+    loose regex fallback on top of it hijacked ordinary product searches
+    ('cheese b code below 4usd' became a silent budget edit)."""
     import ai
     import json as _json
     snapshot = {
@@ -489,7 +532,7 @@ async def llm_update(draft: dict, text: str) -> dict:
             return d
     except Exception as e:  # noqa: BLE001
         log.warning("SR llm_update failed: %s", e)
-    return {"action": "unrelated", "fields": {}, "question": None}
+    return None
 
 
 _CONFIRM_RE = re.compile(
@@ -501,6 +544,15 @@ _DISCARD_RE = re.compile(
 _QTY_REPLY_RE = re.compile(
     r"^(?:make it |change (?:it )?to )?(\d+(?:\.\d+)?)\s*(kg|g)\b"
     r"(\s*each)?[\s.!]*$", re.IGNORECASE)
+
+
+# What may sit BEFORE a bare value for the fallback to treat it as a draft
+# edit ("make it <2 usd", "budget <2 usd", "<2 usd") — a product keyword
+# there ("cheese b code below 4usd") means it's a SEARCH, not an edit.
+_EDIT_PREFIX_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?\b[\s,]*)?(?:please\b\s*)?"
+    r"(?:make\s+(?:it|the\s+budget)|set(?:\s+it)?|budget|"
+    r"change\s+(?:it\s+)?to)?\s*$", re.IGNORECASE)
 
 
 def fallback_update(draft: dict, text: str) -> dict:
@@ -526,7 +578,15 @@ def fallback_update(draft: dict, text: str) -> dict:
     bm = _BUDGET_LINE.search(t)
     if bm and re.search(r"budget|usd|cheap", t, re.I) and len(t) < 80:
         val = (bm.group(1) or bm.group(2) or bm.group(3) or "").strip()
-        if val:
+        # Bare forms ("<2 usd" / "cheap as possible") count as an edit ONLY
+        # when nothing search-like precedes them, and the cheap-form must BE
+        # the whole message ('cheapest chicken powder' is a search).
+        ok = bool(bm.group(1))
+        if not ok and val:
+            ok = bool(_EDIT_PREFIX_RE.match(t[:bm.start()]))
+            if ok and bm.group(3):
+                ok = bm.end() >= len(t) - 2
+        if ok and val:
             fields["budget"] = val
     cm = _COMPLIANCE_LINE.search(t)
     if cm:
@@ -535,16 +595,20 @@ def fallback_update(draft: dict, text: str) -> dict:
             fields["compliance"] = val
     nm = _NEEDBY_LINE.search(t)
     if nm and len(t) < 60:
-        fields["need_by"] = ((nm.group(1) or nm.group(2)) or "").strip().upper()
+        # A bare urgency word ('asap', 'next week') is only an edit when it
+        # is essentially the whole message — inside a longer sentence it's
+        # probably a search or small talk.
+        if nm.group(1) or len(t) < 25:
+            fields["need_by"] = ((nm.group(1) or nm.group(2)) or "").strip().upper()
     am = _ATTN_LINE.search(t)
-    if am:
+    if am and len(t) < 60:
         fields["attn"] = am.group(1).strip()
     km = _CONTACT_LINE.search(t)
-    if km:
+    if km and len(t) < 60:
         fields["contact"] = km.group(1).strip()
     dm = _ADDR_LINE.search(t)
     if dm:
-        fields["addr"] = dm.group(1).strip()
+        fields["addr"] = (dm.group(1) or dm.group(2) or "").strip()
     if fields:
         return {"action": "modify", "fields": fields, "question": None}
     return {"action": "unrelated", "fields": {}, "question": None}
@@ -594,9 +658,12 @@ def parsed_to_text(parsed: dict) -> str:
         bits[0] += f" {parsed['qty_g']}g"
     if parsed.get("sets"):
         bits[0] += f" x {parsed['sets']}"
+    # need_by included: it used to survive only via cmd_sr's post-build
+    # fix-up, so the pending-pick rebuild silently dropped 'need it next
+    # week' back to STANDARD.
     keymap = {"bag": "bag", "budget": "budget", "compliance": "compliance",
               "attn": "attn", "contact": "contact", "addr": "addr",
-              "rtype": "type", "base_code": "base"}
+              "rtype": "type", "base_code": "base", "need_by": "need_by"}
     for k, ov in keymap.items():
         if parsed.get(k):
             bits.append(f"{ov}: {parsed[k]}")
@@ -772,10 +839,10 @@ def derive_defaults(hist: list[dict], ask: Ask) -> dict:
     # request type — inferred, never defaulted (the 49% fix)
     hist_codes = {str(r.get("Product Code") or "").strip().upper() for r in hist}
     if ask.codes and all(c in hist_codes for c in ask.codes) \
-            and not _MOD_RE.search(ask.ask_text):
+            and not _MOD_RE.search(ask.body_text()):
         d["rtype"], d["rtype_label"] = "rep", "Repeat"
         d["base_code"] = ask.codes[0]
-    elif ask.codes and _MOD_RE.search(ask.ask_text):
+    elif ask.codes and _MOD_RE.search(ask.body_text()):
         d["rtype"], d["rtype_label"] = "mod", "Modify"
         d["base_code"] = ask.codes[0]
     else:
@@ -889,9 +956,17 @@ class SRWriter:
             if rtype in ("rep", "mod") and base_code:
                 fill[f"reqProductCode[{n}]"] = base_code
             html3 = self._post(sr_code, _override(_form_payload(form2), fill))
-            # verify: our text is on the page and the section saved
-            probe = reqnote.strip().splitlines()[0][:40]
-            if probe and probe not in html3:
+            # verify: our text is on the page and the section saved.
+            # Compare against the UNESCAPED page ('&' arrives as '&amp;',
+            # which made every ask containing & fail verification and
+            # invite a duplicate raise), and probe with a line that is
+            # unique to THIS request — 'No prefer code.' appears in older
+            # items on the same SR, so it proved nothing.
+            import html as _html
+            probe_lines = [l.strip() for l in reqnote.splitlines()
+                           if l.strip() and l.strip() != "No prefer code."]
+            probe = (probe_lines[0] if probe_lines else "")[:40]
+            if probe and probe not in _html.unescape(html3):
                 return self._bail(sr_code,
                                   f"request{n}: submitted text not found on page")
             # assign + save
@@ -925,7 +1000,10 @@ class SRWriter:
                                               {"command": "clear"}))
         except Exception:  # noqa: BLE001
             log.exception("SR clear-after-fail also failed")
-        return {"ok": False, "detail": why + " (empty item cleared)"}
+        # 'clear' removes only EMPTY items — if the reqnote had already
+        # saved, the item is still there. Never claim it was removed.
+        return {"ok": False, "detail": why + " (cleanup attempted — check "
+                                             "the SR in MMS before retrying)"}
 
     # -- live SR lookup ---------------------------------------------------
     _cl_map: dict[str, str] | None = None  # squished customer name -> modal id
@@ -951,7 +1029,11 @@ class SRWriter:
             key = re.sub(r"[^a-z0-9]", "", name.lower())
             if key:
                 mapping[key] = m.group(1)
-        SRWriter._cl_map = mapping
+        if mapping:
+            # Never cache an EMPTY map — one bad fetch (login redirect,
+            # 5xx body) used to disable live SR lookup for the whole
+            # process lifetime with no visible error.
+            SRWriter._cl_map = mapping
         return mapping
 
     def newest_sr_for(self, customer_name: str) -> str:
@@ -1106,9 +1188,11 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
     # guessing; an explicit override still wins for flexibility.
     assignee = ask.overrides.get("assignee") or TERRITORY_ASSIGNEE[prefix]
 
+    import time as _time
     token = secrets.token_hex(3)
     draft = {
         "token": token, "user_id": user_id, "customer": customer,
+        "created_at": _time.time(),
         "sr_code": sr_code, "territory": territory, "prefix": prefix,
         "ask": ask, "derived": d, "bag": bag, "budget": budget,
         "compliance": compliance, "attn": attn, "contact": contact,

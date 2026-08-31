@@ -105,6 +105,11 @@ _QTY_SUBS = {
 SGT_OFFSET_HOURS = 8
 SAMPLES_PAGE_SIZE = 5
 
+# PTB v20+ run_daily days: 0=SUNDAY … 6=Saturday (changed from 0=Monday in
+# v20). Every scheduler here assumed the old convention, so all the "Mon-Fri"
+# jobs ran Sun-Thu — no Friday digest/MMS-sync, and Sunday firings instead.
+_WEEKDAYS = (1, 2, 3, 4, 5)  # Monday-Friday
+
 
 def _sgt_now() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=SGT_OFFSET_HOURS)
@@ -1397,19 +1402,26 @@ async def _origin_row_for(code: str) -> tuple[dict | None, str]:
     if row:
         return row, "exact"
     root = _code_family_root(code)
-    try:
-        tab = sheets.fsl_tab_for_code(root)
-        from datetime import date as _d
-        fam = [
-            r for r in await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
-            if (lambda c: c == root or c.startswith(root + "-"))(
-                (r.get("Product Code") or "").strip().upper()
-            )
-        ]
-        if fam:
-            return max(fam, key=lambda r: r.get("_date") or _d.min), "family"
-    except Exception as e:  # noqa: BLE001
-        log.debug("/pp origin family lookup failed for %s: %s", code, e)
+    from datetime import date as _d
+    # Routed tab first, then the other two: rows mis-filed in the "wrong"
+    # region tab (the migrate-stranded scripts prove they happen) made /pp
+    # claim '📭 never been sent out' while the 👥 history button directly
+    # below it — which searches ALL tabs — listed the shipments.
+    primary = sheets.fsl_tab_for_code(root)
+    all_tabs = (sheets.FSL_TAB, sheets.JAKARTA_FSL_TAB, sheets.BANGKOK_FSL_TAB)
+    for tab in [primary] + [t for t in all_tabs if t != primary]:
+        try:
+            fam = [
+                r for r in await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
+                if (lambda c: c == root or c.startswith(root + "-"))(
+                    (r.get("Product Code") or "").strip().upper()
+                )
+            ]
+            if fam:
+                return max(fam, key=lambda r: r.get("_date") or _d.min), "family"
+        except Exception as e:  # noqa: BLE001
+            log.debug("/pp origin family lookup failed for %s in %s: %s",
+                      code, tab, e)
     return None, "none"
 
 
@@ -3886,6 +3898,19 @@ async def _run_lastsample_search(
             return
 
         # No products AND no customers matched.
+        # A failed REFINEMENT often isn't a refinement at all: after
+        # 'cheese', typing 'hung hau' means the CUSTOMER and 'laksa sent to
+        # vietnam' means a country query — the sticky chain glued them into
+        # 'cheese hung hau' and dead-ended. Hand the NEW text alone to the
+        # smart router (it knows reps/customers/countries) instead of
+        # declaring a reset.
+        if prev and query != prev and query.startswith(prev):
+            new_tail = query[len(prev):].strip()
+            if new_tail:
+                ctx.user_data.pop("awaiting_lastsample_query", None)
+                ctx.user_data["lastsample_active_query"] = ""
+                await _smart_route_text(update, ctx, new_tail)
+                return
         # V1.13.12 — when self-scope misses, silently peek at all-reps
         # to see if a colleague has the sample. Most common cause of the
         # 'no product found' confusion: rep typed a code that another
@@ -4735,7 +4760,7 @@ def _match_rep_names(text: str, rep_names: list[str]) -> tuple[list[str], bool]:
     from rapidfuzz import fuzz
 
     q = " ".join((text or "").lower().split())
-    if len(q) < 3:
+    if len(q) < 2:
         return [], False
     strong: list[str] = []
     weak: list[str] = []
@@ -4744,7 +4769,9 @@ def _match_rep_names(text: str, rep_names: list[str]) -> tuple[list[str], bool]:
         if q == n or q == n.split(" ")[0]:
             strong.append(name)
             continue
-        if fuzz.WRatio(q, n) >= 85:
+        # 2-char queries: exact matches only (above) — fuzzy on 2 letters
+        # is noise. Without this tier, the Thai rep 'Nu' was unreachable.
+        if len(q) >= 3 and fuzz.WRatio(q, n) >= 85:
             weak.append(name)
     if strong:
         return strong, True
@@ -4765,12 +4792,20 @@ def _collapse_samples(rows: list[dict]) -> list[dict]:
     Input is assumed newest-first by _date; output preserves that order.
     """
     out: list[dict] = []
-    pos: dict[tuple[str, str, str], int] = {}
+    pos: dict[tuple, int] = {}
     for r in rows:
         code = (r.get("Product Code") or "").strip().upper()
-        date_str = str(r.get("Sample Date Out") or "").strip().lstrip("0")
+        # Prefer the PARSED date — the tabs write dates in several formats,
+        # and the raw string let '01/Apr/2026' vs '2026-04-01' rows escape
+        # the collapse and show as two shipments.
+        date_key = r.get("_date") or \
+            str(r.get("Sample Date Out") or "").strip().lstrip("0")
         cust = " ".join(str(r.get("Customer Name") or "").lower().split())
-        key = (code, date_str, cust)
+        # Sales is part of the key: two DIFFERENT reps shipping the same
+        # code to the same customer on the same day are two shipments, not
+        # MMS duplicate rows — merging them silently dropped one rep's name.
+        sales = " ".join(str(r.get("Sales") or "").lower().split())
+        key = (code, date_key, cust, sales)
         ingested = str(r.get("Ingested At UTC") or "")
         if key in pos:
             rep = out[pos[key]]
@@ -4853,7 +4888,11 @@ async def _show_rep_samples(
     # "show all" button. Customers are then packed whole into pages so the
     # message fits Telegram's 4096-char limit.
     _CUST_CAP = 10          # ≤ this → show every sample inline, no button
-    _BUDGET = 3800          # per-message char budget for the customer blocks
+    # 3500, not 3800: the header (~270 chars incl. _PRICE_ASOF_HINT), sync
+    # footer and version footer are appended AFTER packing, and a page
+    # packed to 3800 could total >4096 — Telegram then rejects the message
+    # and the rep sees only 'Something went wrong', deterministically.
+    _BUDGET = 3500          # per-message char budget for the customer blocks
 
     def _group_block(g: dict) -> tuple[str, bool]:
         """Return (block_text, has_more). Shows up to _CUST_CAP samples; a
@@ -5132,6 +5171,12 @@ async def _show_rep_samples_filtered(
 
     kw, cap = matcher.parse_seasoning_query(filter_text)
     kw = (kw or "").strip()
+    if not kw and cap is None and filter_text.strip():
+        # parse_seasoning_query strips generic words, so 'rich powder'
+        # emptied to nothing and the rep's ENTIRE history came back
+        # labelled 'samples matching powder'. Against literal sample rows a
+        # generic word IS a meaningful substring filter — use the raw text.
+        kw = filter_text.strip()
     country_lc = (country or "").strip().lower()
 
     def _base_keep(r: dict) -> bool:
@@ -5262,7 +5307,12 @@ async def _smart_route_text(
          existing disambiguation) as the final net.
     """
     # 1) Embedded codes win outright ("price for S-668U1 please").
-    codes = _PP_CODE_RE.findall(text)
+    # Real MMS codes always carry digits — without this check, filter
+    # phrases like "b-codes below 4usd" and "t-bone seasoning" matched the
+    # code regex and went to MMS as /pp B-CODES / T-BONE ("not found")
+    # instead of reaching the prefix/keyword search they were meant for.
+    codes = [c for c in _PP_CODE_RE.findall(text)
+             if any(ch.isdigit() for ch in c)]
     if codes:
         unique = _dedupe_codes(codes, cap=_pp_cap_for(update.effective_user))
         await _run_pp_for_codes(update, unique)
@@ -5410,7 +5460,13 @@ async def _smart_route_text(
     # are exactly the prepositions the country trigger needs.
     raw_nc, dest_country = matcher.parse_country_filter(text)
     if dest_country:
-        probe_nc = _route_strip_fillers(raw_nc) if raw_nc.strip() else ""
+        # Strip fillers WITHOUT _route_strip_fillers' never-return-empty
+        # fallback: for 'samples for india' the leftover IS all filler, and
+        # the fallback resurrected it as a bogus keyword filter ('No
+        # samples match "samples" · sent to India'). Empty here correctly
+        # means 'everything sent to that country'.
+        probe_nc = re.sub(r"\s+", " ",
+                          _ROUTE_FILLER_RE.sub(" ", raw_nc)).strip()
         nc_toks = probe_nc.split()
         c_rep, c_rest = "", probe_nc
         for k in (2, 1):
@@ -6229,7 +6285,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # listing has neither concept), so hand those to the smart router.
         _q_np, _q_pfx = matcher.parse_code_prefix(_route_strip_fillers(text))
         _, _q_cap = matcher.parse_seasoning_query(_q_np)
-        if _q_pfx or _q_cap is not None:
+        # A country destination ('laksa sent to vietnam') is a router
+        # feature too — parsed on RAW text (the filler-stripper deletes
+        # 'to'/'for', the very prepositions the trigger needs).
+        _, _q_country = matcher.parse_country_filter(text)
+        if _q_pfx or _q_cap is not None or _q_country:
             ctx.user_data.pop("awaiting_lastsample_query", None)
             await _smart_route_text(update, ctx, text)
             return
@@ -9027,12 +9087,14 @@ async def _build_daily_digest_body() -> tuple[str, int]:
     )
     by_region: dict[str, list[dict]] = {}
     total = 0
+    failed_regions: list[str] = []
     for label, _flag, tab, _show_country in region_specs:
         bucket: list[dict] = []
         try:
             rows = await asyncio.to_thread(sheets.load_fsl_rows_all, tab)
         except Exception as e:  # noqa: BLE001
             log.warning("daily_digest: failed to read tab %r: %s", tab, e)
+            failed_regions.append(label)
             by_region[label] = bucket
             continue
         for r in rows:
@@ -9053,6 +9115,18 @@ async def _build_daily_digest_body() -> tuple[str, int]:
 
     pretty_date = today.strftime("%a, %d %b %Y")
     if total == 0:
+        if failed_regions:
+            # A read failure must NEVER masquerade as a quiet day — reps
+            # trusted "No samples logged today" and stopped chasing.
+            body = (
+                f"📋 <b>This is all the sample send today ah! — "
+                f"{pretty_date}</b>\n\n"
+                f"⚠️ <i>Couldn't read the sample sheet(s) for "
+                f"{h(', '.join(failed_regions))} — Google Sheets is acting "
+                "up, so today's list is unavailable (NOT necessarily "
+                "empty). Check MMS directly.</i>"
+            )
+            return body, 0
         body = (
             f"📋 <b>This is all the sample send today ah! — {pretty_date}</b>\n\n"
             "🪴 <i>No samples logged today across all 3 factories.</i>"
@@ -9068,6 +9142,9 @@ async def _build_daily_digest_body() -> tuple[str, int]:
         f"<i>{total} sample{'s' if total != 1 else ''} across all "
         "3 factories.</i>",
     ]
+    if failed_regions:
+        lines.append(f"⚠️ <i>{h(', '.join(failed_regions))} unreachable — "
+                     "samples from there may be missing below.</i>")
     for label, flag, _tab, show_country in region_specs:
         bucket = by_region.get(label, [])
         n = len(bucket)
@@ -9367,9 +9444,15 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await send(update, f"⚠️ <code>{h(code)}</code> doesn't look like a product code.")
         return
     u = update.effective_user
-    outcome = await asyncio.to_thread(
-        sheets.add_price_watch, u.id, u.username or "", code
-    )
+    try:
+        outcome = await asyncio.to_thread(
+            sheets.add_price_watch, u.id, u.username or "", code
+        )
+    except Exception as e:  # noqa: BLE001 — parity with the 🔔 button path
+        log.warning("/watch add failed for %s: %s", code, e)
+        await send(update, f"⚠️ Couldn't set up the watch for "
+                           f"<code>{h(code)}</code> — {_friendly_fetch_error(e)}")
+        return
     if outcome == "added":
         await send(
             update,
@@ -9391,7 +9474,11 @@ async def cmd_unwatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     code = args[0].strip().upper()
     u = update.effective_user
-    removed = await asyncio.to_thread(sheets.remove_price_watch, u.id, code)
+    try:
+        removed = await asyncio.to_thread(sheets.remove_price_watch, u.id, code)
+    except Exception as e:  # noqa: BLE001
+        await send(update, f"⚠️ Remove failed: {_friendly_fetch_error(e)}")
+        return
     await send(
         update,
         f"🛑 Stopped watching <code>{h(code)}</code>." if removed
@@ -9403,7 +9490,12 @@ async def cmd_watches(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _authorized(update):
         return
     u = update.effective_user
-    items = await asyncio.to_thread(sheets.list_price_watches, u.id)
+    try:
+        items = await asyncio.to_thread(sheets.list_price_watches, u.id)
+    except Exception as e:  # noqa: BLE001
+        await send(update, f"⚠️ Couldn't load your watches: "
+                           f"{_friendly_fetch_error(e)}")
+        return
     if not items:
         await send(
             update,
@@ -9456,23 +9548,27 @@ async def _watch_check_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if new_usd is None:
             continue
         for sub in subs:
-            row_num = sub.get("row_number")
+            uid = str(sub.get("Telegram User ID") or "").strip()
             prior_raw = (sub.get("Last Price USD") or "").strip()
             try:
                 prior = float(prior_raw) if prior_raw else None
             except ValueError:
                 prior = None
-            try:
-                await asyncio.to_thread(sheets.update_watch_price, row_num, new_usd)
-            except Exception as e:  # noqa: BLE001
-                log.warning("watch check: write failed for row %s: %s", row_num, e)
-                continue
             if prior is None:
-                continue  # first reading — no baseline to compare
+                # First reading — set the baseline, no alert to send.
+                try:
+                    await asyncio.to_thread(
+                        sheets.update_watch_price, uid, code, new_usd)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("watch check: baseline write failed for "
+                                "%s/%s: %s", uid, code, e)
+                continue
             move_pct = abs(new_usd - prior) / prior * 100 if prior else 0
             if move_pct < sheets.WATCH_THRESHOLD_PCT:
+                # Below threshold: leave the baseline ALONE. Overwriting it
+                # daily let a 0.8%/day drift climb 10%+ without ever
+                # crossing 1% vs "yesterday" — the alert never fired.
                 continue
-            uid = sub.get("Telegram User ID", "").strip()
             if not uid.isdigit():
                 continue
             arrow = "🔺" if new_usd > prior else "🔻"
@@ -9492,7 +9588,18 @@ async def _watch_check_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 notified += 1
             except Exception as e:  # noqa: BLE001
+                # DM failed → do NOT move the baseline; tomorrow's run
+                # re-detects the same move and retries the alert. (The old
+                # order wrote the baseline first, so a single failed DM
+                # destroyed the alert permanently.)
                 log.warning("watch DM to %s failed: %s", uid, e)
+                continue
+            try:
+                await asyncio.to_thread(
+                    sheets.update_watch_price, uid, code, new_usd)
+            except Exception as e:  # noqa: BLE001
+                log.warning("watch check: write failed for %s/%s: %s",
+                            uid, code, e)
     log.info("watch check: %d codes checked, %d alerts sent", checked, notified)
 
 
@@ -9506,7 +9613,7 @@ async def _schedule_watch_check(application: Application) -> None:
     jq.run_daily(
         _watch_check_job,
         time=_time(hour=8, minute=30, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4),
+        days=_WEEKDAYS,
         name="price_watch_check",
     )
     log.info("price watch check scheduled: 08:30 SGT, Mon-Fri")
@@ -9529,8 +9636,11 @@ async def _followup_nudges_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         active = str(sheets._row_get_loose(row, "Active")).strip().lower()
         if active not in {"y", "yes", "true", "1"}:
             continue
-        mms = str(sheets._row_get_loose(row, "MMS Name")).strip()
-        tid = str(sheets._row_get_loose(row, "Telegram User ID")).strip()
+        # Keyed LOWERCASE and IDs via _norm_tg_id: 'ALEX TAN' in the FSL vs
+        # 'Alex Tan' on the Users tab (or an ID cell Sheets typed as
+        # 1039554107.0) silently dropped that rep from nudges forever.
+        mms = str(sheets._row_get_loose(row, "MMS Name")).strip().lower()
+        tid = sheets._norm_tg_id(sheets._row_get_loose(row, "Telegram User ID"))
         if mms and tid.isdigit():
             tg_by_rep[mms] = int(tid)
     if not tg_by_rep:
@@ -9561,22 +9671,28 @@ async def _followup_nudges_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cutoff_old = today - timedelta(days=14)
     cutoff_dead = today - timedelta(days=120)  # too old to bother nudging
     per_rep: dict[str, list[dict]] = {}
+    rep_display: dict[str, str] = {}
     for r in all_rows:
         d = r.get("_date")
         rep = (r.get("Sales") or "").strip()
         cust_name = (r.get("Customer Name") or "").strip()
         cust = " ".join(cust_name.lower().split())
-        if not (d and rep and cust and rep in tg_by_rep):
+        # bucket by LOWERCASE rep so 'ALEX TAN' and 'Alex Tan' rows land in
+        # one DM instead of two partial ones (or none, on a case mismatch)
+        rep_key = rep.lower()
+        if not (d and rep and cust and rep_key in tg_by_rep):
             continue
         if not (cutoff_dead <= d <= cutoff_old):
             continue
         # Only nudge for the MOST RECENT sample to this customer — no newer
         # follow-up already exists. Older stale rows would be spam.
-        if latest_per_pair.get((rep.lower(), cust)) != d:
+        if latest_per_pair.get((rep_key, cust)) != d:
             continue
-        per_rep.setdefault(rep, []).append(r)
+        rep_display.setdefault(rep_key, rep)
+        per_rep.setdefault(rep_key, []).append(r)
     sent = 0
-    for rep, rows in per_rep.items():
+    for rep_key, rows in per_rep.items():
+        rep = rep_display.get(rep_key, rep_key)
         # date-asc, so oldest (most overdue) leads. Cap to a readable list.
         rows.sort(key=lambda x: x["_date"])
         top = rows[:8]
@@ -9600,13 +9716,13 @@ async def _followup_nudges_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append(f"\n<i>… and {len(rows) - len(top)} more</i>")
         try:
             await ctx.bot.send_message(
-                chat_id=tg_by_rep[rep], text="\n".join(lines),
+                chat_id=tg_by_rep[rep_key], text="\n".join(lines),
                 parse_mode=ParseMode.HTML,
             )
             sent += 1
         except Exception as e:  # noqa: BLE001
             log.warning("followup DM to %s (%s) failed: %s",
-                        rep, tg_by_rep[rep], e)
+                        rep, tg_by_rep[rep_key], e)
     log.info("followup nudges: %d reps notified", sent)
 
 
@@ -9617,11 +9733,12 @@ async def _schedule_followup_nudges(application: Application) -> None:
         log.warning("JobQueue not available — followup nudges NOT scheduled.")
         return
     sgt = ZoneInfo("Asia/Singapore")
-    # Monday 09:00 SGT.
+    # Monday 09:00 SGT (PTB v20+: 0=Sunday, so Monday is 1 — with (0,) this
+    # DM'd the whole sales team on Sunday mornings).
     jq.run_daily(
         _followup_nudges_job,
         time=_time(hour=9, minute=0, tzinfo=sgt),
-        days=(0,),
+        days=(1,),
         name="followup_nudges_weekly",
     )
     log.info("followup nudges scheduled: Mondays 09:00 SGT")
@@ -9983,6 +10100,9 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if parsed and parsed.get("need_by") and not draft.get("error"):
         draft["need_by"] = str(parsed["need_by"]).upper()
+    if update.effective_chat:
+        # Scope conversational edits to this chat — see on_sr_text.
+        draft["chat_id"] = update.effective_chat.id
     if draft.get("error") == "territory":
         codes_note = (
             f" (asked codes: {h(', '.join(draft['codes']))})"
@@ -10009,10 +10129,14 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                        f"<b>{h(asked)}</b> in the master list or sample "
                        "history — check the spelling and resend the /sr line.")
             return
+        import time as _clock
         ptok = _secrets.token_hex(3)
         srq.DRAFTS[ptok] = {"pending_pick": True, "candidates": cands,
                             "raw_text": draft.get("raw_text", build_text),
                             "user_id": update.effective_user.id,
+                            "created_at": _clock.time(),
+                            "chat_id": (update.effective_chat.id
+                                        if update.effective_chat else None),
                             "dry": dry}
         _SR_ACTIVE[update.effective_user.id] = ptok
         rows = [[(c[:40], f"srb:pick:{ptok}:{i}")]
@@ -10059,17 +10183,45 @@ async def _sr_build_with_customer(update, draft, name: str, srq) -> None:
 async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        data: str) -> None:
     import sample_request as srq
+    import time as _clock
+    # Buttons bypass cmd_sr's gate — without this, any authorized rep who
+    # saw the draft message could tap ✅ and write the admin's draft to MMS.
+    if not _is_update_sample_owner(update.effective_user):
+        cq = update.callback_query
+        if cq:
+            try:
+                await cq.answer("🛑 /sr is admin-only while in trial.",
+                                show_alert=True)
+            except Exception:  # noqa: BLE001
+                pass
+        return
     parts = data.split(":", 3)  # srb : verb : token [: arg]
     verb, token = parts[1], parts[2]
     arg = parts[3] if len(parts) > 3 else ""
     draft = srq.DRAFTS.get(token)
+    if draft is not None and draft.get("created_at") and \
+            _clock.time() - draft["created_at"] > config.DRAFT_TIMEOUT_MINUTES * 60:
+        srq.DRAFTS.pop(token, None)
+        draft = None
     if draft is None:
-        await send(update, "⌛ That draft has expired (bot restarted). "
-                           "Resend the /sr line — it takes one message.")
+        # Answer as a POPUP, never by editing the message — a stale second
+        # tap used to overwrite a freshly rendered draft (or the '✅
+        # Raised.' confirmation!) with a false 'bot restarted' notice.
+        cq = update.callback_query
+        if cq:
+            try:
+                await cq.answer("⌛ That draft has expired — resend the "
+                                "/sr line if you still need it.",
+                                show_alert=True)
+            except Exception:  # noqa: BLE001
+                pass
         return
     if verb == "x":
         srq.DRAFTS.pop(token, None)
-        _SR_ACTIVE.pop(update.effective_user.id, None)
+        # Only clear the active pointer if it points at THIS draft —
+        # discarding an older message must not orphan the current one.
+        if _SR_ACTIVE.get(update.effective_user.id) == token:
+            _SR_ACTIVE.pop(update.effective_user.id, None)
         await send(update, "🗑 Draft discarded.")
         return
     if verb == "pick":
@@ -10118,6 +10270,28 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
     from telegram.ext import ApplicationHandlerStop
+    # Draft edits belong to the chat the draft lives in — a message in the
+    # sales GROUP must never be read as an instruction about a private
+    # draft (a stray 'ok send' there once meant an MMS write).
+    chat = update.effective_chat
+    if draft.get("chat_id") and chat and chat.id != draft["chat_id"]:
+        return
+    # …and drafts expire: an abandoned draft used to hijack every later
+    # message shaped like a budget/deadline for the life of the process.
+    import time as _clock
+    age = _clock.time() - draft.get("created_at", 0) \
+        if draft.get("created_at") else 0
+    if age > config.DRAFT_TIMEOUT_MINUTES * 60:
+        srq.DRAFTS.pop(token, None)
+        _SR_ACTIVE.pop(user.id, None)
+        if srq._CONFIRM_RE.match(text) or srq._DISCARD_RE.match(text):
+            await send(update,
+                       f"⌛ That /sr draft expired after "
+                       f"{config.DRAFT_TIMEOUT_MINUTES} min idle — nothing "
+                       "was submitted. Resend the /sr line if you still "
+                       "need it.")
+            raise ApplicationHandlerStop
+        return  # anything else routes normally (search, etc.)
     if draft.get("pending_pick"):
         # A typed answer to 'which customer did you mean?' used to fall
         # through to product search (a confusing seasoning list mid-flow).
@@ -10139,9 +10313,11 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _sr_build_with_customer(update, draft, name, srq)
         raise ApplicationHandlerStop
     upd = await srq.llm_update(draft, text)
-    if upd.get("action") == "unrelated":
-        # LLM unavailable or genuinely unsure — try the deterministic
-        # fallback so the conversational loop survives an empty API balance.
+    if upd is None:
+        # LLM UNAVAILABLE (API down / no credits) — the deterministic
+        # fallback keeps the loop alive. A real LLM verdict of 'unrelated'
+        # is respected as-is: re-running the loose regexes on top of it
+        # used to swallow product searches as silent budget edits.
         upd = srq.fallback_update(draft, text)
     action = upd.get("action")
     if action == "unrelated":
@@ -10193,7 +10369,7 @@ async def _schedule_dispatch_reminder(application: Application) -> None:
     jq.run_daily(
         _dispatch_reminder_job,
         time=_time(hour=18, minute=0, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4),
+        days=_WEEKDAYS,
         name="dispatch_reminder_daily",
     )
     log.info("dispatch reminder scheduled: Mon-Fri 18:00 SGT")
@@ -10204,11 +10380,18 @@ async def _schedule_dispatch_reminder(application: Application) -> None:
 async def _monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Post a monthly summary to DAILY_DIGEST_CHAT_ID on the 1st (weekday
     equivalent) of each month — covers the PRIOR calendar month."""
+    global _monthly_report_sent_for
     if not config.DAILY_DIGEST_CHAT_ID:
         return
     # Only fire on the 1st, 2nd, or 3rd (whichever is the first weekday).
     today = _sgt_now().date()
     if today.day > 3:
+        return
+    # Day 1-3 are all scheduled, so without a marker the identical report
+    # posted up to three mornings running. In-memory is enough — a Railway
+    # restart inside the window is the rare case, and a duplicate then is
+    # harmless vs. a guaranteed triple-post.
+    if _monthly_report_sent_for == (today.year, today.month):
         return
     from calendar import monthrange
     # Compute prior month bounds.
@@ -10302,9 +10485,15 @@ async def _monthly_report_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id=int(config.DAILY_DIGEST_CHAT_ID),
             text="\n".join(lines), parse_mode=ParseMode.HTML,
         )
+        _monthly_report_sent_for = (today.year, today.month)
         log.info("monthly report posted for %s", label)
     except Exception as e:  # noqa: BLE001
         log.warning("monthly report post failed: %s", e)
+
+
+# (year, month) of the last successfully posted monthly report — see the
+# duplicate guard at the top of _monthly_report_job.
+_monthly_report_sent_for: tuple[int, int] | None = None
 
 
 async def _schedule_monthly_report(application: Application) -> None:
@@ -10317,7 +10506,7 @@ async def _schedule_monthly_report(application: Application) -> None:
     jq.run_daily(
         _monthly_report_job,
         time=_time(hour=9, minute=15, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4),
+        days=_WEEKDAYS,
         name="monthly_report",
     )
     log.info("monthly report scheduled: 09:15 SGT, day 1-3 of month")
@@ -10409,11 +10598,10 @@ async def _schedule_daily_digest(application: Application) -> None:
         return
 
     sgt = ZoneInfo("Asia/Singapore")
-    # days: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri. Skips Saturday + Sunday.
     job_queue.run_daily(
         _daily_sample_digest_job,
         time=_time(hour=18, minute=0, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4),
+        days=_WEEKDAYS,
         name="daily_sample_digest",
     )
     log.info("daily_digest scheduled: 18:00 SGT, Mon-Fri, chat %s",
@@ -10585,7 +10773,7 @@ async def _schedule_awb_sync(application: Application) -> None:
         log.warning("JobQueue not available — AWB sync NOT scheduled.")
         return
     sgt = ZoneInfo("Asia/Singapore")
-    # Both runs fire every day (0=Mon … 6=Sun) — DHL/FedEx still
+    # Both runs fire every day — DHL/FedEx still
     # record AWBs on weekends if a rep ships then, and we want the
     # FSL to be current even when the Mon-Fri digest is off.
     job_queue.run_daily(
@@ -10637,7 +10825,7 @@ async def _schedule_weekly_mms_sync(application: Application) -> None:
     job_queue.run_daily(
         _weekly_mms_sync_job,
         time=_time(hour=17, minute=40, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4),
+        days=_WEEKDAYS,
         name="weekday_mms_sync",
     )
     log.info("mms_sync scheduled: Mon-Fri 17:40 SGT (20 min before digest)")

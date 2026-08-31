@@ -48,7 +48,25 @@ _PRICE_STRIP_RE = re.compile(
     r"(?:below|under|less\s+than|cheaper\s+than|max(?:imum)?|<=?)\s*\$?\s*\d+(?:\.\d+)?\s*(?:usd|dollars?|sgd)?",
     re.IGNORECASE,
 )
-_LONELY_CURRENCY_RE = re.compile(r"\b(?:usd|sgd|dollars?)\b", re.IGNORECASE)
+_LONELY_CURRENCY_RE = re.compile(
+    r"\b(?:usd|sgd|dollars?|thb|baht|idr|rupiah|rp|myr|rm|jpy|yen)\b",
+    re.IGNORECASE)
+
+# Currency the rep TYPED next to a price ("below 100 thb"). The cap is
+# compared against USD-normalised prices, so convert it — before this, the
+# 100 was read as $100 (no filtering at all) and the header then claimed
+# "under $100 USD" while 'thb' polluted the fuzzy keywords.
+_QUERY_CCY_RE = re.compile(
+    r"\b(usd|dollars?|sgd|thb|baht|idr|rupiah|rp|myr|rm|jpy|yen)\b",
+    re.IGNORECASE)
+_QUERY_CCY_RATE = {
+    "usd": 1.0, "dollar": 1.0, "dollars": 1.0,
+    "sgd": 0.74,
+    "thb": 0.029, "baht": 0.029,
+    "idr": 0.000063, "rupiah": 0.000063, "rp": 0.000063,
+    "myr": 0.21, "rm": 0.21,
+    "jpy": 0.0064, "yen": 0.0064,
+}
 
 
 # Catalog prices are MIXED CURRENCY — as of Jul 2026 the live catalogue is
@@ -225,6 +243,10 @@ def parse_seasoning_query(query: str) -> tuple[str, float | None]:
             max_price = float(m.group(1))
         except ValueError:
             max_price = None
+    if max_price is not None:
+        ccy = _QUERY_CCY_RE.search(q)
+        if ccy:
+            max_price *= _QUERY_CCY_RATE.get(ccy.group(1).lower(), 1.0)
     cleaned = _PRICE_STRIP_RE.sub(" ", q)
     cleaned = _LONELY_CURRENCY_RE.sub(" ", cleaned)
     cleaned = _strip_generic(cleaned)
@@ -300,6 +322,13 @@ def top_seasonings(
     # If the user only typed a price ("below 4"), return the cheapest matches
     # outright — nothing to fuzzy-match against.
     if not cleaned_query:
+        if max_price is None and not prefix:
+            # Not a price/prefix query — real words that ALL stripped as
+            # generic ('seasoning powder'). Returning the cheapest items in
+            # the whole catalogue here presented unrelated SKUs as
+            # "matches"; an honest no-result lets the router try its other
+            # probes and say so.
+            return []
         ranked = sorted(
             candidates,
             key=lambda s: _parse_price(s.get("price")),
@@ -532,7 +561,11 @@ def top_seasonings(
     # band. Undated rows sort last (SENTINEL), never ahead of a dated one.
     ranked.sort(
         key=lambda s: (
-            -round(s["score"] / 5.0),
+            # floor, NOT round: _combined averages two ints so half of all
+            # scores end in .5, and banker's rounding made band edges
+            # asymmetric (92.5 banded WITH 87.5 but apart from 93.0 —
+            # letting a 5-points-worse match win on recency).
+            -int(s["score"] // 5),
             -_recency_ord(s.get("last_sent")),
             s["_price_num"],
         )

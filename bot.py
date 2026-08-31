@@ -9735,6 +9735,21 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("sr build_draft failed")
         await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
         return
+    if draft.get("error") == "territory":
+        codes_note = (
+            f" (asked codes: {h(', '.join(draft['codes']))})"
+            if draft.get("codes") else ""
+        )
+        await send(update,
+                   f"🛑 <b>Singapore-only for now.</b>\n"
+                   f"<b>{h(draft['customer'])}</b> routes to "
+                   f"<b>{h(draft['territory'])}</b> "
+                   f"(SR <code>{h(draft['sr_code'] or '—')}</code>)"
+                   f"{codes_note}.\n\n"
+                   "<i>Per your scope call, /sr only raises S-prefix "
+                   "Singapore requests — no assignee guessing for other "
+                   "territories. Raise this one directly in MMS.</i>")
+        return
     if draft.get("error") == "ambiguous":
         names = "\n".join(
             f"  • {h(c.get('name', ''))}" for c in draft["candidates"]) or "  (none)"
@@ -9778,6 +9793,13 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
         return
     if verb == "go":
+        # Defense in depth: the builder already refuses non-SG drafts, but
+        # never let one slip through to a write (wrong queue = the exact
+        # failure this bot fixes).
+        if draft.get("prefix") != "S":
+            await send(update, "🛑 Singapore-only — this draft isn't an "
+                               "S-prefix SR, refusing to submit.")
+            return
         if not draft["sr_code"]:
             await send(update,
                        "🛑 No existing SR for this customer — creating brand-new "

@@ -47,12 +47,17 @@ log = logging.getLogger("npsamplebot.sr")
 
 # ---------------------------------------------------------------- constants
 
-# Territory front doors (Alex, 31 Aug 2026: "delegate is always jessie for
-# R&D singapore side. indonesia will be otherwise. thailand is to ple").
-# Data (284 Apr-24 submissions): S→Jessie dominant, B→(Boong compounds, Ple
-# is the assignee per Alex — his word wins), J split Iqlima/Takenori/Rafly
-# per requesting rep → Iqlima is the modal choice pending Alex's confirm.
-TERRITORY_ASSIGNEE = {"S": "Jessie", "B": "Ple", "J": "Iqlima"}
+# Territory front doors. v1 scope (Alex, 31 Aug 2026): "ignore thailand and
+# Indonesia sample requesting ill use it for SG only" — so ONLY Singapore is
+# active; a J/B/C-prefix SR is refused outright rather than guessed at (a
+# wrong assignee parks the request in the wrong queue, the exact failure
+# this bot exists to fix). To switch a market on later, add its entry here:
+#   "B": "Ple"     (Alex: "thailand is to ple"; data: Boong compounds)
+#   "J": ?          (split territory — Iqlima/Takenori/Rafly by rep; was
+#                    never confirmed, which is why it stays off)
+# His own history says the cost is nil: all 32 of Alex's SRs in the last
+# ~180 days (356 submission rows) are S-prefix Singapore.
+TERRITORY_ASSIGNEE = {"S": "Jessie"}
 
 _CODE_RE = re.compile(
     r"\b[SJTB]-[A-Za-z0-9]{3,}(?:-[A-Za-z0-9]{1,6}){0,6}\b", re.IGNORECASE
@@ -536,7 +541,18 @@ def build_draft(user_id: int, text: str) -> dict:
     if not sr_code:
         sr_code = find_sr_code(customer)
     prefix = (sr_code or "S")[0].upper()
-    territory = {"S": "Singapore", "J": "Indonesia", "B": "Thailand"}.get(prefix, "?")
+    territory = {"S": "Singapore", "J": "Indonesia",
+                 "B": "Thailand", "C": "C-factory"}.get(prefix, "?")
+
+    # v1 is Singapore-only: refuse anything else instead of guessing the
+    # assignee. (Asked codes are checked too — an S customer being asked
+    # for a J/B product still routes to a non-SG factory.)
+    non_sg = prefix != "S" or any(not c.upper().startswith("S-")
+                                  for c in ask.codes)
+    if non_sg:
+        return {"error": "territory", "customer": customer,
+                "sr_code": sr_code, "territory": territory,
+                "codes": ask.codes}
 
     # memory + overrides beat page-derived values
     bag = ask.overrides.get("bag") or mem_get(customer, "bag")
@@ -556,7 +572,9 @@ def build_draft(user_id: int, text: str) -> dict:
         d["rtype_label"] = {"new": "New", "rep": "Repeat", "mod": "Modify"}[d["rtype"]]
     if ask.overrides.get("base"):
         d["base_code"] = ask.overrides["base"].upper()
-    assignee = ask.overrides.get("assignee") or TERRITORY_ASSIGNEE.get(prefix, "Jessie")
+    # prefix is guaranteed 'S' here (non-SG refused above) — no fallback
+    # guessing; an explicit override still wins for flexibility.
+    assignee = ask.overrides.get("assignee") or TERRITORY_ASSIGNEE[prefix]
 
     token = secrets.token_hex(3)
     draft = {

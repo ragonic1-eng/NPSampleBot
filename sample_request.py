@@ -126,6 +126,12 @@ class Ask:
     sets: int | None = None
     overrides: dict[str, str] = field(default_factory=dict)  # EXPLICIT values
     hints: set = field(default_factory=set)  # field mentioned, value unreadable
+    # Structured body (Alex 31 Aug: 'paragraphs the comment nicely so rnd
+    # knows what comment for which seasoming'):
+    flavours: list = field(default_factory=list)  # [{"name":…, "spec":[…]}]
+    base: str = ""          # TARGET BASE / application
+    restriction: str = ""   # halal / gluten-free / non-GMO …
+    structured: bool = False  # True only when block detection is CONFIDENT
 
 _OVR_KEYS = {"bag", "budget", "compliance", "attn", "addr", "address",
              "contact", "qty", "sets", "assignee", "type", "base"}
@@ -173,10 +179,60 @@ _BAG_LINE = re.compile(r"\b(np|empty)\s*(?:sample\s*)?bags?\b", re.IGNORECASE)
 _NEEDBY_LINE = re.compile(
     r"need(?:ed)?(?:\s+it)?\s+by\s+(.+)|\b(next week|this week|asap|urgent)\b",
     re.IGNORECASE)
+_BASE_LINE = re.compile(
+    r"(?:target\s+)?base\s*(?:is)?\s*(?:on)?\s*[:\-]?\s*(.+)|"
+    r"application\s*[:\-]?\s*(.+)", re.IGNORECASE)
+_RESTRICTION_LINE = re.compile(
+    r"restrictions?\s*[:\-]?\s*(.+)|"
+    r"\b((?:must be |no )?(?:halal|gluten.?free|non.?gmo|msg.?free|vegan|"
+    r"non.?irradiated)[^\n]*)", re.IGNORECASE)
+_NUM_ITEM = re.compile(r"^(\d+)[.)]\s*(.+)$")
 _ATTN_LINE = re.compile(r"\battn\.?\s*[:\-]?\s*(.+)", re.IGNORECASE)
 _CONTACT_LINE = re.compile(
     r"\b(?:contact(?:\s*no\.?)?|phone|tel)\s*[:\-]?\s*(.+)", re.IGNORECASE)
 _ADDR_LINE = re.compile(r"\baddress\s*[:\-]?\s*(.+)", re.IGNORECASE)
+
+
+def _structure_body(a: Ask, body: list[str]) -> None:
+    """Split the request body into per-flavour blocks so R&D can see which
+    comment belongs to which seasoning. CONSERVATIVE: it only claims
+    'structured' when the rep himself numbered the flavours (1. / 2) …);
+    anything else keeps the raw text unaltered — a mangled half-structure
+    is worse than his own words verbatim."""
+    blocks: list[dict] = []
+    current: dict | None = None
+    intro: list[str] = []
+    for line in body:
+        m = _NUM_ITEM.match(line)
+        if m:
+            # 'name - spec' on the same numbered line → split once
+            rest = m.group(2).strip()
+            parts = re.split(r"\s+[-–—]\s+", rest, 1)
+            current = {"name": parts[0].strip(),
+                       "spec": [parts[1].strip()] if len(parts) > 1 else []}
+            blocks.append(current)
+        elif current is not None:
+            current["spec"].append(line)
+        else:
+            intro.append(line)
+    if len(blocks) < 2:
+        return  # nothing to structure confidently
+    # Drop an intro line that just re-lists the flavour names (Alex's head
+    # line 'Lemon Habanero Seasoning. Jalapeno … . Salsa Verde …').
+    names_sq = re.sub(r"[^a-z0-9]", "", " ".join(b["name"] for b in blocks).lower())
+    kept_intro = []
+    for line in intro:
+        line_sq = re.sub(r"[^a-z0-9]", "", line.lower())
+        if line_sq and names_sq:
+            overlap = sum(1 for i in range(0, len(line_sq) - 3, 4)
+                          if line_sq[i:i + 4] in names_sq)
+            if overlap / max(len(line_sq) // 4, 1) >= 0.6:
+                continue  # redundant re-listing — the blocks carry the names
+        kept_intro.append(line)
+    a.flavours = blocks
+    a.structured = True
+    body[:] = kept_intro  # remaining ask_text = intro only; blocks render
+    #                        separately in render_reqnote
 
 
 def parse_ask(text: str) -> Ask:
@@ -259,6 +315,21 @@ def parse_ask(text: str) -> Ask:
         if not consumed:
             body.append(line)
 
+    # base / restriction — corpus-standard fields the summary was dropping
+    kept: list[str] = []
+    for line in body:
+        bm2 = _BASE_LINE.match(line)
+        if bm2 and not a.base:
+            a.base = (bm2.group(1) or bm2.group(2) or "").strip()
+            continue
+        rm2 = _RESTRICTION_LINE.match(line)
+        if rm2 and not a.restriction and len(line) < 90:
+            a.restriction = (rm2.group(1) or rm2.group(2) or "").strip()
+            continue
+        kept.append(line)
+    body = kept
+
+    _structure_body(a, body)
     a.ask_text = "\n".join(body).strip()
     blob = a.ask_text + " "
     a.codes = [c.upper() for c in _CODE_RE.findall(blob)]
@@ -301,7 +372,9 @@ verbatim), "qty_g": int|null, "sets": int|null, "bag": str|null,
 "rtype": "new"|"rep"|"mod"|null, "base_code": str|null}}
 
 Rules: 'repeat X' → rtype rep, base_code X. 'modify/change X' → rtype mod.
-"cheap as possible" etc → budget as stated. Never invent values."""
+"cheap as possible" etc → budget as stated. Never invent values.
+Keep the rep's line breaks in "ask" (use \n) — R&D reads it as written,
+and numbered flavour lists must stay numbered lines."""
 
 _UPDATE_PROMPT = """A salesperson is editing a draft sample request by chatting.
 Current draft:
@@ -1000,29 +1073,54 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
 
 
 def render_reqnote(draft: dict) -> str:
-    """The text that will be written into MMS — house style (Rich/Alex
-    convention), fully visible in the draft before confirm."""
+    """The text written into MMS — the thing R&D actually reads.
+
+    Multi-flavour asks are ONE item with numbered per-flavour blocks (the
+    corpus convention: sections routinely carry 2-6 flavours). Layout
+    follows Alex's requested shape: flavour blocks first — each owning its
+    spec and its quantity — then the constraint footer (TARGET BASE /
+    RESTRICTION / BUDGET / COMPLIANCE / QTY / ship-to). Note: Rich's
+    corpus style puts constraints ABOVE the flavour list; we deviate to
+    Alex's sketch since he's the author R&D reads and both layouts appear
+    in the corpus. If the rep didn't number his flavours we DON'T guess a
+    structure — his text goes through verbatim (never a mangled half-
+    structure).
+    """
     d = draft["derived"]
     ask = draft["ask"]
-    lines = []
-    if ask.ask_text:
-        lines.append(ask.ask_text.upper() if ask.ask_text.islower()
-                     else ask.ask_text)
-    # "1kg for each sample" (multi-flavour asks) → EACH, matching the house
-    # convention: multi-flavour requests are ONE item with a flavour list
-    # (verified across the corpus — Rich's 2026 butter-range and nasi-lemak
-    # requests list up to 6 flavours in a single section).
-    if ask.qty_each:
-        lines.append(f"QTY: {d['qty']}G EACH")
-    else:
-        lines.append(f"QTY: {d['qty']}G X {d['sets']} SET"
-                     + ("S" if d["sets"] != 1 else ""))
+    qty_str = f"{d['qty']}g x {d['sets']} set" + ("s" if d["sets"] != 1 else "")
+    lines: list[str] = []
+    if d["rtype"] == "new" and not ask.codes and not d.get("base_code"):
+        lines.append("No prefer code.")
+        lines.append("")
+    if ask.structured and ask.flavours:
+        if ask.ask_text:
+            lines.append(ask.ask_text)
+            lines.append("")
+        for i, f in enumerate(ask.flavours, 1):
+            lines.append(f"{i}. {f['name'].upper()} — {qty_str}")
+            lines.extend(s for s in f["spec"] if s.strip())
+            lines.append("")
+    elif ask.ask_text:
+        lines.append(ask.ask_text)
+        lines.append("")
+    if ask.base:
+        lines.append(f"TARGET BASE: {ask.base}")
+    if ask.restriction:
+        lines.append(f"RESTRICTION: {ask.restriction}")
     if draft["bag"]:
         lines.append(f"BAG: {draft['bag'].upper()}")
     if draft["budget"]:
         lines.append(f"BUDGET: {draft['budget']}")
     if draft["compliance"]:
         lines.append(f"COMPLIANCE: {draft['compliance']}")
+    n_flav = len(ask.flavours)
+    if ask.structured and n_flav > 1:
+        lines.append(f"QTY: {qty_str} per flavour, {n_flav} flavours")
+    elif ask.qty_each:
+        lines.append(f"QTY: {qty_str} each")
+    else:
+        lines.append(f"QTY: {qty_str}")
     if draft["need_by"]:
         lines.append(f"NEED BY: {draft['need_by']}")
     if draft["attn"]:
@@ -1032,7 +1130,13 @@ def render_reqnote(draft: dict) -> str:
     if draft["addr"]:
         lines.append(f"ADDRESS: {draft['addr']}")
     lines.append("THANKS")
-    return "\n".join(lines)
+    # collapse any doubled blanks from empty optional groups
+    out: list[str] = []
+    for l in lines:
+        if l == "" and (not out or out[-1] == ""):
+            continue
+        out.append(l)
+    return "\n".join(out)
 
 
 def remember_submitted(draft: dict) -> None:

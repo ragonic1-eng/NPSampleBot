@@ -9655,9 +9655,10 @@ def _sr_draft_text(draft: dict) -> str:
         f"Type: <b>{d['rtype_label']}</b>"
         + (f" — base <code>{h(d['base_code'])}</code>" if d["base_code"] else "")
         + " <i>(inferred from your ask)</i>",
-        f"Qty: <b>{d['qty']} g"
-        + (" each" if draft["ask"].qty_each else
-           f" × {d['sets']} set{'s' if d['sets'] != 1 else ''}")
+        f"Qty: <b>{d['qty']} g × {d['sets']} set{'s' if d['sets'] != 1 else ''}"
+        + (f" per flavour — {len(draft['ask'].flavours)} flavours"
+           if draft["ask"].structured and len(draft["ask"].flavours) > 1
+           else (" each" if draft["ask"].qty_each else ""))
         + f"</b> <i>({h(d['qty_src'])})</i>",
         f"Bag: " + (val("bag") if draft["bag"] or src.get("bag") == "confirm"
                     else "<b>❓ not known yet — just tell me: NP or empty "

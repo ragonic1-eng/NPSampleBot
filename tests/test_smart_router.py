@@ -450,3 +450,66 @@ def test_fsl_only_customer_routes_direct_despite_weak_product_noise(monkeypatch)
     )
     assert routed.get("query") == "(HungHau Foods Vietnam)", routed
     assert routed.get("mode") == "customer" and routed.get("scope") == "all"
+
+
+# ---------- code-family history (who else got this sample?) ------------------
+
+from bot import _code_family_root  # noqa: E402
+
+
+def test_code_family_root():
+    assert _code_family_root("S-A74F1") == "S-A74F1"
+    assert _code_family_root("S-B68L1-02") == "S-B68L1"
+    assert _code_family_root("S-TXF06-00-03") == "S-TXF06"
+    assert _code_family_root("J-8AD81-08-11") == "J-8AD81"
+    assert _code_family_root("s-b68l1-06") == "S-B68L1"
+
+
+def test_code_history_includes_sibling_variants(monkeypatch):
+    import datetime as d
+
+    def mk(code, name, cust, days):
+        day = d.date(2026, 8, 28) - d.timedelta(days=days)
+        return {"Product Code": code, "Product Name": name,
+                "Customer Name": cust, "Country": "Singapore", "Sales": "Alex",
+                "Sample Date Out": day.strftime("%d/%b/%Y"),
+                "R&D Price": "USD 5.00", "_date": day, "Ingested At UTC": "x"}
+
+    rows = [
+        mk("S-B68L1-02", "LIME & BLACK PEPPER", "APACIFIC", 30),
+        mk("S-B68L1-06", "CALAMANSI & BLACK PEPPER", "APACIFIC", 3),
+        mk("S-B68L1", "BLACK PEPPER", "YUSHENG", 400),
+        mk("S-B99X1", "UNRELATED", "OTHER", 1),          # different family
+    ]
+
+    async def fl(scope, name=""):
+        return rows
+    monkeypatch.setattr(_botmod, "_load_lastsample_rows", fl)
+    captured = {}
+
+    async def cs(update, text, markup=None, force_new=False):
+        captured["text"] = text
+        captured["force_new"] = force_new
+    monkeypatch.setattr(_botmod, "send", cs)
+
+    class Chat:
+        async def send_action(self, *a):
+            pass
+
+    class Upd:
+        effective_chat = Chat()
+        effective_user = type("U", (), {"id": 1, "username": "a"})()
+        effective_message = None
+        callback_query = None
+
+    class Ctx:
+        user_data = {}
+
+    asyncio.get_event_loop().run_until_complete(
+        _botmod._show_code_history(Upd(), Ctx(), "S-B68L1-02")
+    )
+    t = captured["text"]
+    assert "S-B68L1-06" in t and "S-B68L1-02" in t and "YUSHENG" in t
+    assert "UNRELATED" not in t                    # other family excluded
+    assert "3 shipments" in t
+    assert captured["force_new"] is True           # never clobbers the price msg

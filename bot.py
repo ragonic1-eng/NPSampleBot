@@ -1369,6 +1369,98 @@ def _origin_line(country: str, customer: str, sent_date=None) -> str:
     return "\n".join(lines)
 
 
+def _code_family_root(code: str) -> str:
+    """Family root of a product code: 'S-B68L1-02' → 'S-B68L1'.
+
+    NP codes are <region letter>-<core>[-variant[-variant…]]. The first two
+    dash-separated segments identify the base formulation; trailing segments
+    are variants (sizes, re-runs, concentrates like -Y1). Family = the base
+    itself plus anything extending it with further '-' segments.
+    """
+    m = re.match(r"^([A-Z]-[A-Z0-9]+)", (code or "").strip().upper())
+    return m.group(1) if m else (code or "").strip().upper()
+
+
+async def _show_code_history(update: Update, ctx, code: str) -> None:
+    """👥 Everyone who received this code OR a sibling variant — max 10.
+
+    Answers 'who else has tried this sample?' from the /pp history button:
+    the /pp origin block shows only the single most-recent recipient, but a
+    formulation often ships to several customers across years (S-A74F1 went
+    to APACIFIC in Jul 2026 AND Juta Food Malaysia in Aug 2025). Family
+    matching pulls sibling variants too (S-B68L1 → -02, -06, …), each row
+    labelled with its exact code + name so different flavours stay distinct.
+    Sent as a NEW message so it never clobbers the /pp price reply.
+    """
+    root = _code_family_root(code)
+    try:
+        rows = await _load_lastsample_rows("all")
+    except Exception as e:  # noqa: BLE001
+        await send(
+            update,
+            f"😕 Couldn't read Full Sample Listing: {_friendly_fetch_error(e)}",
+            force_new=True,
+        )
+        return
+    fam = [
+        r for r in rows
+        if (lambda c: c == root or c.startswith(root + "-"))(
+            (r.get("Product Code") or "").strip().upper()
+        )
+    ]
+    if not fam:
+        await send(
+            update,
+            f"📭 No samples of <code>{h(root)}</code> (or its variants) in "
+            "Full Sample Listing.",
+            force_new=True,
+        )
+        return
+    from datetime import date as _d
+    fam.sort(key=lambda r: r.get("_date") or _d.min, reverse=True)
+    fam = _collapse_samples(fam)
+    total = len(fam)
+    n_cust = len({
+        " ".join((r.get("Customer Name") or "").lower().split()) for r in fam
+    })
+    shown = fam[:10]
+    lines = [
+        f"👥 <b>Sample history — <code>{h(root)}</code> family</b>",
+        f"<i>{total} shipment{'s' if total != 1 else ''} · "
+        f"{n_cust} customer{'s' if n_cust != 1 else ''} · newest first</i>",
+        _PRICE_ASOF_HINT,
+        "",
+    ]
+    for i, r in enumerate(shown, 1):
+        d = r.get("_date")
+        date_str = d.strftime("%d %b %Y") if d else (r.get("Sample Date Out") or "—")
+        p_code = (r.get("Product Code") or "—").strip().upper()
+        p_name = (r.get("Product Name") or "—").strip()
+        cust = (r.get("Customer Name") or "—").strip()
+        country = (r.get("Country") or "").strip()
+        sales = (r.get("Sales") or "").strip()
+        flag = _COUNTRY_FLAG.get(country.upper(), "")
+        dup = r.get("_dup_count", 1)
+        dup_badge = f" ·×{dup}" if dup > 1 else ""
+        loc = f" {flag}" if flag else (f" · {h(country)}" if country else "")
+        by = f"  <i>· sent by {h(sales)}</i>" if sales else ""
+        price_raw = (r.get("R&D Price") or "").strip()
+        price_bit = f" · 💲 R&amp;D {h(price_raw)}" if price_raw else ""
+        lines.append(f"{i}. <b>{h(p_name)}</b>")
+        lines.append(
+            f"     <code>{h(p_code)}</code> · {h(date_str)}{price_bit}{dup_badge}"
+        )
+        lines.append(f"     👤 {h(cust)}{loc}{by}")
+    if total > 10:
+        lines.append("")
+        lines.append(
+            f"<i>… and {total - 10} older shipment"
+            f"{'s' if total - 10 != 1 else ''} not shown</i>"
+        )
+    await send(update, "\n".join(lines),
+               kb([[("🏠 Main menu", "menu:home")]]), force_new=True)
+
+
 async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
     """Fetch /pp for each code, edit-in-place loader, audit-log every result.
 
@@ -1427,9 +1519,15 @@ async def _run_pp_for_codes(update: Update, codes: list[str]) -> None:
         # price: jump straight to the last sample of THIS code (own /
         # any rep). Batch pastes stay button-free — they're price sweeps.
         def _price_kb(product_name: str = "", price_usd: str = ""):
+            # V1.17.34 — the history button rides on EVERY price reply,
+            # including batch pastes (which used to get no buttons at all):
+            # 'who else got this sample?' is exactly the question reps ask
+            # right after pasting a handful of codes.
+            hist_row = [("👥 Who else got this? (history)", f"hist:{code}")]
             if len(codes) != 1:
-                return None
+                return kb([hist_row])
             rows: list[list[tuple[str, str]]] = [
+                hist_row,
                 [("📦 My last sample of this code", f"lsx:s:{code}")],
                 [("🌐 Any rep's last sample", f"lsx:a:{code}")],
                 [("🔔 Watch this price", f"watch:add:{code}")],
@@ -6597,6 +6695,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sugg_code = data.split(":", 1)[1].strip().upper()
         if sugg_code and _PP_CODE_RE.fullmatch(sugg_code):
             await _run_pp_for_codes(update, [sugg_code])
+        return
+
+    # 👥 Sample history for a code family (the /pp history button).
+    if data.startswith("hist:"):
+        hist_code = data.split(":", 1)[1].strip().upper()
+        if hist_code and _PP_CODE_RE.fullmatch(hist_code):
+            await _show_code_history(update, ctx, hist_code)
         return
 
     # 🔔 Watch this price. watch:add:<code> — adds a subscription; the daily

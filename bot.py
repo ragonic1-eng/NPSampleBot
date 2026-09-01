@@ -9970,12 +9970,17 @@ def _sr_draft_text(draft: dict) -> str:
                      "what's the contact and address?</b>")
     lines.append(f"R&amp;D: <b>{h(draft['assignee'])}</b> "
                  f"<i>({h(draft['territory'])} — reply to change)</i>")
-    _prep = srq.need_by_prepdate(draft["need_by"], _sgt_now().date())
-    lines.append(f"Need by: <b>{h(draft['need_by'] or 'STANDARD (~1 week)')}</b>"
-                 + prov("need_by")
-                 + (f" · until box: <b>{h(_prep)}</b>" if _prep else
-                    (" <i>(no date read — the MMS until box stays empty)</i>"
-                     if draft["need_by"] else "")))
+    # No default (Alex, 01 Sep): the rep keys in when the customer expects
+    # the seasoning; the bot then writes it and sets the until dropdown.
+    if draft["need_by"]:
+        _prep = srq.need_by_prepdate(draft["need_by"], _sgt_now().date())
+        lines.append(f"Need by: <b>{h(draft['need_by'])}</b>" + prov("need_by")
+                     + (f" · until box: <b>{h(_prep)}</b>" if _prep else
+                        " <i>(no date read — the MMS until box stays "
+                        "empty)</i>"))
+    else:
+        lines.append("Need by: <b>❓ when should this ship? Tap a 📅 button "
+                     "or reply (e.g. “need by 13 Sep”)</b>")
     if draft.get("page_err"):
         lines.append(f"\n⚠️ <i>{h(draft['page_err'])}</i>")
     lines.append("\n<b>Will write into MMS:</b>")
@@ -10023,6 +10028,17 @@ async def _sr_do_submit(update, draft, token, srq) -> None:
                    "🛑 No existing SR for this customer — creating brand-new "
                    "SRs isn't wired up yet. Raise the empty SR once in MMS, "
                    "then this works for them.")
+        return
+    if not draft.get("need_by"):
+        # No default (Alex, 01 Sep): the rep must key in when the customer
+        # expects the seasoning — it goes into the note AND the SR's until
+        # dropdown, so R&D always has a real target date.
+        await send(update,
+                   "📅 <b>When should this ship?</b> Tap a 📅 button or "
+                   "reply with a date (e.g. “need by 13 Sep”), then "
+                   "confirm again — I'll write it into the note and set "
+                   "the SR's until-date.",
+                   _sr_draft_kb(draft))
         return
     await send(update, "📨 Writing to MMS… (each step is verified)",
                with_footer=False)

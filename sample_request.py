@@ -225,6 +225,11 @@ _DOSAGE_LINE = re.compile(
 _PHONE_ONLY_LINE = re.compile(r"\+?\(?\d[\d\s\-().]{6,}")
 _ATTN_NAME_LINE = re.compile(
     r"(?:mr|ms|mrs|mdm|dr|attn)\.?\s+[a-zA-Z][a-zA-Z .'\-]{1,40}", re.IGNORECASE)
+# 'MR SAJIB +880 1704-158453' — Telegram often joins the name and phone
+# onto one line; group 1 = the person, group 2 = the number.
+_ATTN_PHONE_LINE = re.compile(
+    r"((?:mr|ms|mrs|mdm|dr|attn)\.?\s+[a-zA-Z][a-zA-Z .'\-]{1,40}?)\s+"
+    r"(\+?\(?\d[\d\s\-().]{6,})", re.IGNORECASE)
 _COMPANY_TAIL = re.compile(
     r"\b(?:ltd|limited|pte|inc|corp|co|llc|bhd|gmbh|company)\b\.?\s*$",
     re.IGNORECASE)
@@ -250,6 +255,8 @@ def _shipto_kind(line: str) -> str:
         return ""
     if _PHONE_ONLY_LINE.fullmatch(s):
         return "phone"
+    if _ATTN_PHONE_LINE.fullmatch(s):
+        return "attn_phone"
     if _ATTN_NAME_LINE.fullmatch(s):
         return "attn"
     if s.lower().rstrip(".") in _SHIPTO_COUNTRIES:
@@ -270,7 +277,7 @@ def _extract_shipto(a: Ask, body: list[str]) -> None:
     win (setdefault), but the block always leaves the note — a mailing
     block inside a flavour spec is never what R&D should read."""
     pi = next((i for i, l in enumerate(body)
-               if _shipto_kind(l) == "phone"), None)
+               if _shipto_kind(l) in ("phone", "attn_phone")), None)
     if pi is None:
         return
     lo = pi
@@ -279,13 +286,17 @@ def _extract_shipto(a: Ask, body: list[str]) -> None:
     hi = pi
     while hi + 1 < len(body) and _shipto_kind(body[hi + 1]):
         hi += 1
-    if hi == lo:
-        return  # a lone number is not a mailing block
+    if hi == lo and _shipto_kind(body[pi]) == "phone":
+        return  # a lone number is not a mailing block ('MR X +65…' is)
     block = body[lo:hi + 1]
-    attn = next((l.strip() for l in block if _shipto_kind(l) == "attn"), "")
+    ap = _ATTN_PHONE_LINE.fullmatch(body[pi].strip())
+    contact = ap.group(2).strip() if ap else body[pi].strip()
+    attn = (ap.group(1).strip() if ap else
+            next((l.strip() for l in block
+                  if _shipto_kind(l) == "attn"), ""))
     addr_ls = [l.strip().rstrip(",").strip() for l in block
-               if _shipto_kind(l) not in ("phone", "attn")]
-    a.overrides.setdefault("contact", body[pi].strip())
+               if _shipto_kind(l) not in ("phone", "attn", "attn_phone")]
+    a.overrides.setdefault("contact", contact)
     if attn:
         a.overrides.setdefault("attn",
                                attn.title() if attn.isupper() else attn)
@@ -728,7 +739,8 @@ def apply_fields(draft: dict, fields: dict) -> None:
             draft.setdefault("src", {})[k] = "you"
     draft["missing"] = [m for m, val in
                         (("bag", draft["bag"]),
-                         ("ship-to", draft["attn"] or draft["addr"]))
+                         ("ship-to", draft["attn"] or draft["addr"]),
+                         ("need-by", draft["need_by"]))
                         if not val]
 
 
@@ -1365,8 +1377,12 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
         "addr": addr, "assignee": assignee,
         "need_by": (ask.overrides.get("need_by") or "").upper(),
         "page_err": page_err, "src": src,
+        # need-by has NO default (Alex, 01 Sep): the rep keys in when the
+        # customer expects the seasoning; the bot writes it into the note
+        # and sets the SR's until dropdown. Submit refuses while missing.
         "missing": [k for k, v in
-                    (("bag", bag), ("ship-to", attn or addr))
+                    (("bag", bag), ("ship-to", attn or addr),
+                     ("need-by", ask.overrides.get("need_by")))
                     if not v],
     }
     DRAFTS[token] = draft

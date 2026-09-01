@@ -180,6 +180,31 @@ Bangladesh""")
     assert "+880" not in a.ask_text  # block still removed from the note
 
 
+def test_attn_and_phone_on_one_line():
+    # Telegram often joins 'MR SAJIB' and the phone onto one line.
+    a = srq.parse_ask("""acme - bbq seasoning
+PRAN FOODS LTD
+MR SAJIB +880 1704-158453
+PRAN-RFL CENTRE, 105, MIDDLE BADDA,
+1212 DHAKA
+Bangladesh""")
+    assert a.overrides["contact"] == "+880 1704-158453"
+    assert a.overrides["attn"] == "Mr Sajib"
+    assert "MIDDLE BADDA" in a.overrides["addr"]
+    assert "+880" not in a.ask_text and "SAJIB" not in a.ask_text
+
+
+def test_no_need_by_stays_empty_never_defaulted():
+    a = srq.parse_ask(PRAN_SHIPTO)
+    assert "need_by" not in a.overrides
+    d = {"qty": a.qty_g, "sets": 1, "rtype": "new", "rtype_label": "New",
+         "base_code": ""}
+    draft = {"derived": d, "ask": a, "bag": "NP bag", "budget": "<2 usd",
+             "compliance": "", "need_by": "", "attn": "", "contact": "",
+             "addr": ""}
+    assert "NEED BY" not in srq.render_reqnote(draft)
+
+
 def test_lone_number_line_is_not_a_shipto_block():
     a = srq.parse_ask("""acme - bbq seasoning
 target 1200000 scu

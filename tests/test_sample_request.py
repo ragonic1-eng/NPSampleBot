@@ -58,7 +58,13 @@ def test_reqnote_counts_three_flavours():
     note = srq.render_reqnote(draft)
     assert "1. LEMON HABANERO SEASONING" in note
     assert "3. SALSA VERDE FLAVORED SEASONING" in note
-    assert "3 flavours" in note and "2 flavours" not in note
+    # 01-Sep dedupe: qty lives in each numbered header, never repeated in
+    # a footer QTY line; 'no prefer code' appears exactly once (the
+    # Comment: header), Alex's own restatement line is dropped.
+    assert note.count("1000g x 1 set") == 3
+    assert "QTY:" not in note and "per flavour" not in note
+    assert note.lower().count("no prefer code") == 1
+    assert "Customer want" not in note
 
 
 def test_start_at_two_unrecoverable_stays_verbatim():
@@ -132,6 +138,34 @@ def test_pasted_shipto_block_becomes_overrides_not_body():
     assert "MR SAJIB" not in joined
     # flavour structuring is unaffected
     assert a.structured and len(a.flavours) == 3
+
+
+def test_unstructured_note_keeps_qty_footer():
+    a = srq.parse_ask("acme - bbq seasoning 200g")
+    d = {"qty": 200, "sets": 1, "rtype": "new", "rtype_label": "New",
+         "base_code": ""}
+    draft = {"derived": d, "ask": a, "bag": "", "budget": "", "need_by": "",
+             "compliance": "", "attn": "", "contact": "", "addr": ""}
+    note = srq.render_reqnote(draft)
+    assert "QTY: 200g x 1 set" in note  # single-flavour: footer QTY stays
+
+
+def test_filter_ask_text_drops_only_redundant_lines():
+    flavs = [{"name": "Lemon Habanero Seasoning", "spec": []},
+             {"name": "Salsa Verde Flavored Seasoning", "spec": []}]
+    kept = srq._filter_ask_text(
+        "Comment - no prefer code. Customer want Lemon Habanero Seasoning:\n"
+        "Customer want Salsa Verde Flavored Seasoning\n"
+        "Ship with the usual documents please",
+        flavs, no_code=True)
+    assert kept == "Ship with the usual documents please"
+    # a 'customer want' line naming something NOT in the blocks is kept
+    kept2 = srq._filter_ask_text("Customer want Mango Chilli Seasoning:",
+                                 flavs, no_code=True)
+    assert "Mango Chilli" in kept2
+    # with a preferred code, the rep's no-prefer wording is his own text
+    kept3 = srq._filter_ask_text("no prefer code.", flavs, no_code=False)
+    assert kept3 == "no prefer code."
 
 
 def test_labelled_shipto_still_beats_pasted_block():

@@ -1373,6 +1373,36 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
     return draft
 
 
+# Intro lines the rendered note already states, so repeating them is the
+# 01-Sep duplicate bug: 'Comment - no prefer code. Customer want X:' next
+# to the renderer's own 'Comment: No prefer code.' header.
+_NO_PREFER_RESTATE = re.compile(
+    r"^\s*(?:comment\s*[-:–—]*\s*)?no\s+prefer(?:red)?\s+code[.\s]*"
+    r"(?:customer\s+wants?\s+[^:]{0,80}:?\s*)?$", re.IGNORECASE)
+_CUSTOMER_WANT_LINE = re.compile(
+    r"^\s*(?:comment\s*[-:–—]*\s*)?customer\s+wants?\s+([^:]{1,80}):?\s*$",
+    re.IGNORECASE)
+
+
+def _filter_ask_text(ask_text: str, flavours: list, no_code: bool) -> str:
+    """Drop intro lines the note already carries elsewhere: 'no prefer
+    code' restatements (the Comment:/boilerplate line owns that) and
+    'Customer want X:' headers where X is one of the numbered flavours."""
+    names_sq = re.sub(r"[^a-z0-9]", "",
+                      " ".join(f["name"] for f in flavours).lower())
+    out = []
+    for line in ask_text.splitlines():
+        if no_code and _NO_PREFER_RESTATE.match(line):
+            continue
+        cw = _CUSTOMER_WANT_LINE.match(line)
+        if cw and names_sq:
+            want_sq = re.sub(r"[^a-z0-9]", "", cw.group(1).lower())
+            if want_sq and want_sq in names_sq:
+                continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
 def render_reqnote(draft: dict) -> str:
     """The text written into MMS — the thing R&D actually reads.
 
@@ -1412,15 +1442,17 @@ def render_reqnote(draft: dict) -> str:
             lines.append(f"{i}. {f['name'].upper()} - {qty_str}")
             lines.extend(s for s in f["spec"] if s.strip())
             lines.append("")
-        if ask.ask_text:
-            lines.append(ask.ask_text)
+        ask_txt = _filter_ask_text(ask.ask_text, ask.flavours, no_code)
+        if ask_txt:
+            lines.append(ask_txt)
             lines.append("")
     else:
         if no_code:
             lines.append("No prefer code.")
             lines.append("")
-        if ask.ask_text:
-            lines.append(ask.ask_text)
+        ask_txt = _filter_ask_text(ask.ask_text, [], no_code)
+        if ask_txt:
+            lines.append(ask_txt)
             lines.append("")
     if ask.base:
         lines.append(f"TARGET BASE: {ask.base}")
@@ -1432,13 +1464,14 @@ def render_reqnote(draft: dict) -> str:
         lines.append(f"BUDGET: {draft['budget']}")
     if draft["compliance"]:
         lines.append(f"COMPLIANCE: {draft['compliance']}")
-    n_flav = len(ask.flavours)
-    if ask.structured and n_flav > 1:
-        lines.append(f"QTY: {qty_str} per flavour, {n_flav} flavours")
-    elif ask.qty_each:
-        lines.append(f"QTY: {qty_str} each")
-    else:
-        lines.append(f"QTY: {qty_str}")
+    # QTY: each numbered header already carries '- {qty}' for structured
+    # multi-flavour notes — repeating it in the footer was Alex's 01-Sep
+    # duplicate complaint. Footer QTY only when the headers don't show it.
+    if not (ask.structured and len(ask.flavours) > 1):
+        if ask.qty_each:
+            lines.append(f"QTY: {qty_str} each")
+        else:
+            lines.append(f"QTY: {qty_str}")
     if draft["need_by"]:
         lines.append(f"NEED BY: {draft['need_by']}")
     if draft["attn"]:

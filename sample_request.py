@@ -1874,7 +1874,14 @@ def render_reqnote(draft: dict) -> str:
         # the rep never quantified at all.
         for it in unpriced:
             parts.append(f"{d['qty']}g - {it}")
-        lines.append("QTY: " + ", ".join(parts))
+        # One per line once there's more than one — a comma-run of four
+        # items reads as a paragraph and R&D has to pick it apart
+        # (Alex 02-Sep). Matches the 'Seasoning name:' block above.
+        if len(parts) > 1:
+            lines.append("QTY:")
+            lines.extend(parts)
+        else:
+            lines.append(f"QTY: {parts[0]}")
     elif not (ask.structured and len(ask.flavours) > 1):
         if ask.qty_each:
             lines.append(f"QTY: {qty_str} each")

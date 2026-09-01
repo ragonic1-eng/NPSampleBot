@@ -9948,8 +9948,12 @@ def _sr_draft_text(draft: dict) -> str:
                      "what's the contact and address?</b>")
     lines.append(f"R&amp;D: <b>{h(draft['assignee'])}</b> "
                  f"<i>({h(draft['territory'])} — reply to change)</i>")
+    _prep = srq.need_by_prepdate(draft["need_by"], _sgt_now().date())
     lines.append(f"Need by: <b>{h(draft['need_by'] or 'STANDARD (~1 week)')}</b>"
-                 + prov("need_by"))
+                 + prov("need_by")
+                 + (f" · until box: <b>{h(_prep)}</b>" if _prep else
+                    (" <i>(no date read — the MMS until box stays empty)</i>"
+                     if draft["need_by"] else "")))
     if draft.get("page_err"):
         lines.append(f"\n⚠️ <i>{h(draft['page_err'])}</i>")
     lines.append("\n<b>Will write into MMS:</b>")
@@ -10010,6 +10014,7 @@ async def _sr_do_submit(update, draft, token, srq) -> None:
         result = await asyncio.to_thread(
             w.add_item_and_request, draft["sr_code"], d["rtype"],
             d.get("base_code", ""), reqnote, draft["assignee"],
+            srq.need_by_prepdate(draft.get("need_by", ""), _sgt_now().date()),
         )
     except Exception as e:  # noqa: BLE001
         log.exception("sr submit crashed")

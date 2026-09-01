@@ -923,11 +923,18 @@ class SRWriter:
         return m.group(1) if m else ""
 
     def add_item_and_request(self, sr_code: str, rtype: str, base_code: str,
-                             reqnote: str, assignee: str) -> dict:
+                             reqnote: str, assignee: str,
+                             prepdate: str = "") -> dict:
         """additem → fill new section → request{N} → assign → save.
         Every step verified; cleanup via command=clear if we bail after
         additem (clear only removes EMPTY items — exactly our failure
-        window). Returns {'ok':bool, 'detail':str, 'section':int}."""
+        window). `prepdate` ('13/Sep/2026') sets the section's 'until'
+        target-date dropdown when MMS offers that date.
+        Returns {'ok':bool, 'detail':str, 'section':int}."""
+        # MMS turns CRLF into <BR> on save — that's how browser-typed notes
+        # get their line breaks. Bare \n is stored raw and the rendered
+        # page collapses it into one unreadable paragraph.
+        reqnote = reqnote.replace("\r\n", "\n").replace("\n", "\r\n")
         html = self.get_page(sr_code)
         before = self._sections(html)
         aid = self._assignee_id(html, assignee)
@@ -969,12 +976,16 @@ class SRWriter:
             if probe and probe not in _html.unescape(html3):
                 return self._bail(sr_code,
                                   f"request{n}: submitted text not found on page")
-            # assign + save
+            # assign + save (+ the 'until' target-date dropdown)
             form3 = BeautifulSoup(html3, "html.parser").find("form")
-            html4 = self._post(sr_code, _override(_form_payload(form3), {
-                f"sreq1[{n}].nextActUserId": aid,
-                "command": "save",
-            }))
+            fill3 = {f"sreq1[{n}].nextActUserId": aid, "command": "save"}
+            if prepdate:
+                blk = re.search(
+                    rf'name="sreq1\[{n}\]\.prepdateString".*?</select>',
+                    html3, re.S)
+                if blk and f'value="{prepdate}"' in blk.group(0):
+                    fill3[f"sreq1[{n}].prepdateString"] = prepdate
+            html4 = self._post(sr_code, _override(_form_payload(form3), fill3))
             sel = re.search(
                 rf'name="sreq1\[{n}\]\.nextActUserId".*?'
                 rf'<option value="{aid}" selected',
@@ -984,8 +995,21 @@ class SRWriter:
                 return {"ok": False, "section": n + 1,
                         "detail": ("request saved but assignee NOT confirmed "
                                    "selected — set it manually in MMS")}
+            prep_note = ""
+            if prepdate:
+                blk4 = re.search(
+                    rf'name="sreq1\[{n}\]\.prepdateString".*?</select>',
+                    html4, re.S)
+                if blk4 and re.search(
+                        rf'value="{re.escape(prepdate)}" selected',
+                        blk4.group(0)):
+                    prep_note = f", until {prepdate}"
+                else:
+                    prep_note = (f" — ⚠ couldn't set the until-date "
+                                 f"({prepdate}), pick it in MMS")
             return {"ok": True, "section": n + 1,
-                    "detail": f"item ({n + 1}) raised, assigned to {assignee}"}
+                    "detail": (f"item ({n + 1}) raised, assigned to "
+                               f"{assignee}{prep_note}")}
         except Exception as e:  # noqa: BLE001
             log.exception("SR submit failed mid-flight")
             return self._bail(sr_code, f"submit error: {e}")
@@ -1264,7 +1288,6 @@ def render_reqnote(draft: dict) -> str:
         lines.append(f"CONTACT NO.: {draft['contact']}")
     if draft["addr"]:
         lines.append(f"ADDRESS: {draft['addr']}")
-    lines.append("THANKS")
     # collapse any doubled blanks from empty optional groups
     out: list[str] = []
     for l in lines:
@@ -1272,6 +1295,55 @@ def render_reqnote(draft: dict) -> str:
             continue
         out.append(l)
     return "\n".join(out)
+
+
+_MONTH_ABBR = ("jan", "feb", "mar", "apr", "may", "jun",
+               "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def need_by_prepdate(need_by: str, today=None) -> str:
+    """Free-text NEED BY → MMS's 'until' dropdown format (13/Sep/2026).
+
+    The SR form's target-date select (sreq1[N].prepdateString) only offers
+    dates ~4 weeks out in DD/Mon/YYYY. Handles '13 SEP 2026', 'Sep 13',
+    '13/9' and friends; anything vaguer ('ASAP', 'next week') returns ''
+    and the dropdown is left alone — never guess a deadline. A missing
+    year means the nearest upcoming occurrence."""
+    import datetime as _dt
+    s = (need_by or "").lower()
+    today = today or _dt.date.today()
+    months = "|".join(_MONTH_ABBR)
+    d = mo = yr = None
+    m = re.search(rf"(?<!\d)(\d{{1,2}})(?:st|nd|rd|th)?[\s/.\-]*({months})"
+                  rf"[a-z]*[\s/.\-,]*(\d{{4}})?", s)
+    if m:
+        d, mo = int(m.group(1)), _MONTH_ABBR.index(m.group(2)) + 1
+        yr = int(m.group(3)) if m.group(3) else None
+    else:
+        m = re.search(rf"\b({months})[a-z]*[\s/.\-,]*(?<!\d)(\d{{1,2}})"
+                      rf"(?:st|nd|rd|th)?(?!\d)(?:[\s/.\-,]*(\d{{4}}))?", s)
+        if m:
+            mo, d = _MONTH_ABBR.index(m.group(1)) + 1, int(m.group(2))
+            yr = int(m.group(3)) if m.group(3) else None
+        else:
+            m = re.search(r"(?<!\d)(\d{1,2})[/\-](\d{1,2})"
+                          r"(?:[/\-](\d{2,4}))?(?!\d)", s)
+            if m:  # day-first (SG convention); swap if only month-first fits
+                d, mo = int(m.group(1)), int(m.group(2))
+                yr = int(m.group(3)) if m.group(3) else None
+                if yr is not None and yr < 100:
+                    yr += 2000
+                if mo > 12 >= d:
+                    d, mo = mo, d
+    if not d or not mo:
+        return ""
+    try:
+        date = _dt.date(yr or today.year, mo, d)
+        if yr is None and date < today:
+            date = date.replace(year=today.year + 1)
+    except ValueError:
+        return ""
+    return f"{date.day:02d}/{_MONTH_ABBR[date.month - 1].capitalize()}/{date.year}"
 
 
 def remember_submitted(draft: dict) -> None:

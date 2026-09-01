@@ -83,6 +83,36 @@ tangy, creamy
                                                "Sour Cream Seasoning"]
 
 
+def test_reqnote_has_no_thanks():
+    a = srq.parse_ask(PRAN)
+    d = {"qty": a.qty_g, "sets": 1, "rtype": "new", "rtype_label": "New",
+         "base_code": ""}
+    draft = {"derived": d, "ask": a, "bag": "", "budget": "<2 usd",
+             "compliance": "Bangladesh, Mexico", "need_by": "", "attn": "",
+             "contact": "", "addr": "105 Pragati Swarani, Dhaka"}
+    note = srq.render_reqnote(draft)
+    assert "THANKS" not in note
+    assert note.rstrip().endswith("ADDRESS: 105 Pragati Swarani, Dhaka")
+
+
+def test_need_by_prepdate_formats():
+    import datetime as dt
+    today = dt.date(2026, 9, 1)
+    f = srq.need_by_prepdate
+    assert f("BY 13 SEP 2026", today) == "13/Sep/2026"
+    assert f("13 sep", today) == "13/Sep/2026"
+    assert f("Sep 13", today) == "13/Sep/2026"
+    assert f("13/9", today) == "13/Sep/2026"
+    assert f("by 5th sep", today) == "05/Sep/2026"
+    assert f("15/1", today) == "15/Jan/2027"  # already passed -> next year
+    assert f("9/13", today) == "13/Sep/2026"  # month-first numeric, swapped
+    # vague deadlines never guess a date
+    assert f("ASAP", today) == ""
+    assert f("BY NEXT WEEK", today) == ""
+    assert f("BY SEP 2026", today) == ""  # month+year only: no day
+    assert f("", today) == ""
+
+
 def test_resolve_customer_exact_tokens_beat_alias(monkeypatch):
     monkeypatch.setattr(sheets, "load_merged_customers", lambda **k: [
         {"name": "Pran Foods Ltd", "code": "S-UDP041"},

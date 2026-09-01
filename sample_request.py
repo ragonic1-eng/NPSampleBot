@@ -138,7 +138,12 @@ class Ask:
     # Alex 02-Sep: never fabricate 'No prefer code.' — say it only when he
     # actually wrote it, and then only inside the Comment block.
     no_prefer_code: bool = False
-    delivery: str = ""      # 'Send/Delivery method:' — courier, collection…
+    # Alex 02-Sep: delivery METHOD and delivery ADDRESS are two separate
+    # inputs. A stated delivery address is an EXPLICIT ship-to and must
+    # replace the derived customer-master address, never sit beside it
+    # contradicting it (courier-to-Geylang vs the Dhaka master address).
+    delivery: str = ""          # method: courier / self-collect / DHL…
+    delivery_addr: str = ""     # where it actually goes
     # Per-item quantities: [(qty_text, item_name)] e.g. [('500g',
     # 'Texture improver 2')]. Rendered as 'QTY: 100g - Tomato seasoning,
     # 500g - Texture improver 2' so R&D can't misread which is which.
@@ -221,6 +226,18 @@ _NO_PREFER_CODE = re.compile(
 _DELIVERY_LINE = re.compile(
     r"^(?:send|delivery|shipping)\s*method\s*[:\-]?\s*(.*)$|"
     r"^((?:to\s+)?(?:courier|self.?collect|collection|hand.?carry|deliver)\b.*)$",
+    re.IGNORECASE)
+# explicit 'Delivery address: X' / 'Send to: X' / 'Ship to: X'
+_DELIVERY_ADDR_LINE = re.compile(
+    r"^(?:delivery|shipping|send|ship)\s*(?:address|to)\s*[:\-]?\s*(.+)$",
+    re.IGNORECASE)
+# the bare method verbs, so 'to courier to Geylang' splits into
+# method='Courier' + address='Geylang'
+_METHOD_WORD = re.compile(
+    r"\b(courier|self.?collect(?:ion)?|hand.?carry|dhl|fedex|ups|deliver\w*|"
+    r"collect\w*)\b", re.IGNORECASE)
+_METHOD_DEST = re.compile(
+    r"\b(?:courier|deliver\w*|send|ship|collect\w*)\b[^,]*?\bto\s+(.+)$",
     re.IGNORECASE)
 # '500g - texture improver 2'  |  'texture improver 2 - 500g'  |  '500g each'
 _QTY_ITEM_RE = re.compile(
@@ -515,13 +532,26 @@ def parse_ask(text: str) -> Ask:
         if rm2 and not a.restriction and len(line) < 90:
             a.restriction = (rm2.group(1) or rm2.group(2) or "").strip()
             continue
-        # Alex 02-Sep: 'Send method: / To courier to Geylang' must surface
-        # as its own 'Delivery method:' block, not vanish into the body.
+        # Alex 02-Sep: delivery METHOD and delivery ADDRESS are separate
+        # inputs. 'To courier to Geylang.' → method 'Courier',
+        # address 'Geylang'.
+        da2 = _DELIVERY_ADDR_LINE.match(line)
+        if da2 and len(line) < 200 and not _METHOD_WORD.match(da2.group(1)):
+            a.delivery_addr = da2.group(1).strip().rstrip(".")
+            continue
         dm2 = _DELIVERY_LINE.match(line)
-        if dm2 and len(line) < 120:
+        if dm2 and len(line) < 200:
             val = (dm2.group(1) or dm2.group(2) or "").strip()
             if val:
-                a.delivery = (a.delivery + " " + val).strip()
+                dest = _METHOD_DEST.search(val)
+                if dest and not a.delivery_addr:
+                    a.delivery_addr = dest.group(1).strip().rstrip(".")
+                mw = _METHOD_WORD.search(val)
+                if mw:
+                    meth = mw.group(1).strip().rstrip(".")
+                    a.delivery = (meth[:1].upper() + meth[1:]) or a.delivery
+                elif not dest:
+                    a.delivery = (a.delivery + " " + val).strip()
             continue
         # per-item quantity, either order ('500g - X' / 'X - 500g')
         qi = _QTY_ITEM_RE.match(line)
@@ -1428,7 +1458,10 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
                    ("their last request", ship["contact"]),
                    ("remembered", mem_get(customer, "contact")),
                    ("customer master", (master_rec or {}).get("receiver_number", "")))
-    addr = pick("addr", ask.overrides.get("addr"),
+    # A stated delivery address IS the ship-to — explicit always wins over
+    # the customer-master default (Alex 02-Sep: courier-to-Geylang must not
+    # sit next to the Dhaka master address).
+    addr = pick("addr", ask.overrides.get("addr") or ask.delivery_addr,
                 ("their last request", ship["addr"]),
                 ("remembered", mem_get(customer, "addr")),
                 ("customer master", (master_rec or {}).get("address", "")))
@@ -1601,13 +1634,15 @@ def render_reqnote(draft: dict) -> str:
         lines.append(f"NEED BY: {draft['need_by']}")
     if ask.delivery:
         lines.append("")
-        lines.append("Delivery method:")
-        lines.append(ask.delivery)
+        lines.append(f"Delivery method: {ask.delivery}")
+        lines.append(f"Delivery address: {draft['addr'] or ask.delivery_addr}")
+        lines.append("")
     if draft["attn"]:
         lines.append(f"ATTN: {draft['attn']}")
     if draft["contact"]:
         lines.append(f"CONTACT NO.: {draft['contact']}")
-    if draft["addr"]:
+    # 'Delivery address:' above already carries it — don't print it twice.
+    if draft["addr"] and not ask.delivery:
         lines.append(f"ADDRESS: {draft['addr']}")
     # collapse any doubled blanks from empty optional groups
     out: list[str] = []

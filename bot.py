@@ -9972,6 +9972,10 @@ def _sr_draft_text(draft: dict) -> str:
     else:
         lines.append("Ship to: <b>❓ I couldn't find an address anywhere — "
                      "what's the contact and address?</b>")
+    if draft["ask"].delivery:
+        lines.append(f"Delivery: <b>{h(draft['ask'].delivery)}</b> → "
+                     f"<b>{h(draft['addr'] or draft['ask'].delivery_addr)}</b>"
+                     " <i>(you said)</i>")
     lines.append(f"R&amp;D: <b>{h(draft['assignee'])}</b> "
                  f"<i>({h(draft['territory'])} — reply to change)</i>")
     # No default (Alex, 01 Sep): the rep keys in when the customer expects

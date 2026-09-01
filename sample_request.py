@@ -218,6 +218,21 @@ _RESTRICTION_LINE = re.compile(
     r"\b((?:must be |no )?(?:halal|gluten.?free|non.?gmo|msg.?free|vegan|"
     r"non.?irradiated)[^\n]*)", re.IGNORECASE)
 _NUM_ITEM = re.compile(r"^(\d+)[.)]\s*(.+)$")
+# Alex's standard request form marks required fields with '*'
+# ('Budget* for ...', 'Contact*: +86...', 'Expected to be send by* 9sept').
+# The star is form notation, not content — strip it before field matching
+# or it lands inside every captured value ('* For China').
+_STAR = re.compile(r"(?<=[A-Za-z一-鿿)])\*+")
+# Section headers whose CONTENT is the lines beneath them.
+_HDR_SEASONING = re.compile(r"^seasoning\s*names?\s*[:\-]?\s*$", re.IGNORECASE)
+_HDR_QTY = re.compile(
+    r"^(?:qty|quantity)\s*(?:of\s*sample)?s?\s*[:\-]?\s*$", re.IGNORECASE)
+_HDR_COMMENT = re.compile(r"^comments?\s*[:\-]\s*(.*)$", re.IGNORECASE)
+_RECEIVER_LINE = re.compile(
+    r"^(?:receiver|recipient|attention)\s*(?:name)?\s*[:\-]?\s*(.+)$",
+    re.IGNORECASE)
+# A line that is (mostly) CJK is part of a Chinese company / address block.
+_CJK = re.compile(r"[一-鿿]")
 # 'no prefer code' / 'no preferred code' / 'no code preference' — EXPLICIT only.
 _NO_PREFER_CODE = re.compile(
     r"\bno\s+(?:prefer(?:red|ence)?|preference)\s+code\b|"
@@ -446,9 +461,41 @@ def parse_ask(text: str) -> Ask:
             kept.append(seg)
     text = ";".join(kept)
 
+    # Strip the form's required-field stars before ANY field matching.
+    text = _STAR.sub("", text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         return a
+    # Section headers ('Seasoning name' / 'Qty of sample') own the lines
+    # beneath them until the next labelled line — Alex's standard form.
+    flat: list[str] = []
+    section = ""
+    for ln in lines:
+        if _HDR_SEASONING.match(ln):
+            section = "seasoning"
+            continue
+        if _HDR_QTY.match(ln):
+            section = "qty"
+            continue
+        if section and re.match(
+                r"^(comment|budget|complian|target\s*base|send\s*method|"
+                r"delivery|expected|need|receiver|contact|address|restriction)",
+                ln, re.I):
+            section = ""
+        if section == "seasoning":
+            a.items.append(ln.rstrip("."))
+            continue
+        if section == "qty":
+            qi = _QTY_ITEM_RE.match(ln)
+            iq = _ITEM_QTY_RE.match(ln) if not qi else None
+            if qi or iq:
+                q = (qi.group(1) if qi else iq.group(2)).strip()
+                n = (qi.group(2) if qi else iq.group(1)).strip()
+                a.item_qty.append((re.sub(r"\s+", "", q).lower(), n))
+                continue
+            section = ""
+        flat.append(ln)
+    lines = flat or lines
     head = lines[0]
     # customer — ask split: em/en dash, ' - ', 'Ltd- X', or first comma
     m = re.split(r"\s*[–—]\s*|\s+-\s*|-\s+|,", head, 1)
@@ -487,8 +534,12 @@ def parse_ask(text: str) -> Ask:
             a.overrides["need_by"] = (
                 nm.group(1) or nm.group(2) or nm.group(3) or "").strip()
             consumed = consumed or len(line) < 60
+        rc = _RECEIVER_LINE.match(line)
+        if rc and len(line) < 90 and "attn" not in a.overrides:
+            a.overrides["attn"] = rc.group(1).strip()
+            consumed = True
         am = _ATTN_LINE.search(line)
-        if am:
+        if am and "attn" not in a.overrides:
             a.overrides["attn"] = am.group(1).strip()
             consumed = True
         km = _CONTACT_LINE.search(line)
@@ -565,6 +616,26 @@ def parse_ask(text: str) -> Ask:
                 continue
         kept.append(line)
     body = kept
+    # Trailing unlabelled block after the contact line is the ship-to
+    # address (Alex's form ends with the company name + street address,
+    # often in Chinese). Only claimed when we have a contact/receiver and
+    # no address yet — otherwise ordinary prose would be swallowed.
+    if ("addr" not in a.overrides
+            and ("contact" in a.overrides or "attn" in a.overrides)):
+        tail: list[str] = []
+        for line in reversed(body):
+            s = line.strip()
+            if not s:
+                break
+            if _CJK.search(s) or re.search(r"\d{3,}|road|rd\.|street|st\.|"
+                                           r"ave|avenue|jalan|lorong|no\.|"
+                                           r"district|province|city", s, re.I):
+                tail.insert(0, s)
+            else:
+                break
+        if tail:
+            a.overrides["addr"] = "\n".join(tail)
+            body = body[:len(body) - len(tail)]
     # explicit 'no prefer code' anywhere in the message (never inferred)
     if _NO_PREFER_CODE.search(text):
         a.no_prefer_code = True
@@ -900,9 +971,28 @@ def _plausible(query: str, name: str) -> bool:
     return False
 
 
+# Geography a rep adds to place a customer ('Fujian Pan pan', 'PAN PAN
+# CHINA'). Real but weak identity: the BRAND token is what distinguishes
+# one customer from another, so place words must never outrank it.
+_PLACE_TOKENS = {
+    "china", "prc", "fujian", "guangdong", "shanghai", "beijing", "jiangsu",
+    "zhejiang", "shandong", "quanzhou", "jinjiang", "xiamen", "singapore",
+    "malaysia", "indonesia", "thailand", "vietnam", "japan", "korea",
+    "india", "bangladesh", "philippines", "myanmar", "nepal", "taiwan",
+    "hongkong", "dubai", "uae", "australia", "jakarta", "bangkok", "hanoi",
+    "saigon", "penang", "selangor", "johor", "klang", "dhaka", "mumbai",
+    "delhi", "asia", "asian", "pacific", "sdn", "bhd",
+}
+
+
 def _distinct_tokens(s: str) -> frozenset:
     return frozenset(t for t in re.findall(r"[a-z0-9]+", s.lower())
                      if t not in _GENERIC_TOKENS and len(t) >= 3)
+
+
+def _brand_tokens(s: str) -> frozenset:
+    """Distinctive tokens with geography removed — the customer's identity."""
+    return frozenset(t for t in _distinct_tokens(s) if t not in _PLACE_TOKENS)
 
 
 def resolve_customer(q: str) -> tuple[dict | None, list[dict]]:
@@ -927,7 +1017,76 @@ def resolve_customer(q: str) -> tuple[dict | None, list[dict]]:
             if qsq in nsq and (len(qsq) / max(len(nsq), 1) >= 0.3 or len(qsq) >= 8):
                 if name.strip().lower() not in seen:
                     hits.append({"name": name, "score": 95, "code": ""})
-    hits.sort(key=lambda x: -(x.get("score") or 0))
+    # Secondary sweep: when the fuzzy pool covers the rep's words poorly,
+    # scan ALL known names for ones covering more of them. 'Fujian Pan pan'
+    # never surfaced '(PAN PAN CHINA)' because no single fuzzy/containment
+    # rule fires — the distinctive words are there, just worded differently.
+    # Score on BRAND tokens (geography stripped) so 'Fujian Pan pan' is
+    # judged on 'pan', not on the province it shares with unrelated firms.
+    _q_all = _brand_tokens(q) or _distinct_tokens(q)
+    if _q_all:
+        from rapidfuzz import fuzz as _fz
+
+        def _cov_of(name: str) -> int:
+            n_toks = _brand_tokens(name) or _distinct_tokens(name)
+            return sum(1 for qt in _q_all
+                       if any(qt in nt or nt in qt or _fz.ratio(qt, nt) >= 85
+                              for nt in n_toks))
+
+        best_cov = max((_cov_of(h.get("name", "")) for h in hits), default=0)
+        # Sweep when the pool covers the rep's words poorly OR when nothing
+        # in it is an exact brand match — 'Fujian Pan pan' scored a full 1/1
+        # via 'Pan Seas Enterprises', which merely shares the word 'pan',
+        # so a coverage test alone never looked for the real '(Pan Pan)'.
+        _has_exact = any(
+            (_brand_tokens(h.get("name", ""))
+             or _distinct_tokens(h.get("name", ""))) == _q_all for h in hits)
+        if best_cov < len(_q_all) or not _has_exact:
+            seen_l = {h["name"].strip().lower() for h in hits}
+            pool = [(c["name"], c) for c in merged]
+            pool += [(n, {"name": n, "code": ""}) for n in fsl_names]
+            extra = []
+            for name, rec in pool:
+                if name.strip().lower() in seen_l:
+                    continue
+                cov = _cov_of(name)
+                # Better coverage, OR the same coverage with an EXACT brand
+                # identity ('Fujian Pan pan' → '(Pan Pan)' is {pan} == {pan},
+                # while 'Pan Seas Enterprises' is {pan, seas} — a different
+                # company that merely shares the word).
+                exact_brand = (_brand_tokens(name) or _distinct_tokens(name)) \
+                    == _q_all
+                if cov > best_cov or (cov >= best_cov and exact_brand):
+                    extra.append((cov + (1 if exact_brand else 0),
+                                  {**rec, "score": 95 if exact_brand else 90}))
+            extra.sort(key=lambda t: -t[0])
+            for _c, rec in extra[:3]:
+                hits.append(rec)
+
+    # Coverage re-rank: prefer the candidate that accounts for MORE of the
+    # rep's distinctive words. 'Fujian Pan pan' → '(PAN PAN CHINA)' covers
+    # {pan}; 'FUJIAN ZHAOLU TRADING' covers only {fujian} while scoring
+    # higher on raw fuzz because the geographic word is long. Repeated
+    # words count once, so 'pan pan' doesn't outrank on repetition alone.
+    _q_toks = _brand_tokens(q) or _distinct_tokens(q)
+
+    def _coverage(name: str) -> int:
+        from rapidfuzz import fuzz as _f
+        n_toks = _brand_tokens(name) or _distinct_tokens(name)
+        hit = 0
+        for qt in _q_toks:
+            if any(qt in nt or nt in qt or _f.ratio(qt, nt) >= 85
+                   for nt in n_toks):
+                hit += 1
+        return hit
+
+    if _q_toks:
+        for x in hits:
+            x["_cov"] = _coverage(x.get("name", ""))
+        hits.sort(key=lambda x: (-(x.get("_cov") or 0),
+                                 -(x.get("score") or 0)))
+    else:
+        hits.sort(key=lambda x: -(x.get("score") or 0))
     if not hits:
         return None, []
     # Dominant match: a candidate whose DISTINCTIVE tokens equal the query's
@@ -936,9 +1095,11 @@ def resolve_customer(q: str) -> tuple[dict | None, list[dict]]:
     # Ltd (Pran Foods))' ({'technologies','pran'}) can't force a pointless
     # 'which one did you mean?'. Ties (spelling variants of the same entity)
     # go to the best fuzzy score, then to the entry with a customer code.
-    q_set = _distinct_tokens(q)
+    q_set = _brand_tokens(q) or _distinct_tokens(q)
     if q_set:
-        exact = [x for x in hits if _distinct_tokens(x.get("name", "")) == q_set]
+        exact = [x for x in hits
+                 if (_brand_tokens(x.get("name", ""))
+                     or _distinct_tokens(x.get("name", ""))) == q_set]
         if exact:
             exact.sort(key=lambda x: (-(x.get("score") or 0),
                                       not x.get("code")))
@@ -1496,6 +1657,24 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
                     (("bag", bag), ("ship-to", attn or addr),
                      ("need-by", ask.overrides.get("need_by")))
                     if not v],
+        # Smart-fill status for Alex's standard form (each '*' field):
+        # 'you' = he wrote it · a source label = the bot filled it from
+        # history/master · '' = genuinely missing, must be asked.
+        "fields": {
+            "Seasoning name": ("you" if (ask.items or ask.flavours
+                                         or ask.ask_text) else ""),
+            "Comment": "you" if ask.ask_text else "",
+            "Qty of sample": ("you" if (ask.item_qty or ask.qty_g)
+                              else (d.get("qty_src") or "")),
+            "Budget": src.get("budget", ""),
+            "Compliance": src.get("compliance", ""),
+            "Target base": "you" if ask.base else "",
+            "Send method": "you" if ask.delivery else "",
+            "Expected send by": "you" if ask.overrides.get("need_by") else "",
+            "Receiver name": src.get("attn", ""),
+            "Contact": src.get("contact", ""),
+            "Address": src.get("addr", ""),
+        },
         # Alex 02-Sep: 'for the qty segment need to make it clear if not
         # ask user again'. Several named items but not every one has a
         # stated quantity → ASK rather than silently applying one figure.
@@ -1588,6 +1767,13 @@ def render_reqnote(draft: dict) -> str:
             lines.append("")
     else:
         ask_txt = _filter_ask_text(ask.ask_text, [], no_code)
+        # Alex's standard form opens with the seasoning list; keep that
+        # header even when he didn't number them (unnumbered items are
+        # still a list, just not per-flavour specs).
+        if ask.items:
+            lines.append("Seasoning name:")
+            lines.extend(ask.items)
+            lines.append("")
         if no_code:
             # Inside Comment, never as a bare first line. If he wrote his
             # own 'Comment-' line the body already carries it, so just
@@ -1632,17 +1818,24 @@ def render_reqnote(draft: dict) -> str:
             lines.append(f"QTY: {qty_str}")
     if draft["need_by"]:
         lines.append(f"NEED BY: {draft['need_by']}")
-    if ask.delivery:
+    # Delivery method / address are separate inputs. A courier drop-point
+    # ('to Geylang') and the final receiver address can BOTH be given —
+    # they're different places, so never collapse one into the other.
+    deliv_addr = ask.delivery_addr or (draft["addr"] if ask.delivery else "")
+    if ask.delivery or ask.delivery_addr:
         lines.append("")
-        lines.append(f"Delivery method: {ask.delivery}")
-        lines.append(f"Delivery address: {draft['addr'] or ask.delivery_addr}")
+        if ask.delivery:
+            lines.append(f"Delivery method: {ask.delivery}")
+        if deliv_addr:
+            lines.append(f"Delivery address: {deliv_addr}")
         lines.append("")
     if draft["attn"]:
-        lines.append(f"ATTN: {draft['attn']}")
+        lines.append(f"RECEIVER NAME: {draft['attn']}")
     if draft["contact"]:
         lines.append(f"CONTACT NO.: {draft['contact']}")
-    # 'Delivery address:' above already carries it — don't print it twice.
-    if draft["addr"] and not ask.delivery:
+    # Print the receiver address unless the delivery block already showed
+    # this exact text (then it would just be a duplicate).
+    if draft["addr"] and draft["addr"].strip() != deliv_addr.strip():
         lines.append(f"ADDRESS: {draft['addr']}")
     # collapse any doubled blanks from empty optional groups
     out: list[str] = []

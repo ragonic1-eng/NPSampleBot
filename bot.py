@@ -9989,6 +9989,19 @@ def _sr_draft_text(draft: dict) -> str:
     else:
         lines.append("Need by: <b>❓ when should this ship? Tap a 📅 button "
                      "or reply (e.g. “need by 13 Sep”)</b>")
+    # Smart-fill scoreboard for the standard request form: what he gave,
+    # what the bot filled in for him, and what nobody knows yet.
+    _fields = draft.get("fields") or {}
+    if _fields:
+        _filled = [(k, v) for k, v in _fields.items() if v and v != "you"]
+        _gap = [k for k, v in _fields.items() if not v]
+        if _filled:
+            lines.append("\n🤖 <b>I filled in for you:</b> " + ", ".join(
+                f"{h(k)} <i>({h(v)})</i>" for k, v in _filled))
+        if _gap:
+            lines.append("⚠️ <b>Still missing:</b> "
+                         + ", ".join(f"<b>{h(k)}</b>" for k in _gap)
+                         + " — <i>just tell me and I'll fill it in.</i>")
     if draft.get("qty_ambiguous"):
         _items = draft["ask"].items or ["each item"]
         lines.append(

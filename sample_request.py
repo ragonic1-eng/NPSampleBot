@@ -215,6 +215,84 @@ _ADDR_LINE = re.compile(
 _DOSAGE_LINE = re.compile(
     r"\bdosage|\busage|\bper\s+kg\b|\bper\s+100\s*g\b", re.IGNORECASE)
 
+# --- unlabelled pasted ship-to blocks ---------------------------------
+# Reps paste the customer's mailing block verbatim (company / MR X /
+# phone / address lines / country) with no ATTN:/ADDRESS: labels. If it
+# isn't recognised it stays in the note body AND the footer appends the
+# stale remembered ship-to — a duplicate in the note, and worse, the
+# NEW phone/address the rep just gave is silently ignored. Anchored on
+# a standalone phone-number line so prose never matches.
+_PHONE_ONLY_LINE = re.compile(r"\+?\(?\d[\d\s\-().]{6,}")
+_ATTN_NAME_LINE = re.compile(
+    r"(?:mr|ms|mrs|mdm|dr|attn)\.?\s+[a-zA-Z][a-zA-Z .'\-]{1,40}", re.IGNORECASE)
+_COMPANY_TAIL = re.compile(
+    r"\b(?:ltd|limited|pte|inc|corp|co|llc|bhd|gmbh|company)\b\.?\s*$",
+    re.IGNORECASE)
+_ADDR_WORDS = re.compile(
+    r"\b(?:p\.?o\.?\s*box|box|level|floor|road|street|jalan|centre|center|"
+    r"building|tower|block|district|industrial|estate|zone)\b|#\s*\d",
+    re.IGNORECASE)
+_POSTAL_CITY = re.compile(r"\d{3,6}\s+[a-zA-Z][a-zA-Z .\-]+")
+_SHIPTO_COUNTRIES = frozenset((
+    "bangladesh", "mexico", "vietnam", "viet nam", "singapore", "malaysia",
+    "indonesia", "thailand", "india", "china", "japan", "philippines",
+    "myanmar", "cambodia", "laos", "korea", "south korea", "taiwan",
+    "hong kong", "sri lanka", "pakistan", "nepal", "uae",
+    "united arab emirates", "saudi arabia", "australia", "new zealand",
+    "usa", "united states", "uk", "united kingdom",
+))
+
+
+def _shipto_kind(line: str) -> str:
+    """Classify one line of a pasted mailing block ('' = not one)."""
+    s = line.strip()
+    if not s or len(s) > 70:
+        return ""
+    if _PHONE_ONLY_LINE.fullmatch(s):
+        return "phone"
+    if _ATTN_NAME_LINE.fullmatch(s):
+        return "attn"
+    if s.lower().rstrip(".") in _SHIPTO_COUNTRIES:
+        return "country"
+    if _COMPANY_TAIL.search(s):
+        return "company"
+    st = s.rstrip(",").strip()
+    if (_ADDR_WORDS.search(s) or _POSTAL_CITY.fullmatch(st)
+            or ("," in st and any(ch.isdigit() for ch in st))):
+        return "addr"
+    return ""
+
+
+def _extract_shipto(a: Ask, body: list[str]) -> None:
+    """Pull an unlabelled pasted mailing block out of the body into the
+    ship-to overrides. Needs a standalone phone line plus ≥1 adjacent
+    address-shaped line; explicit ATTN:/CONTACT:/ADDRESS: labels still
+    win (setdefault), but the block always leaves the note — a mailing
+    block inside a flavour spec is never what R&D should read."""
+    pi = next((i for i, l in enumerate(body)
+               if _shipto_kind(l) == "phone"), None)
+    if pi is None:
+        return
+    lo = pi
+    while lo > 0 and _shipto_kind(body[lo - 1]):
+        lo -= 1
+    hi = pi
+    while hi + 1 < len(body) and _shipto_kind(body[hi + 1]):
+        hi += 1
+    if hi == lo:
+        return  # a lone number is not a mailing block
+    block = body[lo:hi + 1]
+    attn = next((l.strip() for l in block if _shipto_kind(l) == "attn"), "")
+    addr_ls = [l.strip().rstrip(",").strip() for l in block
+               if _shipto_kind(l) not in ("phone", "attn")]
+    a.overrides.setdefault("contact", body[pi].strip())
+    if attn:
+        a.overrides.setdefault("attn",
+                               attn.title() if attn.isupper() else attn)
+    if addr_ls:
+        a.overrides.setdefault("addr", ", ".join(addr_ls))
+    del body[lo:hi + 1]
+
 
 def _structure_body(a: Ask, body: list[str]) -> None:
     """Split the request body into per-flavour blocks so R&D can see which
@@ -388,6 +466,7 @@ def parse_ask(text: str) -> Ask:
         kept.append(line)
     body = kept
 
+    _extract_shipto(a, body)
     _structure_body(a, body)
     a.ask_text = "\n".join(body).strip()
     # Codes/qty are scanned over the FULL original text, not the post-

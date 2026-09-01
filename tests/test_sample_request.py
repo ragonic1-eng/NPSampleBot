@@ -95,6 +95,66 @@ def test_reqnote_has_no_thanks():
     assert note.rstrip().endswith("ADDRESS: 105 Pragati Swarani, Dhaka")
 
 
+PRAN_SHIPTO = """pran food - Lemon Habanero Seasoning.
+Jalapeno Flavored Seasoning.
+Salsa Verde Flavored Seasoning
+Comment - no prefer code. Customer want Lemon Habanero Seasoning:
+The flavor should have two clear characteristics: citrus freshness followed by strong habanero chilli heat.
+2. Jalapeño Flavored Seasoning
+Garlic and onion as supporting notes.
+3. Salsa Verde Flavored Seasoning
+Tomatillo + green chilli + lime + coriander + onion + garlic.
+PRAN FOODS LTD
+MR SAJIB
++880 1704-158453
+PRAN-RFL CENTRE, 105, MIDDLE BADDA,
+GPO BOX #83, LEVEL 8,
+1212 DHAKA
+Bangladesh
+Budget <2 usd
+Compliance for banagldesh and mexico market
+1kg for each mention flavor
+Target base is on potato biscuit,win win type"""
+
+
+def test_pasted_shipto_block_becomes_overrides_not_body():
+    a = srq.parse_ask(PRAN_SHIPTO)
+    # the NEW details the rep pasted win over anything remembered
+    assert a.overrides.get("contact") == "+880 1704-158453"
+    assert a.overrides.get("attn") == "Mr Sajib"
+    assert a.overrides.get("addr") == (
+        "PRAN FOODS LTD, PRAN-RFL CENTRE, 105, MIDDLE BADDA, "
+        "GPO BOX #83, LEVEL 8, 1212 DHAKA, Bangladesh")
+    # the block leaves the note body entirely — no duplicate in MMS
+    joined = a.ask_text + " ".join(
+        s for f in a.flavours for s in f["spec"])
+    assert "+880" not in joined and "PRAN-RFL" not in joined
+    assert "MR SAJIB" not in joined
+    # flavour structuring is unaffected
+    assert a.structured and len(a.flavours) == 3
+
+
+def test_labelled_shipto_still_beats_pasted_block():
+    a = srq.parse_ask("""acme - bbq seasoning
+CONTACT NO.: 999888777
+MR SAJIB
++880 1704-158453
+105, MIDDLE BADDA, DHAKA
+Bangladesh""")
+    assert a.overrides["contact"] == "999888777"  # explicit label wins
+    assert a.overrides["attn"] == "Mr Sajib"
+    assert "+880" not in a.ask_text  # block still removed from the note
+
+
+def test_lone_number_line_is_not_a_shipto_block():
+    a = srq.parse_ask("""acme - bbq seasoning
+target 1200000 scu
+1704158453
+smoky and sweet profile""")
+    assert "contact" not in a.overrides
+    assert "1704158453" in a.ask_text
+
+
 def test_need_by_prepdate_formats():
     import datetime as dt
     today = dt.date(2026, 9, 1)

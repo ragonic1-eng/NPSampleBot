@@ -10052,6 +10052,19 @@ async def _sr_do_submit(update, draft, token, srq) -> None:
                    f"<code>{h(draft['sr_code'])}</code>.\n"
                    f"<i>Defaults for {h(draft['customer'])} updated from "
                    "this request.</i>")
+        # Visual proof, after the fast ✅ (screenshot adds a few seconds
+        # and is best-effort — never blocks or fails the submit reply).
+        shot = await srq.screenshot_sr(w.session, draft["sr_code"],
+                                       result.get("section"))
+        if shot:
+            try:
+                await update.effective_message.reply_photo(
+                    photo=shot, parse_mode=ParseMode.HTML,
+                    caption=(f"📸 <code>{h(draft['sr_code'])}</code> — "
+                             f"item ({result.get('section', '?')}) as "
+                             "saved in MMS."))
+            except Exception:  # noqa: BLE001
+                log.exception("SR screenshot send failed")
     else:
         await send(update,
                    f"🛑 <b>Not submitted:</b> {h(result.get('detail', '?'))}\n"

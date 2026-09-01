@@ -1101,6 +1101,66 @@ class SRWriter:
                 f"{mid} → clear {after} on {sr_code}")
 
 
+async def screenshot_sr(session, sr_code: str, section: int | None = None):
+    """Best-effort PNG of the SR page after a submit — visual proof for
+    the rep that the item really is in MMS.
+
+    Reuses the ALREADY-LOGGED-IN requests session's cookies in a headless
+    Chromium (the same binary the AWB scrape ships) — no credential entry
+    anywhere. `section` (1-based, from add_item_and_request's result)
+    clips the shot to that item: from its "Next action by" select down to
+    its "until" dropdown. Falls back to the full page, then to None.
+    Never raises — a screenshot hiccup must not touch the submit flow.
+    """
+    try:
+        from playwright.async_api import async_playwright  # noqa: WPS433
+    except ImportError:
+        log.info("playwright unavailable — skipping SR screenshot")
+        return None
+    url = f"{mms_client.BASE_URL}/master/sampleRequestUpdate.do?code={sr_code}"
+    try:
+        cookies = [{
+            "name": c.name, "value": c.value,
+            "domain": c.domain or "www.npsin.com",
+            "path": c.path or "/",
+        } for c in session.cookies]
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True,
+                                              args=["--no-sandbox"])
+            try:
+                ctx = await browser.new_context(
+                    viewport={"width": 1280, "height": 1400})
+                await ctx.add_cookies(cookies)
+                page = await ctx.new_page()
+                await page.goto(url, timeout=30000,
+                                wait_until="domcontentloaded")
+                clip = None
+                if section is not None:
+                    n = section - 1
+                    try:
+                        top = await page.locator(
+                            f'select[name="sreq1[{n}].nextActUserId"]'
+                        ).bounding_box(timeout=5000)
+                        low = await page.locator(
+                            f'select[name="sreq1[{n}].prepdateString"]'
+                        ).bounding_box(timeout=5000)
+                        if top and low:
+                            y0 = max(0.0, top["y"] - 60)
+                            y1 = low["y"] + low["height"] + 40
+                            clip = {"x": 0, "y": y0, "width": 1280,
+                                    "height": max(200.0, y1 - y0)}
+                    except Exception:  # noqa: BLE001 — layout drift → full page
+                        clip = None
+                return await page.screenshot(clip=clip,
+                                             full_page=clip is None,
+                                             timeout=15000)
+            finally:
+                await browser.close()
+    except Exception as e:  # noqa: BLE001
+        log.warning("SR screenshot failed (submit unaffected): %s", e)
+        return None
+
+
 # ------------------------------------------------------------ draft object
 
 def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:

@@ -9947,11 +9947,15 @@ def _sr_draft_text(draft: dict) -> str:
         f"Type: <b>{d['rtype_label']}</b>"
         + (f" — base <code>{h(d['base_code'])}</code>" if d["base_code"] else "")
         + " <i>(inferred from your ask)</i>",
-        f"Qty: <b>{d['qty']} g × {d['sets']} set{'s' if d['sets'] != 1 else ''}"
-        + (f" per flavour — {len(draft['ask'].flavours)} flavours"
-           if draft["ask"].structured and len(draft["ask"].flavours) > 1
-           else (" each" if draft["ask"].qty_each else ""))
-        + f"</b> <i>({h(d['qty_src'])})</i>",
+        ("Qty: <b>"
+         + ", ".join(f"{q} - {n}" for q, n in draft["ask"].item_qty)
+         + "</b> <i>(you said)</i>"
+         if draft["ask"].item_qty else
+         f"Qty: <b>{d['qty']} g × {d['sets']} set{'s' if d['sets'] != 1 else ''}"
+         + (f" per flavour — {len(draft['ask'].flavours)} flavours"
+            if draft["ask"].structured and len(draft["ask"].flavours) > 1
+            else (" each" if draft["ask"].qty_each else ""))
+         + f"</b> <i>({h(d['qty_src'])})</i>"),
         f"Bag: " + (val("bag") if draft["bag"] or src.get("bag") == "confirm"
                     else "<b>❓ not known yet — just tell me: NP or empty "
                          "bags?</b>") + prov("bag"),
@@ -9981,6 +9985,13 @@ def _sr_draft_text(draft: dict) -> str:
     else:
         lines.append("Need by: <b>❓ when should this ship? Tap a 📅 button "
                      "or reply (e.g. “need by 13 Sep”)</b>")
+    if draft.get("qty_ambiguous"):
+        _items = draft["ask"].items or ["each item"]
+        lines.append(
+            "\n❓ <b>How much of each?</b> You named "
+            + ", ".join(f"<b>{h(i)}</b>" for i in _items[:4])
+            + " — tell me the grams per item (e.g. “100g tomato "
+              "seasoning, 500g texture improver 2”) so R&amp;D isn't guessing.")
     if draft.get("page_err"):
         lines.append(f"\n⚠️ <i>{h(draft['page_err'])}</i>")
     lines.append("\n<b>Will write into MMS:</b>")

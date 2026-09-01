@@ -135,6 +135,15 @@ class Ask:
     base: str = ""          # TARGET BASE / application
     restriction: str = ""   # halal / gluten-free / non-GMO …
     structured: bool = False  # True only when block detection is CONFIDENT
+    # Alex 02-Sep: never fabricate 'No prefer code.' — say it only when he
+    # actually wrote it, and then only inside the Comment block.
+    no_prefer_code: bool = False
+    delivery: str = ""      # 'Send/Delivery method:' — courier, collection…
+    # Per-item quantities: [(qty_text, item_name)] e.g. [('500g',
+    # 'Texture improver 2')]. Rendered as 'QTY: 100g - Tomato seasoning,
+    # 500g - Texture improver 2' so R&D can't misread which is which.
+    item_qty: list = field(default_factory=list)
+    items: list = field(default_factory=list)  # bare product/item names
 
     def body_text(self) -> str:
         """ask_text PLUS the structured flavour blocks — for detection scans
@@ -190,7 +199,11 @@ _COMPLIANCE_LINE = re.compile(
     r"complian\w*\s*(?:for|:)?\s*(.+)", re.IGNORECASE)
 _BAG_LINE = re.compile(r"\b(np|empty)\s*(?:sample\s*)?bags?\b", re.IGNORECASE)
 _NEEDBY_LINE = re.compile(
-    r"need(?:ed)?(?:\s+it)?\s+by\s+(.+)|\b(next week|this week|asap|urgent)\b",
+    r"need(?:ed)?(?:\s+it)?\s+by\s+(.+)|"
+    # 'Expected to be send by 9sept', 'target to send by 19 aug'
+    r"(?:expect(?:ed)?|target)\s+to\s+(?:be\s+)?(?:send|sent|ship)\s*"
+    r"(?:by|on)?\s+(.+)|"
+    r"\b(next week|this week|asap|urgent)\b",
     re.IGNORECASE)
 _BASE_LINE = re.compile(
     r"(?:target\s+)?base\s*(?:is)?\s*(?:on)?\s*[:\-]?\s*(.+)|"
@@ -200,6 +213,20 @@ _RESTRICTION_LINE = re.compile(
     r"\b((?:must be |no )?(?:halal|gluten.?free|non.?gmo|msg.?free|vegan|"
     r"non.?irradiated)[^\n]*)", re.IGNORECASE)
 _NUM_ITEM = re.compile(r"^(\d+)[.)]\s*(.+)$")
+# 'no prefer code' / 'no preferred code' / 'no code preference' — EXPLICIT only.
+_NO_PREFER_CODE = re.compile(
+    r"\bno\s+(?:prefer(?:red|ence)?|preference)\s+code\b|"
+    r"\bno\s+code\s+preference\b", re.IGNORECASE)
+# 'Send method:' / 'Delivery method:' / 'to courier to Geylang'
+_DELIVERY_LINE = re.compile(
+    r"^(?:send|delivery|shipping)\s*method\s*[:\-]?\s*(.*)$|"
+    r"^((?:to\s+)?(?:courier|self.?collect|collection|hand.?carry|deliver)\b.*)$",
+    re.IGNORECASE)
+# '500g - texture improver 2'  |  'texture improver 2 - 500g'  |  '500g each'
+_QTY_ITEM_RE = re.compile(
+    r"^(\d+(?:\.\d+)?\s*(?:kg|g))\s*[-–—:]\s*(.+)$", re.IGNORECASE)
+_ITEM_QTY_RE = re.compile(
+    r"^(.+?)\s*[-–—:]\s*(\d+(?:\.\d+)?\s*(?:kg|g))\s*$", re.IGNORECASE)
 _ATTN_LINE = re.compile(r"\battn\.?\s*[:\-]?\s*(.+)", re.IGNORECASE)
 # (?![A-Za-z]) — without it 'tel' matched INSIDE 'Tellicherry'/'Telur' and
 # the rest of a spec line was consumed as CONTACT NO. and written into MMS.
@@ -440,7 +467,9 @@ def parse_ask(text: str) -> Ask:
             consumed = consumed or len(line) < 40
         nm = _NEEDBY_LINE.search(line)
         if nm and "need_by" not in a.overrides:
-            a.overrides["need_by"] = (nm.group(1) or nm.group(2)).strip()
+            a.overrides["need_by"] = (
+                nm.group(1) or nm.group(2) or nm.group(3) or "").strip()
+            consumed = consumed or len(line) < 60
         am = _ATTN_LINE.search(line)
         if am:
             a.overrides["attn"] = am.group(1).strip()
@@ -453,6 +482,18 @@ def parse_ask(text: str) -> Ask:
         if dm:
             a.overrides["addr"] = (dm.group(1) or dm.group(2) or "").strip()
             consumed = True
+        # Per-item quantity FIRST ('500g - texture improver 2'): the
+        # generic scan below used to swallow these short lines as a bare
+        # qty, losing which item they belonged to (Alex 02-Sep).
+        _qi = _QTY_ITEM_RE.match(line)
+        _iq = _ITEM_QTY_RE.match(line) if not _qi else None
+        if (_qi or _iq) and len(line) < 90 and not _DOSAGE_LINE.search(line):
+            _qty_txt = (_qi.group(1) if _qi else _iq.group(2)).strip()
+            _name = (_qi.group(2) if _qi else _iq.group(1)).strip()
+            if _name and len(_name) < 60 and not _QTY_RE.fullmatch(_name):
+                a.item_qty.append(
+                    (re.sub(r"\s+", "", _qty_txt).lower(), _name))
+                continue
         qm = None if _DOSAGE_LINE.search(line) else _QTY_RE.search(line)
         if qm and a.qty_g is None:
             n = float(qm.group(1))
@@ -463,7 +504,7 @@ def parse_ask(text: str) -> Ask:
         if not consumed:
             body.append(line)
 
-    # base / restriction — corpus-standard fields the summary was dropping
+    # base / restriction / delivery / per-item qty — corpus-standard fields
     kept: list[str] = []
     for line in body:
         bm2 = _BASE_LINE.match(line)
@@ -474,8 +515,40 @@ def parse_ask(text: str) -> Ask:
         if rm2 and not a.restriction and len(line) < 90:
             a.restriction = (rm2.group(1) or rm2.group(2) or "").strip()
             continue
+        # Alex 02-Sep: 'Send method: / To courier to Geylang' must surface
+        # as its own 'Delivery method:' block, not vanish into the body.
+        dm2 = _DELIVERY_LINE.match(line)
+        if dm2 and len(line) < 120:
+            val = (dm2.group(1) or dm2.group(2) or "").strip()
+            if val:
+                a.delivery = (a.delivery + " " + val).strip()
+            continue
+        # per-item quantity, either order ('500g - X' / 'X - 500g')
+        qi = _QTY_ITEM_RE.match(line)
+        iq = _ITEM_QTY_RE.match(line) if not qi else None
+        if (qi or iq) and len(line) < 90:
+            qty_txt = (qi.group(1) if qi else iq.group(2)).strip()
+            name = (qi.group(2) if qi else iq.group(1)).strip()
+            # guard: don't swallow spec prose ('lemon - sharp citrus kick')
+            if name and len(name) < 60:
+                a.item_qty.append((re.sub(r"\s+", "", qty_txt).lower(), name))
+                continue
         kept.append(line)
     body = kept
+    # explicit 'no prefer code' anywhere in the message (never inferred)
+    if _NO_PREFER_CODE.search(text):
+        a.no_prefer_code = True
+    body = [l for l in body if not _NO_PREFER_CODE.match(l.strip())]
+    # bare item names: short lines that aren't sentences — the unnumbered
+    # equivalent of a flavour list ('Tomato seasoning' / 'Texture improver 2')
+    for line in body:
+        s = line.strip().rstrip(".")
+        if (2 <= len(s.split()) <= 6 and len(s) < 55
+                and not s.endswith((":", ","))
+                and not re.search(r"[.!?]\s", s)
+                and not re.match(r"^(comment|budget|compliance|target|note)",
+                                 s, re.I)):
+            a.items.append(s)
 
     _extract_shipto(a, body)
     _structure_body(a, body)
@@ -492,6 +565,12 @@ def parse_ask(text: str) -> Ask:
     if a.qty_g is None:
         for _bl in blob.splitlines():
             if _DOSAGE_LINE.search(_bl):
+                continue
+            # A per-item line ('500g - texture improver 2') belongs to THAT
+            # item — it must not become the request-wide default, or the
+            # other item silently inherits the wrong figure (Alex 02-Sep).
+            _s = _bl.strip()
+            if _QTY_ITEM_RE.match(_s) or _ITEM_QTY_RE.match(_s):
                 continue
             m2 = _QTY_RE.search(_bl)
             if m2:
@@ -1384,6 +1463,16 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
                     (("bag", bag), ("ship-to", attn or addr),
                      ("need-by", ask.overrides.get("need_by")))
                     if not v],
+        # Alex 02-Sep: 'for the qty segment need to make it clear if not
+        # ask user again'. Several named items but not every one has a
+        # stated quantity → ASK rather than silently applying one figure.
+        "qty_ambiguous": bool(
+            ask.item_qty and ask.items
+            and len(ask.item_qty) < len({i.lower() for i in ask.items})
+        ) or bool(
+            len(ask.items) > 1 and not ask.item_qty and not ask.qty_each
+            and not (ask.structured and ask.flavours)
+        ),
     }
     DRAFTS[token] = draft
     return draft
@@ -1436,7 +1525,9 @@ def render_reqnote(draft: dict) -> str:
     d = draft["derived"]
     ask = draft["ask"]
     qty_str = f"{d['qty']}g x {d['sets']} set" + ("s" if d["sets"] != 1 else "")
-    no_code = d["rtype"] == "new" and not ask.codes and not d.get("base_code")
+    # Alex 02-Sep: 'No prefer code.' is HIS phrase, not our inference —
+    # emit it only when he actually wrote it, and only inside Comment.
+    no_code = ask.no_prefer_code
     lines: list[str] = []
     if ask.structured and ask.flavours:
         # Alex's OWN convention, confirmed from his prior request already
@@ -1463,10 +1554,16 @@ def render_reqnote(draft: dict) -> str:
             lines.append(ask_txt)
             lines.append("")
     else:
-        if no_code:
-            lines.append("No prefer code.")
-            lines.append("")
         ask_txt = _filter_ask_text(ask.ask_text, [], no_code)
+        if no_code:
+            # Inside Comment, never as a bare first line. If he wrote his
+            # own 'Comment-' line the body already carries it, so just
+            # prefix; otherwise open the Comment block ourselves.
+            if re.search(r"^\s*comment\s*[-:]", ask_txt, re.I | re.M):
+                lines.append("Comment: No prefer code.")
+            else:
+                lines.append(f"Comment: No prefer code.")
+            lines.append("")
         if ask_txt:
             lines.append(ask_txt)
             lines.append("")
@@ -1483,13 +1580,29 @@ def render_reqnote(draft: dict) -> str:
     # QTY: each numbered header already carries '- {qty}' for structured
     # multi-flavour notes — repeating it in the footer was Alex's 01-Sep
     # duplicate complaint. Footer QTY only when the headers don't show it.
-    if not (ask.structured and len(ask.flavours) > 1):
+    if ask.item_qty:
+        # Per-item quantities — Alex 02-Sep: '100g - Tomato seasoning,
+        # 500g - Texture improver 2', never a bare figure that reads as
+        # the whole request. Items he didn't price get the default qty so
+        # every named item is accounted for explicitly.
+        named = {n.lower() for _, n in ask.item_qty}
+        parts = [f"{q} - {n}" for q, n in ask.item_qty]
+        for it in ask.items:
+            if it.lower() not in named and not any(
+                    it.lower() in n or n in it.lower() for n in named):
+                parts.insert(0, f"{d['qty']}g - {it}")
+        lines.append("QTY: " + ", ".join(parts))
+    elif not (ask.structured and len(ask.flavours) > 1):
         if ask.qty_each:
             lines.append(f"QTY: {qty_str} each")
         else:
             lines.append(f"QTY: {qty_str}")
     if draft["need_by"]:
         lines.append(f"NEED BY: {draft['need_by']}")
+    if ask.delivery:
+        lines.append("")
+        lines.append("Delivery method:")
+        lines.append(ask.delivery)
     if draft["attn"]:
         lines.append(f"ATTN: {draft['attn']}")
     if draft["contact"]:

@@ -254,11 +254,25 @@ _METHOD_WORD = re.compile(
 _METHOD_DEST = re.compile(
     r"\b(?:courier|deliver\w*|send|ship|collect\w*)\b[^,]*?\bto\s+(.+)$",
     re.IGNORECASE)
-# '500g - texture improver 2'  |  'texture improver 2 - 500g'  |  '500g each'
+# Sample quantities aren't only weights — Alex 02-Sep sent '1 pkt- Texture
+# 2 wheat flour pellets' (base pellets ship by the packet), and those lines
+# stayed stranded in the comment instead of joining QTY.
+_QTY_UNIT = (r"(?:kgs?|g|gm|grams?|pkts?|packets?|packs?|pcs?|pieces?|"
+             r"bottles?|sets?|cartons?|boxes|box|bags?|tins?|sachets?)")
+# '500g - texture improver 2' | 'texture improver 2 - 500g' | '1 pkt- X'
 _QTY_ITEM_RE = re.compile(
-    r"^(\d+(?:\.\d+)?\s*(?:kg|g))\s*[-–—:]\s*(.+)$", re.IGNORECASE)
+    rf"^(\d+(?:\.\d+)?\s*{_QTY_UNIT})\s*[-–—:]\s*(.+)$", re.IGNORECASE)
 _ITEM_QTY_RE = re.compile(
-    r"^(.+?)\s*[-–—:]\s*(\d+(?:\.\d+)?\s*(?:kg|g))\s*$", re.IGNORECASE)
+    rf"^(.+?)\s*[-–—:]\s*(\d+(?:\.\d+)?\s*{_QTY_UNIT})\s*$", re.IGNORECASE)
+
+
+def _norm_qty(s: str) -> str:
+    """'1 pkt' / '500 g' → '1 pkt' / '500g' — tidy but readable."""
+    m = re.match(rf"^(\d+(?:\.\d+)?)\s*({_QTY_UNIT})$", s.strip(), re.I)
+    if not m:
+        return s.strip()
+    num, unit = m.group(1), m.group(2).lower()
+    return f"{num}{unit}" if unit in ("g", "kg", "kgs") else f"{num} {unit}"
 _ATTN_LINE = re.compile(r"\battn\.?\s*[:\-]?\s*(.+)", re.IGNORECASE)
 # (?![A-Za-z]) — without it 'tel' matched INSIDE 'Tellicherry'/'Telur' and
 # the rest of a spec line was consumed as CONTACT NO. and written into MMS.
@@ -491,7 +505,7 @@ def parse_ask(text: str) -> Ask:
             if qi or iq:
                 q = (qi.group(1) if qi else iq.group(2)).strip()
                 n = (qi.group(2) if qi else iq.group(1)).strip()
-                a.item_qty.append((re.sub(r"\s+", "", q).lower(), n))
+                a.item_qty.append((_norm_qty(q), n))
                 continue
             section = ""
         flat.append(ln)
@@ -559,8 +573,7 @@ def parse_ask(text: str) -> Ask:
             _qty_txt = (_qi.group(1) if _qi else _iq.group(2)).strip()
             _name = (_qi.group(2) if _qi else _iq.group(1)).strip()
             if _name and len(_name) < 60 and not _QTY_RE.fullmatch(_name):
-                a.item_qty.append(
-                    (re.sub(r"\s+", "", _qty_txt).lower(), _name))
+                a.item_qty.append((_norm_qty(_qty_txt), _name))
                 continue
         qm = None if _DOSAGE_LINE.search(line) else _QTY_RE.search(line)
         if qm and a.qty_g is None:
@@ -612,7 +625,7 @@ def parse_ask(text: str) -> Ask:
             name = (qi.group(2) if qi else iq.group(1)).strip()
             # guard: don't swallow spec prose ('lemon - sharp citrus kick')
             if name and len(name) < 60:
-                a.item_qty.append((re.sub(r"\s+", "", qty_txt).lower(), name))
+                a.item_qty.append((_norm_qty(qty_txt), name))
                 continue
         kept.append(line)
     body = kept

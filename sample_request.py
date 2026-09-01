@@ -523,7 +523,10 @@ verbatim), "qty_g": int|null, "sets": int|null, "bag": str|null,
 Rules: 'repeat X' → rtype rep, base_code X. 'modify/change X' → rtype mod.
 "cheap as possible" etc → budget as stated. Never invent values.
 Keep the rep's line breaks in "ask" (use \n) — R&D reads it as written,
-and numbered flavour lists must stay numbered lines."""
+and numbered flavour lists must stay numbered lines. If he numbers
+multiple flavours (1. name - spec, 2. name - spec...), extract each as
+a distinct name+spec pair — the renderer builds the 'Seasoning name:' /
+'Comment:' blocks itself; don't rewrite them into that shape yourself."""
 
 _UPDATE_PROMPT = """A salesperson is editing a draft sample request by chatting.
 Current draft:
@@ -1387,21 +1390,38 @@ def render_reqnote(draft: dict) -> str:
     d = draft["derived"]
     ask = draft["ask"]
     qty_str = f"{d['qty']}g x {d['sets']} set" + ("s" if d["sets"] != 1 else "")
+    no_code = d["rtype"] == "new" and not ask.codes and not d.get("base_code")
     lines: list[str] = []
-    if d["rtype"] == "new" and not ask.codes and not d.get("base_code"):
-        lines.append("No prefer code.")
-        lines.append("")
     if ask.structured and ask.flavours:
+        # Alex's OWN convention, confirmed from his prior request already
+        # on this SR ('Seasoning name: X / Comment: Y / Budget: Z /
+        # Sample to be given to customer: Q', repeated per flavour when
+        # budget/qty genuinely differ per flavour). Here budget/qty/
+        # compliance are IDENTICAL across all flavours, so per his
+        # correction they're consolidated once instead of repeated:
+        # one 'Seasoning name:' block listing every name, one 'Comment:'
+        # block holding the numbered spec list (with 'No prefer code.'
+        # folded in as its opening line), shared footer once at the end.
+        lines.append("Seasoning name:")
+        lines.extend(f["name"].upper() for f in ask.flavours)
+        lines.append("")
+        comment_lead = "No prefer code." if no_code else ""
+        lines.append(f"Comment: {comment_lead}".rstrip())
+        lines.append("")
+        for i, f in enumerate(ask.flavours, 1):
+            lines.append(f"{i}. {f['name'].upper()} - {qty_str}")
+            lines.extend(s for s in f["spec"] if s.strip())
+            lines.append("")
         if ask.ask_text:
             lines.append(ask.ask_text)
             lines.append("")
-        for i, f in enumerate(ask.flavours, 1):
-            lines.append(f"{i}. {f['name'].upper()} — {qty_str}")
-            lines.extend(s for s in f["spec"] if s.strip())
+    else:
+        if no_code:
+            lines.append("No prefer code.")
             lines.append("")
-    elif ask.ask_text:
-        lines.append(ask.ask_text)
-        lines.append("")
+        if ask.ask_text:
+            lines.append(ask.ask_text)
+            lines.append("")
     if ask.base:
         lines.append(f"TARGET BASE: {ask.base}")
     if ask.restriction:

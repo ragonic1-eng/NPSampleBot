@@ -20,7 +20,8 @@ os.environ.setdefault("TELEGRAM_BOT_TOKEN", "")
 
 import matcher  # noqa: E402
 import sample_request as srq  # noqa: E402
-from bot import _WEEKDAYS, _collapse_samples, _match_rep_names  # noqa: E402
+from bot import (_WEEKDAYS, _collapse_samples, _kw_all_words_match,  # noqa: E402
+                 _match_rep_names, _smart_text_match)
 
 
 # ---- PTB cron convention ---------------------------------------------------
@@ -165,6 +166,24 @@ def test_collapse_merges_date_format_drift():
     ]
     out = _collapse_samples(rows)
     assert len(out) == 1 and out[0]["_dup_count"] == 2
+
+
+# ---- promo pseudo-customers must be findable by filter ---------------------
+
+def test_multiword_filter_matches_promo_customers():
+    # 'alex bangladesh promotion' → rep filter kw 'bangladesh promotion'.
+    # _smart_text_match needs the words adjacent, so these grouped promo
+    # rows were invisible; the all-words fallback finds them.
+    target = "(Bangladesh August sample promotion)"
+    assert not _smart_text_match("bangladesh promotion", target)  # the gap
+    assert _kw_all_words_match("bangladesh promotion", target)
+    assert _kw_all_words_match("bangladesh aug", target)
+    assert _kw_all_words_match("bangladesh sample promotion", target)
+    # …but wrong-country and single-word queries don't over-match
+    assert not _kw_all_words_match("bangladesh promotion",
+                                   "(Vietnam promotion samples July trip)")
+    assert not _kw_all_words_match("promotion", target)  # 1 token → defer
+    assert not _kw_all_words_match("", target)
 
 
 # ---- 2-char rep names ------------------------------------------------------

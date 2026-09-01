@@ -1210,6 +1210,23 @@ def _smart_text_match(query: str, target: str, fuzzy_threshold: int = 80) -> boo
     return False
 
 
+def _kw_all_words_match(kw: str, target: str) -> bool:
+    """Order-free all-words containment for multi-word queries.
+
+    _smart_text_match's substring passes need the query words ADJACENT in
+    the target, so 'bangladesh promotion' could never match the promo
+    pseudo-customer '(Bangladesh August sample promotion)' — those rows
+    were unfindable by filter and buried pages deep in the rep view.
+    Requires ≥ 2 tokens of ≥ 3 alphanumeric chars, each a substring of
+    the target; single words stay with _smart_text_match's rules."""
+    toks = [t for t in re.findall(r"[a-z0-9]+", (kw or "").lower())
+            if len(t) >= 3]
+    if len(toks) < 2:
+        return False
+    t_lc = (target or "").lower()
+    return all(t in t_lc for t in toks)
+
+
 # Max product codes per /pp or /scan invocation. Each code triggers an
 # MMS round-trip (product detail + R&D price scrape), so this caps both
 # server load and the time the user waits before seeing results.
@@ -4963,7 +4980,10 @@ async def _show_rep_samples(
         f"👔 <b>Samples sent by {h(rep_name)} — last 2 years</b>",
         f"<i>Page {page + 1}/{total_pages} · {len(glist)} customers · "
         f"{len(rows)} samples total · newest first</i>",
-        "<i>Tap a grey block to expand or hide it.</i>",
+        "<i>Tap a grey block to expand or hide it. 🔎 To jump, add a "
+        f"word: “{h(rep_name.lower())} promo”, "
+        f"“{h(rep_name.lower())} bangladesh”, "
+        f"“{h(rep_name.lower())} &lt;4 usd”.</i>",
         _PRICE_ASOF_HINT,
         "",
     ]
@@ -5204,8 +5224,10 @@ async def _show_rep_samples_filtered(
             prod_matches.append(r)
         elif _match_lastsample_product(r, kw):
             prod_matches.append(r)
-        elif _smart_text_match(kw, (r.get("Customer Name") or "").strip()):
-            cust_matches.append(r)
+        else:
+            _cust = (r.get("Customer Name") or "").strip()
+            if _smart_text_match(kw, _cust) or _kw_all_words_match(kw, _cust):
+                cust_matches.append(r)
     via_customer = not prod_matches and bool(cust_matches)
     matches = prod_matches or cust_matches
     matches.sort(key=lambda r: r["_date"], reverse=True)

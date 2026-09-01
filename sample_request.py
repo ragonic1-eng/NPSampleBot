@@ -226,7 +226,9 @@ _STAR = re.compile(r"(?<=[A-Za-z一-鿿)])\*+")
 # Section headers whose CONTENT is the lines beneath them.
 _HDR_SEASONING = re.compile(r"^seasoning\s*names?\s*[:\-]?\s*$", re.IGNORECASE)
 _HDR_QTY = re.compile(
-    r"^(?:qty|quantity)\s*(?:of\s*sample)?s?\s*[:\-]?\s*$", re.IGNORECASE)
+    r"^(?:qty|quantity)\s*(?:of\s*samples?)?\s*[:\-]?\s*$|"
+    # Alex's own wording on his existing SRs
+    r"^sample\s*(?:to\s*be\s*given|size|qty)[^:]*:?\s*$", re.IGNORECASE)
 _HDR_COMMENT = re.compile(r"^comments?\s*[:\-]\s*(.*)$", re.IGNORECASE)
 _RECEIVER_LINE = re.compile(
     r"^(?:receiver|recipient|attention)\s*(?:name)?\s*[:\-]?\s*(.+)$",
@@ -254,25 +256,40 @@ _METHOD_WORD = re.compile(
 _METHOD_DEST = re.compile(
     r"\b(?:courier|deliver\w*|send|ship|collect\w*)\b[^,]*?\bto\s+(.+)$",
     re.IGNORECASE)
-# Sample quantities aren't only weights — Alex 02-Sep sent '1 pkt- Texture
-# 2 wheat flour pellets' (base pellets ship by the packet), and those lines
-# stayed stranded in the comment instead of joining QTY.
-_QTY_UNIT = (r"(?:kgs?|g|gm|grams?|pkts?|packets?|packs?|pcs?|pieces?|"
-             r"bottles?|sets?|cartons?|boxes|box|bags?|tins?|sachets?)")
-# '500g - texture improver 2' | 'texture improver 2 - 500g' | '1 pkt- X'
+# What a sample quantity actually IS (Alex 02-Sep, confirmed against the
+# corpus): an AMOUNT PHRASE — a leading number followed by an optional short
+# unit/qualifier. The vocabulary is open and always will be: '1000g', '50kg',
+# '1 pkt', '1 small bottle', '1pcs Noodle Cake', '200g each', '500G EA'. So
+# the rule is 'starts with a number', NOT membership of a unit list — a fixed
+# list silently drops every phrasing nobody thought to enumerate.
+#
+# Guards that keep it from eating other lines:
+#   • the trailing phrase is capped short, so a product name can't pass as
+#     a unit ('1 Lemon Habanero Seasoning' is not a quantity)
+#   • a numbered list marker is excluded for free: '1.' / '2)' put
+#     punctuation straight after the digit, where a unit letter must be.
+_AMOUNT = r"\d+(?:\.\d+)?\s*(?:[A-Za-z][A-Za-z.]{0,9}(?:\s+[A-Za-z]{1,8})?)?"
+_QTY_SEP = r"(?:[-–—:]|\s+of\b)"
+# '500g - texture improver 2' | '1 pkt- X' | '1 pkt of application'
 _QTY_ITEM_RE = re.compile(
-    rf"^(\d+(?:\.\d+)?\s*{_QTY_UNIT})\s*[-–—:]\s*(.+)$", re.IGNORECASE)
+    rf"^({_AMOUNT})\s*{_QTY_SEP}\s*(.+)$", re.IGNORECASE)
+# 'texture improver 2 - 500g'
 _ITEM_QTY_RE = re.compile(
-    rf"^(.+?)\s*[-–—:]\s*(\d+(?:\.\d+)?\s*{_QTY_UNIT})\s*$", re.IGNORECASE)
+    rf"^(.+?)\s*[-–—:]\s*({_AMOUNT})\s*$", re.IGNORECASE)
+# A bare amount on its own line ('1 small bottle', '100g sample',
+# '1pcs Noodle Cake'). Only used UNDER a quantity heading — in that
+# context the whole line is the quantity, so 'starts with a number' is
+# the honest rule and no unit vocabulary is needed. Numbered list markers
+# ('1.' / '2)') are still excluded.
+_BARE_AMOUNT_RE = re.compile(r"^\d+(?:\.\d+)?\s*[A-Za-z][\w.,/ ]{0,40}$")
 
 
 def _norm_qty(s: str) -> str:
-    """'1 pkt' / '500 g' → '1 pkt' / '500g' — tidy but readable."""
-    m = re.match(rf"^(\d+(?:\.\d+)?)\s*({_QTY_UNIT})$", s.strip(), re.I)
-    if not m:
-        return s.strip()
-    num, unit = m.group(1), m.group(2).lower()
-    return f"{num}{unit}" if unit in ("g", "kg", "kgs") else f"{num} {unit}"
+    """Tidy spacing only — never re-word the rep's own phrasing.
+    '500 g' → '500g'; '1 pkt', '1 small bottle' pass through intact."""
+    s = " ".join(s.split())
+    return re.sub(r"^(\d+(?:\.\d+)?)\s+(kgs?|g|gm)\b", r"\1\2", s,
+                  flags=re.IGNORECASE)
 _ATTN_LINE = re.compile(r"\battn\.?\s*[:\-]?\s*(.+)", re.IGNORECASE)
 # (?![A-Za-z]) — without it 'tel' matched INSIDE 'Tellicherry'/'Telur' and
 # the rest of a spec line was consumed as CONTACT NO. and written into MMS.
@@ -497,6 +514,17 @@ def parse_ask(text: str) -> Ask:
                 ln, re.I):
             section = ""
         if section == "seasoning":
+            # A quantity line inside the seasoning list is still a
+            # quantity ('1 pkt- Texture 2 wheat flour pellets'), not the
+            # name of a seasoning — otherwise it becomes an item AND
+            # picks up a fabricated default amount.
+            _qi = _QTY_ITEM_RE.match(ln)
+            _iq = _ITEM_QTY_RE.match(ln) if not _qi else None
+            if _qi or _iq:
+                _q = (_qi.group(1) if _qi else _iq.group(2)).strip()
+                _n = (_qi.group(2) if _qi else _iq.group(1)).strip()
+                a.item_qty.append((_norm_qty(_q), _n))
+                continue
             a.items.append(ln.rstrip("."))
             continue
         if section == "qty":
@@ -506,6 +534,12 @@ def parse_ask(text: str) -> Ask:
                 q = (qi.group(1) if qi else iq.group(2)).strip()
                 n = (qi.group(2) if qi else iq.group(1)).strip()
                 a.item_qty.append((_norm_qty(q), n))
+                continue
+            # A bare amount under the heading ('1 small bottle', '100g
+            # sample') is the quantity itself — it belongs to the item
+            # being discussed, not to a name on the same line.
+            if _BARE_AMOUNT_RE.match(ln):
+                a.item_qty.append((_norm_qty(ln), ""))
                 continue
             section = ""
         flat.append(ln)
@@ -1817,12 +1851,29 @@ def render_reqnote(draft: dict) -> str:
         # 500g - Texture improver 2', never a bare figure that reads as
         # the whole request. Items he didn't price get the default qty so
         # every named item is accounted for explicitly.
-        named = {n.lower() for _, n in ask.item_qty}
-        parts = [f"{q} - {n}" for q, n in ask.item_qty]
-        for it in ask.items:
-            if it.lower() not in named and not any(
-                    it.lower() in n or n in it.lower() for n in named):
-                parts.insert(0, f"{d['qty']}g - {it}")
+        paired = [(q, n) for q, n in ask.item_qty if n]
+        bare = [q for q, n in ask.item_qty if not n]
+        named = {n.lower() for _, n in paired}
+
+        def _claimed(item: str) -> bool:
+            il = item.lower()
+            return il in named or any(il in n or n in il for n in named)
+
+        # Attach bare amounts ('1 small bottle' under the Qty heading) to
+        # the items that don't yet have one, in the order both were given —
+        # that IS the quantity for that item, not a loose figure.
+        unpriced = [it for it in ask.items if not _claimed(it)]
+        for it in list(unpriced):
+            if not bare:
+                break
+            paired.append((bare.pop(0), it))
+            unpriced.remove(it)
+        parts = [f"{q} - {n}" for q, n in paired]
+        parts += bare  # anything still unattached, kept verbatim
+        # Only now fall back to the derived default, and only for items
+        # the rep never quantified at all.
+        for it in unpriced:
+            parts.append(f"{d['qty']}g - {it}")
         lines.append("QTY: " + ", ".join(parts))
     elif not (ask.structured and len(ask.flavours) > 1):
         if ask.qty_each:

@@ -10003,8 +10003,26 @@ def _sr_draft_text(draft: dict) -> str:
                      "and address</i>")
     # Smart-fill scoreboard for the standard request form: what he gave,
     # what the bot filled in for him, and what nobody knows yet.
-    _fields = draft.get("fields") or {}
+    _fields = dict(draft.get("fields") or {})
     if _fields:
+        # Re-derive the fields a button or reply can change AFTER the
+        # build, or the list goes stale ('Still missing: Address' right
+        # after ✋ Hand-carry filled it in).
+        _live = {
+            "Send method": a.delivery,
+            "Expected send by": draft.get("need_by", ""),
+            "Receiver name": draft.get("attn", ""),
+            "Contact": draft.get("contact", ""),
+            "Address": draft.get("addr", ""),
+        }
+        for _k, _v in _live.items():
+            if _k in _fields and _v and not _fields[_k]:
+                _fields[_k] = src.get(
+                    {"Receiver name": "attn", "Address": "addr",
+                     "Contact": "contact", "Expected send by": "need_by"}
+                    .get(_k, ""), "you") or "you"
+        if a.delivery and a.delivery.lower().startswith("hand"):
+            _fields.pop("Contact", None)   # no phone needed for a desk drop
         _filled = [(k, v) for k, v in _fields.items() if v and v != "you"]
         _gap = [k for k, v in _fields.items() if not v]
         if _filled:
@@ -10074,6 +10092,13 @@ def _sr_draft_kb(draft: dict):
     if not draft["bag"]:
         rows.append([("👝 NP bag", f"srb:bag:{t}:NP bag"),
                      ("👝 Empty bag", f"srb:bag:{t}:Empty bag")])
+    # Delivery is the rep's call, never assumed from history (Alex 02-Sep:
+    # the bot pasted a name from an old request when he wanted hand-carry).
+    if not draft["ask"].delivery:
+        drow = [("✋ Hand-carry to Alex's desk", f"srb:dlv:{t}:hand")]
+        if draft.get("addr"):
+            drow.append(("📦 Courier to that address", f"srb:dlv:{t}:last"))
+        rows.append(drow)
     rows.append([("✅ Raise it in MMS", f"srb:go:{t}"),
                  ("❌ Discard", f"srb:x:{t}")])
     return kb(rows)
@@ -10229,7 +10254,11 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
         return
     if parsed and parsed.get("need_by") and not draft.get("error"):
-        draft["need_by"] = str(parsed["need_by"]).upper()
+        # Only if the rep actually wrote a deadline — a phantom '11 Sep'
+        # appeared on a Yusheng draft with no date in the message at all.
+        if re.search(r"\b(need|by|deadline|expected|target|asap|urgent|"
+                     r"week)\b", text, re.I):
+            draft["need_by"] = str(parsed["need_by"]).upper()
     if update.effective_chat:
         # Scope conversational edits to this chat — see on_sr_text.
         draft["chat_id"] = update.effective_chat.id
@@ -10432,6 +10461,21 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         days = int(arg or 7)
         target = (_sgt_now() + timedelta(days=days)).strftime("%d %b %Y").upper()
         draft["need_by"] = f"BY {target}"
+        await _sr_show(update, draft, srq)
+        return
+    if verb == "dlv":
+        if arg == "hand":
+            draft["ask"].delivery = "Hand carry"
+            draft["ask"].delivery_addr = "Alex's desk, NP Foods Singapore"
+            draft["addr"] = "Alex's desk, NP Foods Singapore"
+            draft["attn"] = "Alex"
+            draft["contact"] = ""
+            draft.setdefault("src", {}).update(addr="you", attn="you")
+        elif arg == "last":
+            draft["ask"].delivery = "Courier"
+            draft.setdefault("src", {})["addr"] = "you"
+        draft["missing"] = [m for m in draft.get("missing", [])
+                            if m != "ship-to"]
         await _sr_show(update, draft, srq)
         return
     if verb == "noop":

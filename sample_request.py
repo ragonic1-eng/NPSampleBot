@@ -203,8 +203,15 @@ _BUDGET_LINE = re.compile(
     r"((?:<|under|below|max|less than|around|about)\s*(?:usd\s*)?\$?"
     r"\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*(?:usd)?)|"
     r"(cheap(?:est)?(?:\s+as\s+possible)?|no budget)", re.IGNORECASE)
+# 'Compliance: China' / 'compliance for jordan'. The old pattern
+# ('complian\w*') backtracked INSIDE the word on 'For china compliance' and
+# captured the final 'e' as the market → COMPLIANCE: E (Alex 02-Sep).
 _COMPLIANCE_LINE = re.compile(
-    r"complian\w*\s*(?:for|:)?\s*(.+)", re.IGNORECASE)
+    r"\bcomplian(?:ce|t)\b\s*(?:for|:|-)?\s*(.+)$", re.IGNORECASE)
+# market BEFORE the word: 'For china compliance', 'to jordan market compliance'
+_COMPLIANCE_PRE = re.compile(
+    r"^(?:for|to)?\s*(.+?)\s+(?:market\s+)?complian(?:ce|t)\b\.?\s*$",
+    re.IGNORECASE)
 _BAG_LINE = re.compile(r"\b(np|empty)\s*(?:sample\s*)?bags?\b", re.IGNORECASE)
 _NEEDBY_LINE = re.compile(
     r"need(?:ed)?(?:\s+it)?\s+by\s+(.+)|"
@@ -292,12 +299,18 @@ _METHOD_DEST = re.compile(
 #     punctuation straight after the digit, where a unit letter must be.
 _AMOUNT = r"\d+(?:\.\d+)?\s*(?:[A-Za-z][A-Za-z.]{0,9}(?:\s+[A-Za-z]{1,8})?)?"
 _QTY_SEP = r"(?:[-–—:]|\s+of\b)"
+# For PAIRING an amount with an item the unit is REQUIRED. A bare number
+# after a dash is far more often a product-code suffix than a quantity:
+# 'TRIO CHEESE & LIME SEASONING S-XAAG1-25' was read as 25 of the item and
+# the code lost its '-25' (Alex 02-Sep). Real quantities always carry a
+# unit word: 50g, 1 pkt, 1 small bottle.
+_AMOUNT_U = r"\d+(?:\.\d+)?\s*[A-Za-z][A-Za-z.]{0,9}(?:\s+[A-Za-z]{1,8})?"
 # '500g - texture improver 2' | '1 pkt- X' | '1 pkt of application'
 _QTY_ITEM_RE = re.compile(
-    rf"^({_AMOUNT})\s*{_QTY_SEP}\s*(.+)$", re.IGNORECASE)
+    rf"^({_AMOUNT_U})\s*{_QTY_SEP}\s*(.+)$", re.IGNORECASE)
 # 'texture improver 2 - 500g'
 _ITEM_QTY_RE = re.compile(
-    rf"^(.+?)\s*[-–—:]\s*({_AMOUNT})\s*$", re.IGNORECASE)
+    rf"^(.+?)\s*[-–—:]\s*({_AMOUNT_U})\s*$", re.IGNORECASE)
 # A bare amount on its own line ('1 small bottle', '100g sample',
 # '1pcs Noodle Cake'). Only used UNDER a quantity heading — in that
 # context the whole line is the quantity, so 'starts with a number' is
@@ -312,7 +325,23 @@ def _norm_qty(s: str) -> str:
     s = " ".join(s.split())
     return re.sub(r"^(\d+(?:\.\d+)?)\s+(kgs?|g|gm)\b", r"\1\2", s,
                   flags=re.IGNORECASE)
-_ATTN_LINE = re.compile(r"\battn\.?\s*[:\-]?\s*(.+)", re.IGNORECASE)
+_ATTN_LINE = re.compile(r"\batt(?:n|ention)?\.?\s*[:\-]?\s*(.+)", re.IGNORECASE)
+
+
+def _looks_like_address(s: str) -> bool:
+    """A person's name is not an address. 'Att Jackie' was accepted as one
+    (Alex 02-Sep). An address has a number, a street/area word, CJK text,
+    or at least four words — and never starts with Att/Attn."""
+    s = (s or "").strip()
+    if not s or re.match(r"^att(?:n|ention)?\b", s, re.I):
+        return False
+    if _CJK.search(s) or re.search(r"\d", s):
+        return True
+    if re.search(r"\b(road|rd|street|st|ave|avenue|jalan|jln|lorong|lane|"
+                 r"blk|block|building|tower|park|estate|district|province|"
+                 r"city|industrial|zone|desk|office|warehouse)\b", s, re.I):
+        return True
+    return len(s.split()) >= 4
 # (?![A-Za-z]) — without it 'tel' matched INSIDE 'Tellicherry'/'Telur' and
 # the rest of a spec line was consumed as CONTACT NO. and written into MMS.
 _CONTACT_LINE = re.compile(
@@ -635,7 +664,7 @@ def parse_ask(text: str) -> Ask:
                 consumed = True
             else:
                 a.hints.add("budget")
-        cm = _COMPLIANCE_LINE.search(line)
+        cm = _COMPLIANCE_PRE.match(line) or _COMPLIANCE_LINE.search(line)
         if cm and "compliance" not in a.overrides:
             val = _normalize_markets(cm.group(1))
             if val:
@@ -714,9 +743,28 @@ def parse_ask(text: str) -> Ask:
             if val:
                 dest = _METHOD_DEST.search(val)
                 if dest and not a.delivery_addr:
-                    a.delivery_addr = dest.group(1).strip().rstrip(".")
+                    _dst = dest.group(1).strip().rstrip(".")
+                    # 'courier to Geylang' is a place; 'courier to customer'
+                    # / 'to them' is not — a generic lowercase noun must
+                    # never become the delivery address.
+                    if (_looks_like_address(_dst)
+                            or (_dst[:1].isupper() and _dst.lower() not in
+                                ("customer", "client", "them", "office",
+                                 "you", "us", "me"))):
+                        a.delivery_addr = _dst
+                    else:
+                        dest = None
                 mw = _METHOD_WORD.search(val)
-                if mw and not dest and len(val) <= 30:
+                if mw and re.search(r"hand.?carr", val, re.I):
+                    # 'handcarry put on alex desk' — Alex 02-Sep: the
+                    # sample stays in the office; no customer address.
+                    a.delivery = "Hand carry"
+                    tail_ = re.sub(r".*?hand.?carr\w*\s*", "", val, flags=re.I)
+                    a.delivery_addr = (tail_.strip(" ,.-") or
+                                       "Alex's desk, NP Foods Singapore")
+                    if re.search(r"\b(alex|my)\b.*desk|desk", a.delivery_addr, re.I):
+                        a.delivery_addr = "Alex's desk, NP Foods Singapore"
+                elif mw and not dest and len(val) <= 30:
                     # short value = the method as written; keep 'DHL/FedEx'
                     # intact rather than collapsing it to the first word
                     a.delivery = val.rstrip(".").strip()
@@ -767,14 +815,28 @@ def parse_ask(text: str) -> Ask:
     body = [l for l in body if not _NO_PREFER_CODE.match(l.strip())]
     # bare item names: short lines that aren't sentences — the unnumbered
     # equivalent of a flavour list ('Tomato seasoning' / 'Texture improver 2')
+    # A line that became an item LEAVES the body — otherwise it prints
+    # twice in MMS: once under 'Seasoning name:' and again in the comment
+    # (Alex 02-Sep: 'Smoke cheese / SPICY TOMATO SEASONING repeated twice?').
+    # A bare product code on the line AFTER an item belongs to that item
+    # ('SPICY TOMATO SEASONING' / 'S-31P26-05-04' → one seasoning).
+    kept_body: list[str] = []
     for line in body:
         s = line.strip().rstrip(".")
+        if (a.items and _CODE_RE.fullmatch(s)
+                and not _CODE_RE.search(a.items[-1])):
+            a.items[-1] = f"{a.items[-1]} {s.upper()}"
+            continue
         if (2 <= len(s.split()) <= 6 and len(s) < 55
                 and not s.endswith((":", ","))
                 and not re.search(r"[.!?]\s", s)
-                and not re.match(r"^(comment|budget|compliance|target|note)",
+                and not re.match(r"^(comment|budget|compliance|target|note|"
+                                 r"for\b|each\b|need\b|send\b|delivery\b)",
                                  s, re.I)):
             a.items.append(s)
+            continue
+        kept_body.append(line)
+    body[:] = kept_body
 
     _extract_shipto(a, body)
     _structure_body(a, body)
@@ -959,6 +1021,15 @@ def fallback_update(draft: dict, text: str) -> dict:
     Deterministic and conservative: anything it can't clearly match is
     'unrelated' (falls through to normal routing), never a guess."""
     t = text.strip()
+    # 'hand carry' / 'put it on my desk' — no customer address at all.
+    if re.search(r"hand.?carr|put (?:it )?on (?:my|alex'?s?) desk|to my desk",
+                 t, re.I) and len(t) < 80:
+        return {"action": "modify",
+                "fields": {"delivery": "Hand carry",
+                           "delivery_addr": "Alex's desk, NP Foods Singapore",
+                           "addr": "Alex's desk, NP Foods Singapore",
+                           "attn": "Alex"},
+                "question": None}
     if _CONFIRM_RE.match(t):
         return {"action": "confirm", "fields": {}, "question": None}
     if _DISCARD_RE.match(t):
@@ -1036,6 +1107,10 @@ def apply_fields(draft: dict, fields: dict) -> None:
             d["base_code"] = str(v).upper()
         elif k == "ask":
             draft["ask"].ask_text = str(v)
+        elif k == "delivery":
+            draft["ask"].delivery = str(v)
+        elif k == "delivery_addr":
+            draft["ask"].delivery_addr = str(v)
         elif k in ("bag", "budget", "compliance", "attn", "contact",
                    "addr", "assignee", "need_by"):
             draft[k] = str(v)
@@ -1355,12 +1430,15 @@ def shipto_from_sr_page(html: str) -> dict:
     carry the block, near-identical per customer)."""
     text = BeautifulSoup(html, "html.parser").get_text("\n", strip=True)
     out = {"attn": "", "contact": "", "addr": "", "compliance": ""}
-    for m in re.finditer(r"ATTN\s*:?\s*([^\n]+)", text, re.IGNORECASE):
+    for m in re.finditer(r"\bATT(?:N|ENTION)?\.?\s*:?\s*([^\n]+)", text,
+                         re.IGNORECASE):
         out["attn"] = m.group(1).strip()
     for m in re.finditer(r"CONTACT(?:\s*NO\.?)?\s*:?\s*([^\n]+)", text, re.IGNORECASE):
         out["contact"] = m.group(1).strip()
     for m in re.finditer(r"ADDRESS\s*:?\s*([^\n]+)", text, re.IGNORECASE):
-        out["addr"] = m.group(1).strip()
+        cand = m.group(1).strip()
+        if _looks_like_address(cand):   # never a bare name
+            out["addr"] = cand
     for m in re.finditer(r"COMPLIAN\w*\s*:?\s*([^\n]+)", text, re.IGNORECASE):
         out["compliance"] = m.group(1).strip()
     return out
@@ -1965,21 +2043,37 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
     master_rec = best if not force_customer else next(
         (c for c in sheets.load_merged_customers()
          if c.get("name", "").strip().lower() == customer.strip().lower()), {})
+    # Ship-to from history ONLY when the rep signalled delivery to the
+    # customer (a method, an address, a receiver). With no such signal the
+    # sample may well be hand-carried — Alex 02-Sep: the bot pasted 'Att
+    # Jackie' from an old request when he wanted it on his own desk. Then
+    # the fields stay blank and the delivery buttons decide.
+    ship_intent = bool(ask.delivery or ask.delivery_addr
+                       or ask.overrides.get("addr") or ask.overrides.get("attn")
+                       or ask.overrides.get("contact"))
     attn = pick("attn", ask.overrides.get("attn"),
-                ("their last request", ship["attn"]),
-                ("remembered", mem_get(customer, "attn")),
-                ("customer master", (master_rec or {}).get("receiving_person", "")))
+                *([("their last request", ship["attn"]),
+                   ("remembered", mem_get(customer, "attn")),
+                   ("customer master",
+                    (master_rec or {}).get("receiving_person", ""))]
+                  if ship_intent else []))
     contact = pick("contact", ask.overrides.get("contact"),
-                   ("their last request", ship["contact"]),
-                   ("remembered", mem_get(customer, "contact")),
-                   ("customer master", (master_rec or {}).get("receiver_number", "")))
+                   *([("their last request", ship["contact"]),
+                      ("remembered", mem_get(customer, "contact")),
+                      ("customer master",
+                       (master_rec or {}).get("receiver_number", ""))]
+                     if ship_intent else []))
     # A stated delivery address IS the ship-to — explicit always wins over
     # the customer-master default (Alex 02-Sep: courier-to-Geylang must not
     # sit next to the Dhaka master address).
+    def _ok_addr(v: str) -> str:
+        return v if _looks_like_address(v) else ""
     addr = pick("addr", ask.overrides.get("addr") or ask.delivery_addr,
-                ("their last request", ship["addr"]),
-                ("remembered", mem_get(customer, "addr")),
-                ("customer master", (master_rec or {}).get("address", "")))
+                *([("their last request", _ok_addr(ship["addr"])),
+                   ("remembered", _ok_addr(mem_get(customer, "addr"))),
+                   ("customer master",
+                    _ok_addr((master_rec or {}).get("address", "")))]
+                  if ship_intent else []))
     if ask.overrides.get("qty"):
         m = _QTY_RE.search(ask.overrides["qty"] + "g")
         if m:
@@ -2128,15 +2222,22 @@ def render_reqnote(draft: dict) -> str:
             lines.append("Seasoning name:")
             lines.extend(ask.items)
             lines.append("")
+        # 'Comment:' is ALWAYS present — Alex's form has it, and he asked
+        # 'where's my comment?' when every line had been consumed as a
+        # field and the block silently vanished. His own 'Comment-' prefix
+        # is folded in rather than doubled; nothing left → 'Comment: -'.
+        body_txt = re.sub(r"^\s*comment\s*[-:]\s*", "", ask_txt or "",
+                          count=1, flags=re.I)
+        comment_lines = []
         if no_code:
-            # Inside Comment, never as a bare first line. If he wrote his
-            # own 'Comment-' line the body already carries it, so just
-            # prefix; otherwise open the Comment block ourselves.
-            if re.search(r"^\s*comment\s*[-:]", ask_txt, re.I | re.M):
-                lines.append("Comment: No prefer code.")
-            else:
-                lines.append(f"Comment: No prefer code.")
+            comment_lines.append("No prefer code.")
+        if body_txt.strip():
+            comment_lines.extend(body_txt.strip().splitlines())
+        lines.append("Comment: " + (comment_lines[0] if comment_lines else "-"))
+        lines.extend(comment_lines[1:])
+        if comment_lines:
             lines.append("")
+        ask_txt = ""  # rendered above
         if ask_txt:
             lines.append(ask_txt)
             lines.append("")

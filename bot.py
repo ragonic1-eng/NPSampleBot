@@ -10248,6 +10248,7 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         import time as _clock
         ptok = _secrets.token_hex(3)
         srq.DRAFTS[ptok] = {"pending_pick": True, "candidates": cands,
+                            "name": asked,   # for the 'new customer' button
                             "raw_text": draft.get("raw_text", build_text),
                             "user_id": update.effective_user.id,
                             "created_at": _clock.time(),
@@ -10255,11 +10256,16 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                         if update.effective_chat else None),
                             "dry": dry}
         _SR_ACTIVE[update.effective_user.id] = ptok
+        # Alex 02-Sep: when a near-match exists, never decide same-or-
+        # different for him. Show the match(es) AND a new-customer button
+        # side by side; he taps.
         rows = [[(c[:40], f"srb:pick:{ptok}:{i}")]
                 for i, c in enumerate(cands[:4])]
+        rows.append([(f"🆕 Different — new customer: {asked[:18]}",
+                      f"srb:newcust:{ptok}")])
         await send(update,
-                   f"🤔 Which customer is <b>{h(asked)}</b>? "
-                   "Tap one (or type the name):",
+                   f"🤔 Is <b>{h(asked)}</b> one of these existing customers, "
+                   "or a new one? Tap to confirm — I won't guess:",
                    kb(rows))
         return
     if dry:
@@ -10353,7 +10359,11 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await _sr_build_with_customer(update, draft, name, srq)
         return
     if verb == "newcust":
-        if not draft.get("pending_newcust"):
+        # Reached from the no-match prompt OR from the near-match picker's
+        # 'Different — new customer' button.
+        if not (draft.get("pending_newcust") or draft.get("pending_pick")):
+            return
+        if not draft.get("name"):
             return
         await _sr_create_new_customer(update, draft, token, srq)
         return
@@ -10474,6 +10484,12 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Accept a number or a fuzzy name; anything else routes normally.
         cands = draft.get("candidates") or []
         name = ""
+        # Typed equivalent of the 'Different — new customer' button.
+        if draft.get("name") and re.match(
+                r"^\s*(new(\s+customer)?|different|neither|none(\s+of\s+(these|them))?|"
+                r"not\s+(these|them|any))\b", text, re.I):
+            await _sr_create_new_customer(update, draft, token, srq)
+            raise ApplicationHandlerStop
         if text.isdigit() and 1 <= int(text) <= len(cands):
             name = cands[int(text) - 1]
         else:

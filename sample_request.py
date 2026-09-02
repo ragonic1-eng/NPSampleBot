@@ -1090,11 +1090,15 @@ def _plausible(query: str, name: str) -> bool:
     if not q_toks:
         return True  # nothing distinctive in the QUERY — don't over-filter
     if not n_toks:
-        # The rep gave a distinctive name ('SUBEIH …') but this candidate
+        # The rep gave a distinctive name ('SUBEIH …') and this candidate
         # is nothing but generic words ('Food Industries Co.'). It matched
-        # on 'food'/'industries' alone — that is not a customer match, and
-        # offering it hides the real answer: this is a NEW customer.
-        return False
+        # on 'food'/'industries' alone — almost certainly a different
+        # company. But Alex (02-Sep): never ASSUME same-or-different —
+        # keep it as a candidate so the bot shows it next to a 'new
+        # customer' button and he taps. It can never auto-resolve: a
+        # generic-only name has no exact brand match, so it always lands
+        # in the ask-the-user path.
+        return True
     for qt in q_toks:
         for nt in n_toks:
             if qt in nt or nt in qt or fuzz.ratio(qt, nt) >= 80:

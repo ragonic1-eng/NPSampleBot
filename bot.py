@@ -10360,12 +10360,27 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
     if verb == "newcust":
         # Reached from the no-match prompt OR from the near-match picker's
-        # 'Different — new customer' button.
+        # 'Different — new customer' button. Alex 02-Sep: never straight to
+        # Save — show the filled create form first, with Save / Edit.
         if not (draft.get("pending_newcust") or draft.get("pending_pick")):
             return
         if not draft.get("name"):
             return
+        await _sr_preview_new_customer(update, draft, token, srq)
+        return
+    if verb == "create":
+        if not draft.get("pending_create"):
+            return
         await _sr_create_new_customer(update, draft, token, srq)
+        return
+    if verb == "editcreate":
+        if not draft.get("pending_create"):
+            return
+        await send(update,
+                   "✏️ Tell me what to change — e.g. <i>name: SUBEIH FOOD "
+                   "INDUSTRIES LLC</i> or <i>shipping: Fedex</i> (Hand / "
+                   "Fedex / DHL / Sampai / Flying Time). I'll show the form "
+                   "again before saving.", with_footer=False)
         return
     if verb == "nb":
         days = int(arg or 7)
@@ -10383,20 +10398,74 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
 
 
+async def _sr_preview_new_customer(update, draft, token, srq) -> None:
+    """Show the create form FILLED but NOT saved — Alex's 02-Sep rule.
+    Sends a real screenshot of the form when Chromium is available, a
+    text card otherwise; either way the same Save / Edit / Cancel buttons."""
+    import secrets as _secrets
+    import time as _clock
+    name = draft["name"]
+    # shipping from whatever delivery method the rep wrote ('DHL/FedEx')
+    shipping = draft.get("shipping")
+    if not shipping:
+        try:
+            shipping = srq.SRWriter.shipping_for(
+                srq.parse_ask(draft.get("raw_text", "")).delivery)
+        except Exception:  # noqa: BLE001
+            shipping = "Hand"
+    srq.DRAFTS.pop(token, None)
+    ctok = _secrets.token_hex(3)
+    srq.DRAFTS[ctok] = {"pending_create": True, "name": name,
+                        "shipping": shipping,
+                        "raw_text": draft.get("raw_text", ""),
+                        "user_id": update.effective_user.id,
+                        "created_at": _clock.time(),
+                        "chat_id": (update.effective_chat.id
+                                    if update.effective_chat else None),
+                        "dry": draft.get("dry", False)}
+    _SR_ACTIVE[update.effective_user.id] = ctok
+    buttons = kb([[("💾 Save in MMS", f"srb:create:{ctok}"),
+                   ("✏️ Edit", f"srb:editcreate:{ctok}")],
+                  [("❌ Cancel", f"srb:x:{ctok}")]])
+    caption = (f"🆕 <b>New Sample Request — not saved yet</b>\n"
+               f"Factory: <b>S-</b> · Customer (unregistered): <b>{h(name)}</b>\n"
+               f"Pellet base: <b>Others</b> · Machine: <b>Others</b> · "
+               f"Sample type: <b>Seasoning Only</b> · Shipping: <b>{h(shipping)}</b>\n"
+               "<i>Check it, then Save — or Edit to change the name/shipping.</i>")
+    shot = None
+    try:
+        w = srq.SRWriter()
+        if w.login():
+            shot = await srq.screenshot_create_preview(
+                w.session, name, "S-", shipping)
+    except Exception:  # noqa: BLE001
+        log.exception("create preview failed (text card instead)")
+    if shot:
+        try:
+            await update.effective_message.reply_photo(
+                photo=shot, caption=caption, parse_mode=ParseMode.HTML,
+                reply_markup=buttons)
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("create preview photo send failed")
+    await send(update, caption, buttons)
+
+
 async def _sr_create_new_customer(update, draft, token, srq) -> None:
     """Mint the SR shell for a brand-new customer, then show the normal
-    request draft on it. Shared by the ✅ button and a typed 'yes'."""
+    request draft on it. Reached ONLY from the preview's 💾 Save."""
     name = draft["name"]
+    shipping = draft.get("shipping", "Hand")
     srq.DRAFTS.pop(token, None)
     _SR_ACTIVE.pop(update.effective_user.id, None)
-    await send(update, f"🛠 Creating <b>{h(name)}</b> in MMS…",
+    await send(update, f"🛠 Saving <b>{h(name)}</b> in MMS…",
                with_footer=False)
     try:
         w = srq.SRWriter()
         if not w.login():
             await send(update, "🛑 MMS login failed — stopping (no retry).")
             return
-        result = await asyncio.to_thread(w.create_sr, name, "S-")
+        result = await asyncio.to_thread(w.create_sr, name, "S-", shipping)
     except Exception as e:  # noqa: BLE001
         log.exception("sr create_sr crashed")
         await send(update, f"🛑 Create crashed: {h(str(e)[:200])} — check "
@@ -10463,13 +10532,38 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                        "need it.")
             raise ApplicationHandlerStop
         return  # anything else routes normally (search, etc.)
+    if draft.get("pending_create"):
+        # The filled create form is on screen, Save not yet pressed.
+        t = text.strip()
+        low = t.lower()
+        if srq._CONFIRM_RE.match(t) or low in ("save", "yes", "y", "ok",
+                                                "okay", "proceed", "go"):
+            await _sr_create_new_customer(update, draft, token, srq)
+            raise ApplicationHandlerStop
+        if srq._DISCARD_RE.match(t) or low in ("no", "n"):
+            srq.DRAFTS.pop(token, None)
+            _SR_ACTIVE.pop(user.id, None)
+            await send(update, "👍 Not saved. Nothing was created in MMS.")
+            raise ApplicationHandlerStop
+        m = re.match(r"^\s*(name|customer)\s*[:\-]\s*(.+)$", t, re.I)
+        if m:
+            draft["name"] = m.group(2).strip()
+            await _sr_preview_new_customer(update, draft, token, srq)
+            raise ApplicationHandlerStop
+        m = re.match(r"^\s*(shipping|delivery|ship)\s*[:\-]?\s*(.+)$", t, re.I)
+        if m or low in ("hand", "fedex", "dhl", "sampai", "flying time"):
+            draft["shipping"] = srq.SRWriter.shipping_for(m.group(2) if m else t)
+            await _sr_preview_new_customer(update, draft, token, srq)
+            raise ApplicationHandlerStop
+        return  # anything else routes normally
     if draft.get("pending_newcust"):
-        # Waiting on 'create this new customer?'. A typed yes creates it;
-        # a typed no drops it; anything else must NOT reach the LLM draft
-        # editor (this dict has no ask/derived) — route it normally.
+        # Waiting on 'is this a new customer?'. A typed yes goes to the
+        # filled-form preview (never straight to Save); a typed no drops
+        # it; anything else must NOT reach the LLM draft editor (this
+        # dict has no ask/derived) — route it normally.
         if srq._CONFIRM_RE.match(text) or text.strip().lower() in (
                 "yes", "y", "ok", "okay", "create", "create it", "go"):
-            await _sr_create_new_customer(update, draft, token, srq)
+            await _sr_preview_new_customer(update, draft, token, srq)
             raise ApplicationHandlerStop
         if srq._DISCARD_RE.match(text) or text.strip().lower() in ("no", "n"):
             srq.DRAFTS.pop(token, None)
@@ -10488,7 +10582,7 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if draft.get("name") and re.match(
                 r"^\s*(new(\s+customer)?|different|neither|none(\s+of\s+(these|them))?|"
                 r"not\s+(these|them|any))\b", text, re.I):
-            await _sr_create_new_customer(update, draft, token, srq)
+            await _sr_preview_new_customer(update, draft, token, srq)
             raise ApplicationHandlerStop
         if text.isdigit() and 1 <= int(text) <= len(cands):
             name = cands[int(text) - 1]

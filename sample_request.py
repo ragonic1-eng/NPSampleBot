@@ -1591,10 +1591,67 @@ class SRWriter:
         m = re.search(r"sampleRequestUpdate\.do\?code=([A-Za-z0-9\-]+)", r.text)
         return m.group(1) if m else ""
 
+    def find_sr_by_name(self, customer_name: str) -> str:
+        """Find an SR by the customer name AS TEXT — the only way to find an
+        SR raised for an unregistered ('temporary name') customer.
+
+        Such customers are not in the search page's picker, so
+        newest_sr_for() can't see them. The SR LIST page does print the
+        name on each row, so scan it for the row carrying this name and
+        take that row's code. Verified live on S-193S43-002 (SUBEIH).
+        This is what stops a second tap of 'new customer' from minting a
+        duplicate SR."""
+        import html as _html
+        url = f"{mms_client.BASE_URL}/master/sampleRequestSearch.do"
+        hdrs = {**mms_client.HEADERS_BASE,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": url}
+        common = {"code": "", "customer_id": "", "customer_name": customer_name}
+        self.session.post(url, data={**common, "command": "find"},
+                          headers=hdrs, timeout=60)
+        r = self.session.post(url, data={**common, "command": "list"},
+                              headers=hdrs, timeout=90)
+        r.encoding = "utf-8"
+        page = r.text
+        key = " ".join(customer_name.lower().split())
+        found: set[str] = set()
+        for tr in re.finditer(r"<tr\b.*?</tr>", page, re.S | re.I):
+            block = tr.group(0)
+            if key in " ".join(_html.unescape(block).lower().split()):
+                m = re.search(r"sampleRequestUpdate\.do\?code=([A-Za-z0-9\-]+)",
+                              block)
+                if m:
+                    found.add(m.group(1))
+        if not found:
+            return ""
+        # Several SRs can carry the same name (a duplicate shell, or a
+        # genuinely new project). Use the NEWEST — the list page is not
+        # reliably ordered, so sort by the code's own series/sequence.
+        return max(found, key=_sr_series_key)
+
     # -- new customer: mint an SR shell --------------------------------
     CREATE_URL = f"{mms_client.BASE_URL}/master/sampleRequestCreate.do"
+    # Create-form radio values, verified on the live page.
+    CREATE_SHIPPING = ("Hand", "Fedex", "Sampai", "Flying Time", "DHL")
 
-    def create_sr(self, customer_name: str, prefix: str = "S-") -> dict:
+    @staticmethod
+    def shipping_for(delivery_text: str) -> str:
+        """Map the rep's delivery method to the create form's Shipping
+        radio. 'DHL/FedEx' → DHL (Alex picked DHL for exactly that text,
+        02-Sep screenshot); anything unrecognised → Hand, the form default."""
+        t = (delivery_text or "").lower()
+        if "dhl" in t:
+            return "DHL"
+        if "fedex" in t or "fed ex" in t:
+            return "Fedex"
+        if "flying" in t:
+            return "Flying Time"
+        if "sampai" in t:
+            return "Sampai"
+        return "Hand"
+
+    def create_sr(self, customer_name: str, prefix: str = "S-",
+                  shipping: str = "Hand") -> dict:
         """Mint a brand-new SR for a customer MMS doesn't know yet.
 
         Alex's procedure (02-Sep), mapped to the live create form:
@@ -1611,6 +1668,14 @@ class SRWriter:
         {'ok', 'code', 'detail'}; the new code is verified by re-reading
         the SR page before it is handed back.
         """
+        # DUPLICATE GUARD — an SR for this exact name may already exist
+        # (a retry after a later step failed, or a second tap). Use it.
+        existing = self.find_sr_by_name(customer_name)
+        if existing:
+            return {"ok": True, "code": existing,
+                    "detail": (f"{existing} already exists for "
+                               f"{customer_name} — using it, not creating "
+                               "a second one")}
         r = self.session.get(self.CREATE_URL, headers=mms_client.HEADERS_BASE,
                              timeout=60)
         r.raise_for_status()
@@ -1627,7 +1692,7 @@ class SRWriter:
             "palletBase": "Others",
             "machine": "Others",
             "sampleType": "Seasoning Only",
-            "shipping": "Hand",
+            "shipping": shipping if shipping in self.CREATE_SHIPPING else "Hand",
         })
         # never carry the 2,333-entry customer modal radio through
         payload = [(k, v) for k, v in payload if k != "cl"]
@@ -1684,6 +1749,68 @@ class SRWriter:
         ok = (mid == before + 1) and (after == before)
         return (f"{'PASS' if ok else 'FAIL'}: sections {before} → additem "
                 f"{mid} → clear {after} on {sr_code}")
+
+
+async def screenshot_create_preview(session, customer_name: str,
+                                    prefix: str = "S-",
+                                    shipping: str = "Hand"):
+    """PNG of the CREATE form filled in exactly as it will be saved — the
+    factory dropdown, the unregistered name, Others / Others / Seasoning
+    Only and the shipping radio — with Save deliberately NOT clicked.
+
+    Alex (02-Sep): show me this before the bot saves, with a button to
+    edit or proceed. Same headless-Chromium-with-session-cookies pattern
+    as screenshot_sr; fills the page in the browser only, never submits.
+    Never raises; None means 'no picture', the flow continues with a text
+    preview instead.
+    """
+    try:
+        from playwright.async_api import async_playwright  # noqa: WPS433
+    except ImportError:
+        log.info("playwright unavailable — skipping create preview")
+        return None
+    try:
+        cookies = [{
+            "name": c.name, "value": c.value,
+            "domain": c.domain or "www.npsin.com",
+            "path": c.path or "/",
+        } for c in session.cookies]
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True,
+                                              args=["--no-sandbox"])
+            try:
+                ctx = await browser.new_context(
+                    viewport={"width": 1280, "height": 900})
+                await ctx.add_cookies(cookies)
+                page = await ctx.new_page()
+                await page.goto(SRWriter.CREATE_URL, timeout=30000,
+                                wait_until="domcontentloaded")
+                await page.select_option('select[name="countryCode"]', prefix)
+                await page.fill('input[name="customerTemporaryName"]',
+                                customer_name)
+                await page.check('input[name="palletBase"][value="Others"]')
+                await page.check('input[name="machine"][value="Others"]')
+                await page.check(
+                    'input[name="sampleType"][value="Seasoning Only"]')
+                ship = shipping if shipping in SRWriter.CREATE_SHIPPING else "Hand"
+                await page.check(f'input[name="shipping"][value="{ship}"]')
+                # clip to the form itself; the customer modal is hidden
+                form = await page.locator(
+                    'form[name="sampleRequestCreateForm"]').bounding_box(
+                        timeout=5000)
+                clip = None
+                if form:
+                    clip = {"x": 0, "y": max(0.0, form["y"] - 10),
+                            "width": 1280,
+                            "height": min(880.0, form["height"] + 20)}
+                return await page.screenshot(clip=clip,
+                                             full_page=clip is None,
+                                             timeout=15000)
+            finally:
+                await browser.close()
+    except Exception as e:  # noqa: BLE001
+        log.warning("create preview screenshot failed: %s", e)
+        return None
 
 
 async def screenshot_sr(session, sr_code: str, section: int | None = None):
@@ -1775,6 +1902,10 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
         if w.login():
             if not sr_code:
                 sr_code = w.newest_sr_for(customer)
+            if not sr_code:
+                # unregistered (temporary-name) customers aren't in the
+                # picker — find their SR by name on the list page
+                sr_code = w.find_sr_by_name(customer)
             if sr_code:
                 ship = shipto_from_sr_page(w.get_page(sr_code))
         else:

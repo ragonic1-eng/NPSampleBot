@@ -149,6 +149,9 @@ class Ask:
     # 500g - Texture improver 2' so R&D can't misread which is which.
     item_qty: list = field(default_factory=list)
     items: list = field(default_factory=list)  # bare product/item names
+    addr_block: list = field(default_factory=list)  # lines under 'Address:'
+    company_from_addr: str = ""  # first line of that block
+    head_is_field: bool = False  # message opened with the form, no customer
 
     def body_text(self) -> str:
         """ask_text PLUS the structured flavour blocks — for detection scans
@@ -233,6 +236,25 @@ _HDR_COMMENT = re.compile(r"^comments?\s*[:\-]\s*(.*)$", re.IGNORECASE)
 _RECEIVER_LINE = re.compile(
     r"^(?:receiver|recipient|attention)\s*(?:name)?\s*[:\-]?\s*(.+)$",
     re.IGNORECASE)
+# 'Delivery address:' / 'Address:' on its own line opens a block: every
+# line beneath it, up to the next field, is the address — and its FIRST
+# line is the company name (Alex's form: 'SUBEIH FOOD INDUSTRIES / AL AMAL
+# STREET / ... / JORDAN'). That first line is also our only customer
+# signal when the message opens with the form instead of 'customer — ask'.
+_HDR_ADDRESS = re.compile(
+    r"^(?:delivery\s*|shipping\s*|ship[\s\-]*to\s*)?address\s*[:\-]?\s*$",
+    re.IGNORECASE)
+# 'Seasoning name: 1. Spicy Korean Gochujang 2. Korean Cream Cheese ...'
+# — the whole list on the header line, numbered inline.
+_HDR_SEASONING_INLINE = re.compile(
+    r"^seasoning\s*names?\s*[:\-]?\s*(?=\d+[.)])(.+)$", re.IGNORECASE)
+_INLINE_NUMBERED = re.compile(r"\d+[.)]\s*")
+# Any field header the form uses — if the message STARTS with one, there is
+# no customer on the head line and we must not invent one from its words.
+_FIELD_HEAD = re.compile(
+    r"^(seasoning\s*name|comment|qty|quantity|budget|complian|target\s*base|"
+    r"send\s*method|delivery|expected|need\s*by|receiver|contact|address|"
+    r"restriction|bag)\b", re.IGNORECASE)
 # A line that is (mostly) CJK is part of a Chinese company / address block.
 _CJK = re.compile(r"[一-鿿]")
 # 'no prefer code' / 'no preferred code' / 'no code preference' — EXPLICIT only.
@@ -497,22 +519,62 @@ def parse_ask(text: str) -> Ask:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if not lines:
         return a
+    # Several fields on ONE line — 'Target base: corn puff Bag: NP BAG
+    # Budget: < 2.2 USD Compliance: Gluten free/Jordan market' (Alex,
+    # 02-Sep). Split at each inline 'Label:' so every field is its own
+    # line; otherwise the first label swallows the rest as its value.
+    _split: list[str] = []
+    for ln in lines:
+        parts = re.split(
+            r"\s+(?=(?:target\s*base|bag|budget|complian\w*|qty|quantity|"
+            r"need\s*by|delivery\s*method|delivery\s*address|send\s*method|"
+            r"attn|contact|comment|receiver\s*name)\s*[:\-])",
+            ln, flags=re.IGNORECASE)
+        _split.extend(p.strip() for p in parts if p.strip())
+    lines = _split
     # Section headers ('Seasoning name' / 'Qty of sample') own the lines
     # beneath them until the next labelled line — Alex's standard form.
     flat: list[str] = []
     section = ""
-    for ln in lines:
+    if _FIELD_HEAD.match(lines[0]):
+        # Alex's 02-Sep Jordan request opened straight with 'Seasoning
+        # name: 1. …' — the old head-split turned that into a customer
+        # called 'Seasoning name: 1.'. A form header is never a customer.
+        a.head_is_field = True
+    for idx, ln in enumerate(lines):
+        im = _HDR_SEASONING_INLINE.match(ln)
+        if im:
+            for part in _INLINE_NUMBERED.split(im.group(1)):
+                part = part.strip(" .,;")
+                if part:
+                    a.items.append(part)
+            section = "seasoning"   # any further lines beneath still count
+            continue
         if _HDR_SEASONING.match(ln):
             section = "seasoning"
             continue
         if _HDR_QTY.match(ln):
             section = "qty"
             continue
+        if _HDR_ADDRESS.match(ln):
+            section = "address"
+            continue
         if section and re.match(
                 r"^(comment|budget|complian|target\s*base|send\s*method|"
-                r"delivery|expected|need|receiver|contact|address|restriction)",
+                r"delivery|expected|need|receiver|contact|address|restriction|"
+                r"attn|bag|tel\b|phone)",
                 ln, re.I):
             section = ""
+        if section == "address":
+            # TEL/phone lines are the contact, not part of the address —
+            # let the main loop capture them as such.
+            if re.match(r"^(tel|phone|contact)\b", ln, re.I):
+                section = ""
+            else:
+                a.addr_block.append(ln)
+                if not a.company_from_addr:
+                    a.company_from_addr = ln.strip(" .,")
+                continue
         if section == "seasoning":
             # A quantity line inside the seasoning list is still a
             # quantity ('1 pkt- Texture 2 wheat flour pellets'), not the
@@ -544,17 +606,26 @@ def parse_ask(text: str) -> Ask:
             section = ""
         flat.append(ln)
     lines = flat or lines
-    head = lines[0]
-    # customer — ask split: em/en dash, ' - ', 'Ltd- X', or first comma
-    m = re.split(r"\s*[–—]\s*|\s+-\s*|-\s+|,", head, 1)
-    if len(m) == 2:
-        a.customer_text, first_ask = m[0].strip(), m[1].strip()
+    if a.head_is_field:
+        # No 'customer — ask' head. The customer is the company line of the
+        # address block (or nothing — the bot will then ask). Every line is
+        # body; nothing is split off as a customer.
+        a.customer_text = a.company_from_addr
+        first_ask = ""
+        rest = lines
     else:
-        words = head.split()
-        a.customer_text, first_ask = " ".join(words[:3]), " ".join(words[3:])
+        head = lines[0]
+        # customer — ask split: em/en dash, ' - ', 'Ltd- X', or first comma
+        m = re.split(r"\s*[–—]\s*|\s+-\s*|-\s+|,", head, 1)
+        if len(m) == 2:
+            a.customer_text, first_ask = m[0].strip(), m[1].strip()
+        else:
+            words = head.split()
+            a.customer_text, first_ask = " ".join(words[:3]), " ".join(words[3:])
+        rest = lines[1:]
 
     body: list[str] = [first_ask] if first_ask else []
-    for line in lines[1:]:
+    for line in rest:
         consumed = False
         bm = _BUDGET_LINE.search(line)
         if bm and "budget" not in a.overrides:
@@ -645,7 +716,11 @@ def parse_ask(text: str) -> Ask:
                 if dest and not a.delivery_addr:
                     a.delivery_addr = dest.group(1).strip().rstrip(".")
                 mw = _METHOD_WORD.search(val)
-                if mw:
+                if mw and not dest and len(val) <= 30:
+                    # short value = the method as written; keep 'DHL/FedEx'
+                    # intact rather than collapsing it to the first word
+                    a.delivery = val.rstrip(".").strip()
+                elif mw:
                     meth = mw.group(1).strip().rstrip(".")
                     a.delivery = (meth[:1].upper() + meth[1:]) or a.delivery
                 elif not dest:
@@ -663,6 +738,9 @@ def parse_ask(text: str) -> Ask:
                 continue
         kept.append(line)
     body = kept
+    # An explicit 'Delivery address:' block wins outright.
+    if "addr" not in a.overrides and a.addr_block:
+        a.overrides["addr"] = "\n".join(a.addr_block)
     # Trailing unlabelled block after the contact line is the ship-to
     # address (Alex's form ends with the company name + street address,
     # often in Chinese). Only claimed when we have a contact/receiver and
@@ -1009,8 +1087,14 @@ def _plausible(query: str, name: str) -> bool:
               if t not in _GENERIC_TOKENS and len(t) >= 3]
     n_toks = [t for t in re.findall(r"[a-z0-9]+", name.lower())
               if t not in _GENERIC_TOKENS and len(t) >= 3]
-    if not q_toks or not n_toks:
-        return True  # nothing distinctive to judge by — don't over-filter
+    if not q_toks:
+        return True  # nothing distinctive in the QUERY — don't over-filter
+    if not n_toks:
+        # The rep gave a distinctive name ('SUBEIH …') but this candidate
+        # is nothing but generic words ('Food Industries Co.'). It matched
+        # on 'food'/'industries' alone — that is not a customer match, and
+        # offering it hides the real answer: this is a NEW customer.
+        return False
     for qt in q_toks:
         for nt in n_toks:
             if qt in nt or nt in qt or fuzz.ratio(qt, nt) >= 80:
@@ -1494,6 +1578,83 @@ class SRWriter:
         m = re.search(r"sampleRequestUpdate\.do\?code=([A-Za-z0-9\-]+)", r.text)
         return m.group(1) if m else ""
 
+    # -- new customer: mint an SR shell --------------------------------
+    CREATE_URL = f"{mms_client.BASE_URL}/master/sampleRequestCreate.do"
+
+    def create_sr(self, customer_name: str, prefix: str = "S-") -> dict:
+        """Mint a brand-new SR for a customer MMS doesn't know yet.
+
+        Alex's procedure (02-Sep), mapped to the live create form:
+          countryCode = 'S-'          (the factory dropdown)
+          customer_code / customer_name left EMPTY (no registered ID)
+          customerTemporaryName = the customer as the rep typed it
+            ('In case the ID is not yet registered, enter the name')
+          palletBase = 'Others' · machine = 'Others'
+          sampleType = 'Seasoning Only' · shipping = 'Hand' (form default)
+          command = 'save'  → MMS assigns the code ('New (auto assign)')
+
+        This is NOT reversible the way additem→clear is, so the bot only
+        calls it after an explicit 'yes, new customer' tap. Returns
+        {'ok', 'code', 'detail'}; the new code is verified by re-reading
+        the SR page before it is handed back.
+        """
+        r = self.session.get(self.CREATE_URL, headers=mms_client.HEADERS_BASE,
+                             timeout=60)
+        r.raise_for_status()
+        r.encoding = "utf-8"
+        form = BeautifulSoup(r.text, "html.parser").find("form")
+        if form is None:
+            return {"ok": False, "code": "", "detail": "create page has no form"}
+        payload = _override(_form_payload(form), {
+            "command": "save",
+            "countryCode": prefix,
+            "customer_code": "",
+            "customer_name": "",
+            "customerTemporaryName": customer_name,
+            "palletBase": "Others",
+            "machine": "Others",
+            "sampleType": "Seasoning Only",
+            "shipping": "Hand",
+        })
+        # never carry the 2,333-entry customer modal radio through
+        payload = [(k, v) for k, v in payload if k != "cl"]
+        resp = self.session.post(
+            self.CREATE_URL, data=payload,
+            headers={**mms_client.HEADERS_BASE,
+                     "Content-Type": "application/x-www-form-urlencoded",
+                     "Referer": self.CREATE_URL},
+            timeout=90, allow_redirects=True,
+        )
+        resp.raise_for_status()
+        resp.encoding = "utf-8"
+        # Where did the new code land? Try the redirect chain, the page's
+        # own hidden code field, then MMS's list for this customer name.
+        code = ""
+        for h_ in list(resp.history) + [resp]:
+            m = re.search(r"sampleRequestUpdate\.do\?code=([A-Za-z0-9\-]+)",
+                          h_.headers.get("Location", "") + " " + h_.url)
+            if m:
+                code = m.group(1)
+        if not code:
+            m = re.search(r'name="code"\s+value="([A-Za-z0-9\-]+)"', resp.text)
+            if m:
+                code = m.group(1)
+        if not code:
+            SRWriter._cl_map = None  # the modal may now list the new name
+            code = self.newest_sr_for(customer_name)
+        if not code:
+            return {"ok": False, "code": "",
+                    "detail": "saved, but no new SR code came back — check "
+                              "MMS before retrying (a duplicate would be worse)"}
+        # verify it really exists and carries the name
+        page = self.get_page(code)
+        if customer_name.lower() not in page.lower():
+            return {"ok": False, "code": code,
+                    "detail": f"{code} exists but doesn't show "
+                              f"'{customer_name}' — check MMS"}
+        return {"ok": True, "code": code,
+                "detail": f"created {code} for {customer_name}"}
+
     def test_cycle(self, sr_code: str) -> str:
         """Reversible write test: additem → verify → clear → verify.
         Leaves the SR byte-identical (clear removes only empty items)."""
@@ -1574,7 +1735,8 @@ async def screenshot_sr(session, sr_code: str, section: int | None = None):
 
 # ------------------------------------------------------------ draft object
 
-def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
+def build_draft(user_id: int, text: str, force_customer: str = "",
+                force_sr_code: str = "") -> dict:
     """Everything needed to render + submit. Fetches the SR page once for
     ship-to/compliance provenance and section count. `force_customer`
     skips name resolution (the 'which one did you mean' button flow)."""
@@ -1594,11 +1756,12 @@ def build_draft(user_id: int, text: str, force_customer: str = "") -> dict:
     # ordering), Submissions-tab series heuristic as offline fallback.
     ship = {"attn": "", "contact": "", "addr": "", "compliance": ""}
     page_err = ""
-    sr_code = ""
+    sr_code = force_sr_code or ""
     try:
         w = SRWriter()
         if w.login():
-            sr_code = w.newest_sr_for(customer)
+            if not sr_code:
+                sr_code = w.newest_sr_for(customer)
             if sr_code:
                 ship = shipto_from_sr_page(w.get_page(sr_code))
         else:

@@ -10208,10 +10208,42 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cands = [c.get("name", "") for c in draft["candidates"] if c.get("name")]
         asked = draft.get("customer_text") or "that customer"
         if not cands:
+            # Nothing in the master list OR the sample history: a genuinely
+            # new customer. Alex 02-Sep: tell him, then offer to mint the SR
+            # in MMS (Create Sample Request → S- → name as typed → Others /
+            # Others / Seasoning Only / Hand). Never done silently — it is
+            # not reversible the way an added item is.
+            if not asked or asked == "that customer":
+                await send(update,
+                           "😕 I couldn't tell which customer this is for — "
+                           "I look at the first line, or the company line of "
+                           "the delivery address. Tell me the name and I'll "
+                           "carry on.")
+                return
+            import time as _clock
+            ntok = _secrets.token_hex(3)
+            srq.DRAFTS[ntok] = {"pending_newcust": True, "name": asked,
+                                "raw_text": draft.get("raw_text", build_text),
+                                "user_id": update.effective_user.id,
+                                "created_at": _clock.time(),
+                                "chat_id": (update.effective_chat.id
+                                            if update.effective_chat else None),
+                                "dry": dry}
+            _SR_ACTIVE[update.effective_user.id] = ntok
             await send(update,
-                       f"😕 I couldn't find a customer matching "
-                       f"<b>{h(asked)}</b> in the master list or sample "
-                       "history — check the spelling and resend the /sr line.")
+                       f"🆕 <b>{h(asked)}</b> isn't in the customer list or "
+                       "any sample history — this looks like a <b>new "
+                       "customer</b>.\n\n"
+                       "I can set them up in MMS the way you do it: Create "
+                       "Sample Request → <b>S-</b> → name entered as "
+                       "unregistered → pellet base <b>Others</b> · machine "
+                       "<b>Others</b> · <b>Seasoning Only</b> · delivery "
+                       "<b>Hand</b> → Save. That mints a new SR code, then "
+                       "I'll show you the request draft on it as usual.\n\n"
+                       "<i>This creates a record in MMS. Only tap yes if the "
+                       "name is right.</i>",
+                       kb([[("✅ Yes, create " + asked[:24], f"srb:newcust:{ntok}"),
+                            ("❌ No", f"srb:x:{ntok}")]]))
             return
         import time as _clock
         ptok = _secrets.token_hex(3)
@@ -10320,6 +10352,11 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         _SR_ACTIVE.pop(update.effective_user.id, None)
         await _sr_build_with_customer(update, draft, name, srq)
         return
+    if verb == "newcust":
+        if not draft.get("pending_newcust"):
+            return
+        await _sr_create_new_customer(update, draft, token, srq)
+        return
     if verb == "nb":
         days = int(arg or 7)
         target = (_sgt_now() + timedelta(days=days)).strftime("%d %b %Y").upper()
@@ -10334,6 +10371,46 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     if verb == "go":
         await _sr_do_submit(update, draft, token, srq)
         return
+
+
+async def _sr_create_new_customer(update, draft, token, srq) -> None:
+    """Mint the SR shell for a brand-new customer, then show the normal
+    request draft on it. Shared by the ✅ button and a typed 'yes'."""
+    name = draft["name"]
+    srq.DRAFTS.pop(token, None)
+    _SR_ACTIVE.pop(update.effective_user.id, None)
+    await send(update, f"🛠 Creating <b>{h(name)}</b> in MMS…",
+               with_footer=False)
+    try:
+        w = srq.SRWriter()
+        if not w.login():
+            await send(update, "🛑 MMS login failed — stopping (no retry).")
+            return
+        result = await asyncio.to_thread(w.create_sr, name, "S-")
+    except Exception as e:  # noqa: BLE001
+        log.exception("sr create_sr crashed")
+        await send(update, f"🛑 Create crashed: {h(str(e)[:200])} — check "
+                           "MMS before retrying, a duplicate would be worse.")
+        return
+    if not result.get("ok"):
+        await send(update, f"🛑 <b>Not created:</b> {h(result['detail'])}")
+        return
+    await send(update, f"✅ {h(result['detail'])} — now the request draft…",
+               with_footer=False)
+    try:
+        new = await asyncio.to_thread(
+            srq.build_draft, update.effective_user.id,
+            draft["raw_text"], name, result["code"])
+    except Exception as e:  # noqa: BLE001
+        await send(update, f"😕 SR <code>{h(result['code'])}</code> exists "
+                           f"but I couldn't build the draft: {h(str(e)[:160])}")
+        return
+    if new.get("error"):
+        await send(update, f"😕 SR <code>{h(result['code'])}</code> exists "
+                           "but the draft failed — resend the /sr line "
+                           "and it will pick the new SR up.")
+        return
+    await _sr_show(update, new, srq)
 
 
 async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -10376,6 +10453,21 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                        "need it.")
             raise ApplicationHandlerStop
         return  # anything else routes normally (search, etc.)
+    if draft.get("pending_newcust"):
+        # Waiting on 'create this new customer?'. A typed yes creates it;
+        # a typed no drops it; anything else must NOT reach the LLM draft
+        # editor (this dict has no ask/derived) — route it normally.
+        if srq._CONFIRM_RE.match(text) or text.strip().lower() in (
+                "yes", "y", "ok", "okay", "create", "create it", "go"):
+            await _sr_create_new_customer(update, draft, token, srq)
+            raise ApplicationHandlerStop
+        if srq._DISCARD_RE.match(text) or text.strip().lower() in ("no", "n"):
+            srq.DRAFTS.pop(token, None)
+            _SR_ACTIVE.pop(user.id, None)
+            await send(update, "👍 Not created. Resend the /sr line with the "
+                               "right name whenever you're ready.")
+            raise ApplicationHandlerStop
+        return
     if draft.get("pending_pick"):
         # A typed answer to 'which customer did you mean?' used to fall
         # through to product search (a confusing seasoning list mid-flow).

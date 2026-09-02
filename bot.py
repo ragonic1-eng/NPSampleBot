@@ -9939,56 +9939,68 @@ def _sr_draft_text(draft: dict) -> str:
                     "please tell me</b>")
         return f"<b>{h(v)}</b>" if v else "<b>—</b>"
 
-    lines = [
-        f"📋 <b>Draft sample request — {h(draft['customer'])}</b>",
-        f"SR: <code>{h(draft['sr_code'] or '— none found —')}</code> · "
-        f"{h(draft['territory'])}",
-        "",
-        f"Type: <b>{d['rtype_label']}</b>"
-        + (f" — base <code>{h(d['base_code'])}</code>" if d["base_code"] else "")
-        + " <i>(inferred from your ask)</i>",
-        ("Qty: <b>"
-         + ", ".join(f"{q} - {n}" for q, n in draft["ask"].item_qty)
-         + "</b> <i>(you said)</i>"
-         if draft["ask"].item_qty else
-         f"Qty: <b>{d['qty']} g × {d['sets']} set{'s' if d['sets'] != 1 else ''}"
-         + (f" per flavour — {len(draft['ask'].flavours)} flavours"
-            if draft["ask"].structured and len(draft["ask"].flavours) > 1
-            else (" each" if draft["ask"].qty_each else ""))
-         + f"</b> <i>({h(d['qty_src'])})</i>"),
-        f"Bag: " + (val("bag") if draft["bag"] or src.get("bag") == "confirm"
-                    else "<b>❓ not known yet — just tell me: NP or empty "
-                         "bags?</b>") + prov("bag"),
-        f"Budget: {val('budget')}{prov('budget')}",
-        f"Compliance: {val('compliance')}{prov('compliance')}",
-    ]
-    ship_bits = " · ".join(x for x in (draft["attn"], draft["contact"]) if x)
-    if ship_bits or draft["addr"]:
-        lines.append(f"Ship to: <b>{h(ship_bits) if ship_bits else ''}</b>"
-                     + prov("addr" if draft["addr"] else "attn")
-                     + " — <i>does this look right?</i>")
-        if draft["addr"]:
-            lines.append(f"           {h(draft['addr'][:90])}")
+    # Alex 02-Sep: the old card repeated the address three times and
+    # tagged every line '(you said)'. Now: one aligned key/value block,
+    # provenance only where the BOT supplied a value (that's the signal
+    # worth reading), and the delivery block printed exactly once.
+    a = draft["ask"]
+
+    def tail(key):
+        s = src.get(key, "")
+        return f"  ← {s}" if s and s not in ("you", "confirm") else ""
+
+    def val_or(key, missing):
+        if src.get(key) == "confirm":
+            return "❓ couldn't read it — tell me"
+        return draft.get(key) or missing
+
+    if a.item_qty:
+        qty = "; ".join(f"{q} {n}".strip() for q, n in a.item_qty)
+        qty_tail = ""
     else:
-        lines.append("Ship to: <b>❓ I couldn't find an address anywhere — "
-                     "what's the contact and address?</b>")
-    if draft["ask"].delivery:
-        lines.append(f"Delivery: <b>{h(draft['ask'].delivery)}</b> → "
-                     f"<b>{h(draft['addr'] or draft['ask'].delivery_addr)}</b>"
-                     " <i>(you said)</i>")
-    lines.append(f"R&amp;D: <b>{h(draft['assignee'])}</b> "
-                 f"<i>({h(draft['territory'])} — reply to change)</i>")
-    # No default (Alex, 01 Sep): the rep keys in when the customer expects
-    # the seasoning; the bot then writes it and sets the until dropdown.
+        qty = (f"{d['qty']} g × {d['sets']} set{'s' if d['sets'] != 1 else ''}"
+               + (f" per flavour ({len(a.flavours)} flavours)"
+                  if a.structured and len(a.flavours) > 1
+                  else (" each" if a.qty_each else "")))
+        qs = d.get("qty_src", "")
+        qty_tail = f"  ← {qs}" if qs and not qs.startswith("you") else ""
     if draft["need_by"]:
         _prep = srq.need_by_prepdate(draft["need_by"], _sgt_now().date())
-        lines.append(f"Need by: <b>{h(draft['need_by'])}</b>" + prov("need_by")
-                     + (f" · until box: <b>{h(_prep)}</b>" if _prep else
-                        " <i>(no date read — the MMS until box stays "
-                        "empty)</i>"))
+        need = (f"{_prep.replace('/', ' ')}" if _prep
+                else f"{draft['need_by']}  (no date read — until box empty)")
     else:
-        lines.append("Need by: <b>❓ when should this ship? Tap a 📅 button "
-                     "or reply (e.g. “need by 13 Sep”)</b>")
+        need = "❓ tap 📅 to pick a date"
+    rows = [
+        ("Type", d["rtype_label"]
+         + (f" — base {d['base_code']}" if d["base_code"] else "")),
+        ("Qty", qty + qty_tail),
+        ("Bag", val_or("bag", "❓ NP or empty?") + tail("bag")),
+        ("Budget", val_or("budget", "—") + tail("budget")),
+        ("Compliance", val_or("compliance", "—") + tail("compliance")),
+        ("Need by", need),
+        ("R&D", f"{draft['assignee']}  ({draft['territory']})"),
+    ]
+    block = "\n".join(f"{k:<11}{v}" for k, v in rows)
+    lines = [
+        "📋 <b>Draft sample request</b>",
+        f"<b>{h(draft['customer'])}</b> · "
+        f"<code>{h(draft['sr_code'] or 'no SR yet')}</code>",
+        f"<pre>{h(block)}</pre>",
+    ]
+    # Delivery — once. Contact line, then the address lines as written.
+    ship_bits = " · ".join(x for x in (draft["attn"], draft["contact"]) if x)
+    addr = draft["addr"] or a.delivery_addr
+    head = (f"📦 <b>Delivery — {h(a.delivery)}</b>" if a.delivery
+            else "📦 <b>Ship to</b>")
+    lines.append(head + (f" <i>{h(tail('addr').strip(' ←'))}</i>"
+                         if tail("addr") else ""))
+    if ship_bits:
+        lines.append(h(ship_bits))
+    if addr:
+        lines.extend(h(l) for l in addr.splitlines() if l.strip())
+    if not (ship_bits or addr):
+        lines.append("❓ <i>no address found anywhere — tell me the contact "
+                     "and address</i>")
     # Smart-fill scoreboard for the standard request form: what he gave,
     # what the bot filled in for him, and what nobody knows yet.
     _fields = draft.get("fields") or {}
@@ -10011,20 +10023,54 @@ def _sr_draft_text(draft: dict) -> str:
               "seasoning, 500g texture improver 2”) so R&amp;D isn't guessing.")
     if draft.get("page_err"):
         lines.append(f"\n⚠️ <i>{h(draft['page_err'])}</i>")
-    lines.append("\n<b>Will write into MMS:</b>")
+    lines.append("\n📝 <b>Will write into MMS</b>")
     lines.append(f"<pre>{h(srq.render_reqnote(draft))}</pre>")
-    lines.append("<i>Reply to change anything — nothing is submitted until "
-                 "you say so or tap ✅.</i>")
+    lines.append("<i>Reply to change anything. Nothing is submitted until "
+                 "you tap ✅.</i>")
     return "\n".join(lines)
+
+
+def _sr_calendar_kb(tok: str, y: int, m: int):
+    """Inline month calendar for 'Need by' (Alex 02-Sep: a real date
+    picker, not three week buttons). Past days are dead; ◀ ▶ move a
+    month, capped to today … +3 months. Tap a day → srb:nbd."""
+    import calendar as _cal
+    from datetime import date as _date
+    today = _sgt_now().date()
+    noop = f"srb:noop:{tok}"
+    first_m = (today.year, today.month)
+    lim = today.month + 3
+    last_m = (today.year + (lim - 1) // 12, (lim - 1) % 12 + 1)
+    py, pm = (y, m - 1) if m > 1 else (y - 1, 12)
+    ny, nm = (y, m + 1) if m < 12 else (y + 1, 1)
+    rows = [[
+        ("◀" if (y, m) > first_m else " ",
+         f"srb:cal:{tok}:{py}-{pm:02d}" if (y, m) > first_m else noop),
+        (f"{_cal.month_name[m]} {y}", noop),
+        ("▶" if (y, m) < last_m else " ",
+         f"srb:cal:{tok}:{ny}-{nm:02d}" if (y, m) < last_m else noop),
+    ]]
+    rows.append([(w, noop) for w in ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")])
+    for week in _cal.monthcalendar(y, m):
+        row = []
+        for day in week:
+            if day == 0:
+                row.append((" ", noop))
+            elif _date(y, m, day) < today:
+                row.append(("·", noop))
+            else:
+                row.append((str(day), f"srb:nbd:{tok}:{y}-{m:02d}-{day:02d}"))
+        rows.append(row)
+    rows.append([("↩ Back to the draft", f"srb:back:{tok}")])
+    return kb(rows)
 
 
 def _sr_draft_kb(draft: dict):
     t = draft["token"]
-    rows = [[
-        ("📅 This week", f"srb:nb:{t}:5"),
-        ("📅 Next week", f"srb:nb:{t}:12"),
-        ("📅 2 weeks+", f"srb:nb:{t}:21"),
-    ]]
+    today = _sgt_now().date()
+    rows = [[(("📅 Change need-by date" if draft.get("need_by")
+               else "📅 Pick need-by date"),
+              f"srb:cal:{t}:{today.year}-{today.month:02d}")]]
     if not draft["bag"]:
         rows.append([("👝 NP bag", f"srb:bag:{t}:NP bag"),
                      ("👝 Empty bag", f"srb:bag:{t}:Empty bag")])
@@ -10386,6 +10432,30 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         days = int(arg or 7)
         target = (_sgt_now() + timedelta(days=days)).strftime("%d %b %Y").upper()
         draft["need_by"] = f"BY {target}"
+        await _sr_show(update, draft, srq)
+        return
+    if verb == "noop":
+        return  # calendar padding / label cells
+    if verb == "cal":
+        try:
+            y, m = (int(x) for x in arg.split("-"))
+        except ValueError:
+            today = _sgt_now().date()
+            y, m = today.year, today.month
+        await send(update, "📅 <b>Need by</b> — when does the customer need "
+                           "the samples? Tap a date:",
+                   _sr_calendar_kb(token, y, m), with_footer=False)
+        return
+    if verb == "nbd":
+        try:
+            picked = datetime.strptime(arg, "%Y-%m-%d").date()
+        except ValueError:
+            return
+        draft["need_by"] = f"BY {picked.strftime('%d %b %Y').upper()}"
+        draft.setdefault("src", {})["need_by"] = "you"
+        await _sr_show(update, draft, srq)
+        return
+    if verb == "back":
         await _sr_show(update, draft, srq)
         return
     if verb == "bag":

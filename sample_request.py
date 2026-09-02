@@ -1436,11 +1436,11 @@ class SRWriter:
         reqnote = reqnote.replace("\r\n", "\n").replace("\n", "\r\n")
         html = self.get_page(sr_code)
         before = self._sections(html)
-        aid = self._assignee_id(html, assignee)
-        if not aid:
-            return {"ok": False,
-                    "detail": f"assignee '{assignee}' not in the page's dropdown"}
-
+        # NOTE: the 'Next action by' dropdown only exists INSIDE a saved
+        # section. A brand-new SR (Alex's SUBEIH, 02-Sep) has no sections,
+        # so resolving the assignee from THIS page failed before anything
+        # was written. It is resolved below from the page returned after
+        # request{n}, which carries the new section and its dropdown.
         form = BeautifulSoup(html, "html.parser").find("form")
         if form is None:
             return {"ok": False, "detail": "no form on SR page"}
@@ -1475,6 +1475,15 @@ class SRWriter:
             if probe and probe not in _html.unescape(html3):
                 return self._bail(sr_code,
                                   f"request{n}: submitted text not found on page")
+            # Resolve the assignee's user-id from THIS page: the new section
+            # now exists and carries the 'Next action by' dropdown. A brand
+            # new SR has no dropdown at all before this point (SUBEIH).
+            aid = self._assignee_id(html3, assignee)
+            if not aid:
+                return {"ok": False, "section": n + 1,
+                        "detail": (f"item ({n + 1}) is saved, but '{assignee}' "
+                                   "isn't in the Next-action-by dropdown — "
+                                   "set it by hand in MMS")}
             # assign + save (+ the 'until' target-date dropdown)
             form3 = BeautifulSoup(html3, "html.parser").find("form")
             fill3 = {f"sreq1[{n}].nextActUserId": aid, "command": "save"}

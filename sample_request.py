@@ -2510,7 +2510,11 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
         "fields": {
             "Seasoning name": ("you" if (ask.items or ask.flavours
                                          or ask.ask_text) else ""),
-            "Comment": "you" if ask.ask_text else "",
+            # In the multi-item form the comments live INSIDE each block,
+            # not in ask_text - the card said 'Still missing: Comment' to
+            # Alex right after he gave eight of them (03-Sep).
+            "Comment": ("you" if (ask.ask_text or any(
+                (f.get("spec") or []) for f in ask.flavours)) else ""),
             "Qty of sample": ("you" if (ask.item_qty or ask.qty_g)
                               else (d.get("qty_src") or "")),
             "Budget": src.get("budget", ""),

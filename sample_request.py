@@ -214,7 +214,10 @@ _COMPLIANCE_PRE = re.compile(
     re.IGNORECASE)
 _BAG_LINE = re.compile(r"\b(np|empty)\s*(?:sample\s*)?bags?\b", re.IGNORECASE)
 _NEEDBY_LINE = re.compile(
-    r"need(?:ed)?(?:\s+it)?\s+by\s+(.+)|"
+    # optional ':' so the bot's own 'NEED BY: BY 11 SEP 2026' round-trips
+    # when a note is pasted back in - it used to leak into the comment
+    # while the LLM filled the footer, printing twice (Alex 03-Sep).
+    r"need(?:ed)?(?:\s+it)?\s+by\s*[:\-]?\s*(.+)|"
     # 'Expected to be send by 9sept', 'target to send by 19 aug'
     r"(?:expect(?:ed)?|target)\s+to\s+(?:be\s+)?(?:send|sent|ship)\s*"
     r"(?:by|on)?\s+(.+)|"
@@ -234,7 +237,9 @@ _NUM_ITEM = re.compile(r"^(\d+)[.)]\s*(.+)$")
 # or it lands inside every captured value ('* For China').
 _STAR = re.compile(r"(?<=[A-Za-z一-鿿)])\*+")
 # Section headers whose CONTENT is the lines beneath them.
-_HDR_SEASONING = re.compile(r"^seasoning\s*names?\s*[:\-]?\s*$", re.IGNORECASE)
+# A bare 'Seasoning:' (no 'name') is the same header - a pasted note carried
+# one and it printed as 'Comment: Seasoning:' (Alex 03-Sep).
+_HDR_SEASONING = re.compile(r"^seasoning(?:\s*names?)?\s*[:\-]?\s*$", re.IGNORECASE)
 _HDR_QTY = re.compile(
     r"^(?:qty|quantity)\s*(?:of\s*samples?)?\s*[:\-]?\s*$|"
     # Alex's own wording on his existing SRs
@@ -259,15 +264,67 @@ _INLINE_NUMBERED = re.compile(r"\d+[.)]\s*")
 # Any field header the form uses — if the message STARTS with one, there is
 # no customer on the head line and we must not invent one from its words.
 _FIELD_HEAD = re.compile(
-    r"^(seasoning\s*name|comment|qty|quantity|budget|complian|target\s*base|"
+    r"^(?:(?:company|customer(?:\s*name)?)\s*[:\-]|"
+    r"(seasoning\s*name|comment|qty|quantity|budget|complian|target\s*base|"
     r"send\s*method|delivery|expected|need\s*by|receiver|contact|address|"
-    r"restriction|bag)\b", re.IGNORECASE)
+    r"restriction|bag|mobile|phone|tel|whatsapp)\b)", re.IGNORECASE)
 # A line that is (mostly) CJK is part of a Chinese company / address block.
 _CJK = re.compile(r"[一-鿿]")
 # 'no prefer code' / 'no preferred code' / 'no code preference' — EXPLICIT only.
+# 'specific' / 'particular' are Alex's own variants (03-Sep) of the same note.
+_CODE_NOTE = r"no\s+(?:prefer(?:red|ence)?|preference|specific|particular)\s+code"
 _NO_PREFER_CODE = re.compile(
-    r"\bno\s+(?:prefer(?:red|ence)?|preference)\s+code\b|"
-    r"\bno\s+code\s+preference\b", re.IGNORECASE)
+    rf"\b{_CODE_NOTE}\b|\bno\s+code\s+preference\b", re.IGNORECASE)
+# 'Lemon seasoning- no specific code' is the item PLUS his code note, not a
+# second item (03-Sep: it printed under 'Seasoning name:' twice).
+_ITEM_CODE_NOTE = re.compile(
+    rf"^(.*?)\s*[-–—:]\s*{_CODE_NOTE}\b.*$", re.IGNORECASE)
+_GENERIC_ITEM_WORDS = re.compile(
+    r"\b(seasonings?|flavou?rs?|powders?|premix(?:es)?)\b", re.IGNORECASE)
+# 'Company: X' / 'Customer: X' names the customer in a pasted form or note.
+_COMPANY_LINE = re.compile(
+    r"^\s*(?:company|customer)(?:\s*name)?\s*[:\-]\s*(.+)$", re.IGNORECASE)
+# A carrier name alone on a line is the delivery method. Only the names
+# _DELIVERY_LINE doesn't already catch - courier / hand-carry / self-collect
+# keep their existing, richer handling (desk address etc.).
+_BARE_METHOD_LINE = re.compile(
+    r"^\s*(fedex|fed\s*ex|dhl|ups)\s*\.?\s*$", re.IGNORECASE)
+_METHOD_NAMES = {"fedex": "FedEx", "dhl": "DHL", "ups": "UPS"}
+
+
+def _strip_code_note(s: str) -> tuple[str, bool]:
+    """'Lemon seasoning- no specific code' -> ('Lemon seasoning', True)."""
+    m = _ITEM_CODE_NOTE.match(s.strip())
+    if m:
+        return m.group(1).strip(" .,-"), True
+    return s.strip(), False
+
+
+def _is_dup_item(name: str, items: list) -> bool:
+    """'Lemon seasoning' after 'Lemon flavor' is the same item - the generic
+    word differs, the product doesn't. token_sort (NOT token_set) so an
+    existing 'Chilli' never swallows a later 'Chilli lime'."""
+    if not name or not items:
+        return False
+    from rapidfuzz import fuzz
+    key = " ".join(_GENERIC_ITEM_WORDS.sub(" ", name).lower().split())
+    if not key:
+        return False
+    for it in items:
+        other = " ".join(_GENERIC_ITEM_WORDS.sub(" ", it).lower().split())
+        if other and fuzz.token_sort_ratio(key, other) >= 85:
+            return True
+    return False
+
+
+def _add_item(a, raw: str) -> None:
+    """Append a seasoning name ONCE: strip a trailing code note (setting the
+    flag), skip a near-duplicate of a name already listed."""
+    name, noted = _strip_code_note(raw.rstrip("."))
+    if noted:
+        a.no_prefer_code = True
+    if name and not _is_dup_item(name, a.items):
+        a.items.append(name)
 # 'Send method:' / 'Delivery method:' / 'to courier to Geylang'
 _DELIVERY_LINE = re.compile(
     r"^(?:send|delivery|shipping)\s*method\s*[:\-]?\s*(.*)$|"
@@ -345,7 +402,8 @@ def _looks_like_address(s: str) -> bool:
 # (?![A-Za-z]) — without it 'tel' matched INSIDE 'Tellicherry'/'Telur' and
 # the rest of a spec line was consumed as CONTACT NO. and written into MMS.
 _CONTACT_LINE = re.compile(
-    r"\b(?:contact(?:\s*no\.?)?|phone|tel)(?![A-Za-z])\s*[:\-]?\s*(.+)",
+    r"\b(?:contact(?:\s*no\.?)?|phone|tel|mobile|whatsapp|handphone|hp|cell)"
+    r"(?![A-Za-z])\s*[:\-]?\s*(.+)",
     re.IGNORECASE)
 # Line-start OR explicit colon — 'Please address the bitterness at the end'
 # is the verb, not a shipping address. Value is group(1) or group(2).
@@ -591,7 +649,8 @@ def parse_ask(text: str) -> Ask:
         if section and re.match(
                 r"^(comment|budget|complian|target\s*base|send\s*method|"
                 r"delivery|expected|need|receiver|contact|address|restriction|"
-                r"attn|bag|tel\b|phone)",
+                r"attn|bag|tel\b|phone|mobile|company|customer|whatsapp|"
+                r"e-?mail|hp\b|handphone|cell|fedex|dhl|ups)",
                 ln, re.I):
             section = ""
         if section == "address":
@@ -616,7 +675,7 @@ def parse_ask(text: str) -> Ask:
                 _n = (_qi.group(2) if _qi else _iq.group(1)).strip()
                 a.item_qty.append((_norm_qty(_q), _n))
                 continue
-            a.items.append(ln.rstrip("."))
+            _add_item(a, ln)
             continue
         if section == "qty":
             qi = _QTY_ITEM_RE.match(ln)
@@ -698,6 +757,13 @@ def parse_ask(text: str) -> Ask:
         if dm:
             a.overrides["addr"] = (dm.group(1) or dm.group(2) or "").strip()
             consumed = True
+        # 'Company: X' names the customer in a pasted form / note - never a
+        # seasoning, never comment text (Alex 03-Sep).
+        co = _COMPANY_LINE.match(line)
+        if co:
+            if not a.customer_text or a.head_is_field:
+                a.customer_text = co.group(1).strip(" .,")
+            consumed = True
         # Per-item quantity FIRST ('500g - texture improver 2'): the
         # generic scan below used to swallow these short lines as a bare
         # qty, losing which item they belonged to (Alex 02-Sep).
@@ -722,6 +788,24 @@ def parse_ask(text: str) -> Ask:
     # base / restriction / delivery / per-item qty — corpus-standard fields
     kept: list[str] = []
     for line in body:
+        # A carrier name alone on a line IS the delivery method (03-Sep:
+        # 'fedex' leaked into the comment). Consumed so it never prints.
+        mwl = _BARE_METHOD_LINE.match(line)
+        if mwl:
+            if not a.delivery:
+                a.delivery = _METHOD_NAMES.get(
+                    re.sub(r"\s", "", mwl.group(1)).lower(), mwl.group(1))
+            continue
+        # A 'Comment:' header with nothing behind it, or with only another
+        # bare header behind it ('Comment: Seasoning:'), is scaffolding from
+        # a pasted note - drop it, or the note prints 'Comment: Seasoning:'
+        # then a second empty 'Comment:' (03-Sep).
+        hm = _HDR_COMMENT.match(line)
+        if hm:
+            _c = hm.group(1).strip()
+            if (not _c or _HDR_SEASONING.match(_c) or _HDR_QTY.match(_c)
+                    or _HDR_COMMENT.match(_c)):
+                continue
         bm2 = _BASE_LINE.match(line)
         if bm2 and not a.base:
             a.base = (bm2.group(1) or bm2.group(2) or "").strip()
@@ -833,7 +917,7 @@ def parse_ask(text: str) -> Ask:
                 and not re.match(r"^(comment|budget|compliance|target|note|"
                                  r"for\b|each\b|need\b|send\b|delivery\b)",
                                  s, re.I)):
-            a.items.append(s)
+            _add_item(a, s)
             continue
         kept_body.append(line)
     body[:] = kept_body
@@ -904,7 +988,11 @@ Keep the rep's line breaks in "ask" (use \n) — R&D reads it as written,
 and numbered flavour lists must stay numbered lines. If he numbers
 multiple flavours (1. name - spec, 2. name - spec...), extract each as
 a distinct name+spec pair — the renderer builds the 'Seasoning name:' /
-'Comment:' blocks itself; don't rewrite them into that shape yourself."""
+'Comment:' blocks itself; don't rewrite them into that shape yourself.
+Mobile / Phone / WhatsApp / Tel lines are the contact and 'Company:' names
+the customer - never leave them inside "ask". A line you extracted into a
+key (need_by, contact, addr, budget...) must not ALSO remain inside "ask".
+'X - no specific code' means no preferred code for X, not a second item."""
 
 _UPDATE_PROMPT = """A salesperson is editing a draft sample request by chatting.
 Current draft:

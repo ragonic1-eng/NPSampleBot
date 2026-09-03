@@ -910,16 +910,20 @@ _UPDATE_PROMPT = """A salesperson is editing a draft sample request by chatting.
 Current draft:
 {draft}
 
+The bot has just asked them for these still-missing fields: {asked}
+
 Their new message: {text}
 
 Classify and reply with ONLY JSON:
 {{"action": "modify"|"confirm"|"discard"|"new_request"|"unrelated",
 "fields": {{...only the draft keys that change...}},
+"clear": [...draft keys they want REMOVED, usually empty...],
 "question": str|null}}
 
-Draft keys allowed in fields: ask, qty (int, grams), sets (int), bag, budget,
-compliance, attn, contact, addr, need_by, assignee, rtype ("new"/"rep"/"mod"),
-base_code.
+Draft keys allowed in fields/clear: ask, qty (int, grams), sets (int), bag,
+budget, compliance, base (the target base / application the seasoning goes
+on, e.g. "potato chip"), attn, contact, addr, need_by, assignee,
+rtype ("new"/"rep"/"mod"), base_code.
 - "confirm" = they clearly say to raise/submit/send it (e.g. "yes go ahead",
   "raise it", "confirm", "ok send").
 - "discard" = cancel / never mind / drop it.
@@ -929,6 +933,13 @@ base_code.
   another bot task).
 - otherwise "modify" with the changed fields. "make it 200g" → qty 200.
   "use empty bags" → bag "Empty bag". "send to the KL office ..." → addr.
+- A short reply with no field keyword, while a field is listed as
+  still-missing above, is the ANSWER to the first such field - put it
+  there (asked for base, they say "potato chip" -> base "potato chip").
+  Never call such an answer unrelated.
+- "no compliance" / "remove the budget" / "without an address" / "drop the
+  deadline" -> put that key in "clear" and leave fields empty. Never swap
+  a removed value for an invented one.
 - If their edit is ambiguous, action "modify", empty fields, and put a short
   plain-language question in "question" (like a colleague would ask,
   e.g. "How many grams — 200?"). Never invent values."""
@@ -981,10 +992,14 @@ async def llm_update(draft: dict, text: str) -> dict | None:
         "compliance": draft["compliance"], "attn": draft["attn"],
         "contact": draft["contact"], "addr": draft["addr"],
         "assignee": draft["assignee"], "need_by": draft["need_by"],
+        "base": draft["ask"].base,
     }
+    # What the card is currently asking for - a bare reply answers it.
+    asked = ", ".join(draft.get("gaps") or []) or "none"
     try:
         out, _, _ = await ai._ask(  # noqa: SLF001
-            _UPDATE_PROMPT.format(draft=_json.dumps(snapshot), text=text),
+            _UPDATE_PROMPT.format(draft=_json.dumps(snapshot), text=text,
+                                  asked=asked),
             max_tokens=300)
         d = _json_from(out)
         if d and d.get("action") in ("modify", "confirm", "discard",
@@ -1014,6 +1029,31 @@ _EDIT_PREFIX_RE = re.compile(
     r"(?:make\s+(?:it|the\s+budget)|set(?:\s+it)?|budget|"
     r"change\s+(?:it\s+)?to)?\s*$", re.IGNORECASE)
 
+# Explicit removal of a value the bot proposed ('no compliance', 'remove the
+# address', 'drop the deadline') - Alex 03-Sep: Compliance came from an old
+# request with no way to take it back. Every spelling maps to the draft key.
+# Whole-message only, so 'no compliance needed for this one' still goes to
+# the LLM, which reads the intent from the prompt rule.
+_CLEAR_RE = re.compile(
+    r"^\s*(?:no|none|remove|clear|drop|delete|without|skip|forget)\s+"
+    r"(?:the\s+|any\s+|a\s+|an\s+)?"
+    r"(compliance|budget|bag|address|addr|contact|phone|attn|receiver|"
+    r"need\s*-?\s*by|deadline|target\s*base|base|application)"
+    r"\b[\s.!]*$", re.IGNORECASE)
+_CLEAR_KEY = {
+    "compliance": "compliance", "budget": "budget", "bag": "bag",
+    "address": "addr", "addr": "addr",
+    "contact": "contact", "phone": "contact",
+    "attn": "attn", "receiver": "attn",
+    "needby": "need_by", "deadline": "need_by",
+    "targetbase": "base", "base": "base", "application": "base",
+}
+# 'target base: potato chip' / 'base: corn puff' / 'application: chips' as a
+# reply. The keyword must be a whole word so 'based on ...' can't hijack it.
+_BASE_REPLY_RE = re.compile(
+    r"^\s*(?:target\s+)?(?:base|application)\b\s*(?:is)?\s*(?:on)?\s*"
+    r"[:\-]?\s*(.+?)\s*$", re.IGNORECASE)
+
 
 def fallback_update(draft: dict, text: str) -> dict:
     """No-LLM interpretation of a reply to an active draft — keeps the
@@ -1034,6 +1074,15 @@ def fallback_update(draft: dict, text: str) -> dict:
         return {"action": "confirm", "fields": {}, "question": None}
     if _DISCARD_RE.match(t):
         return {"action": "discard", "fields": {}, "question": None}
+    cl = _CLEAR_RE.match(t)
+    if cl:
+        key = _CLEAR_KEY[re.sub(r"[\s\-]+", "", cl.group(1)).lower()]
+        # 'no budget' is a VALUE R&D reads ('BUDGET: no budget'), kept by
+        # the budget parser below - only 'remove/drop the budget' clears.
+        if not (key == "budget"
+                and re.match(r"^\s*(?:no|none)\b", t, re.I)):
+            return {"action": "modify", "fields": {}, "clear": [key],
+                    "question": None}
     fields: dict = {}
     qm = _QTY_REPLY_RE.match(t)
     if qm:
@@ -1078,16 +1127,23 @@ def fallback_update(draft: dict, text: str) -> dict:
     dm = _ADDR_LINE.search(t)
     if dm:
         fields["addr"] = (dm.group(1) or dm.group(2) or "").strip()
+    bm2 = _BASE_REPLY_RE.match(t)
+    if bm2 and len(t) < 80 and bm2.group(1).strip():
+        fields["base"] = bm2.group(1).strip()
     if fields:
         return {"action": "modify", "fields": fields, "question": None}
     return {"action": "unrelated", "fields": {}, "question": None}
 
 
-def apply_fields(draft: dict, fields: dict) -> None:
-    """Merge an LLM 'modify' result into the draft in place."""
+def apply_fields(draft: dict, fields: dict,
+                 clear: list | None = None) -> None:
+    """Merge an LLM 'modify' result into the draft in place. `clear` lists
+    keys the rep wants REMOVED - the only way to blank a field, since an
+    empty value in `fields` means 'unchanged' (LLM nulls must never wipe
+    the draft)."""
     d = draft["derived"]
     for k, v in (fields or {}).items():
-        if v in (None, ""):
+        if k == "clear" or v in (None, ""):
             continue
         if k == "qty":
             try:
@@ -1105,6 +1161,9 @@ def apply_fields(draft: dict, fields: dict) -> None:
                                 "mod": "Modify"}[v]
         elif k == "base_code":
             d["base_code"] = str(v).upper()
+        elif k == "base":
+            draft["ask"].base = str(v)
+            draft.setdefault("src", {})["base"] = "you"
         elif k == "ask":
             draft["ask"].ask_text = str(v)
         elif k == "delivery":
@@ -1117,11 +1176,74 @@ def apply_fields(draft: dict, fields: dict) -> None:
             # a reply IS an explicit statement — it must never be
             # re-overridden by derived values, and clears 'confirm' flags
             draft.setdefault("src", {})[k] = "you"
+    for k in (clear or []):
+        if k == "base":
+            draft["ask"].base = ""
+        elif k in ("bag", "budget", "compliance", "attn", "contact",
+                   "addr", "need_by"):
+            draft[k] = ""
+        else:
+            continue
+        # an explicit removal is the rep's word - never re-derived
+        draft.setdefault("src", {})[k] = "you"
     draft["missing"] = [m for m, val in
                         (("bag", draft["bag"]),
                          ("ship-to", draft["attn"] or draft["addr"]),
                          ("need-by", draft["need_by"]))
                         if not val]
+
+
+# Scoreboard labels ('Still missing: ...') -> where a bare answer lands. Only
+# the scalar fields one short reply can fill outright; the seasoning list,
+# the comment and per-item quantities stay with the LLM / qty parsers.
+_GAP_SLOT = {
+    "Target base": "base", "Budget": "budget", "Compliance": "compliance",
+    "Receiver name": "attn", "Contact": "contact", "Address": "addr",
+    "Send method": "delivery", "Expected send by": "need_by",
+}
+_CODE_SHAPE_RE = re.compile(r"^[A-Za-z]-[A-Za-z0-9\-]{3,}$")
+
+
+def answer_gap(draft: dict, text: str) -> str:
+    """The card just asked for ONE field and the rep replied with a bare
+    value ('potato chip') - that reply IS the answer, so file it there
+    instead of letting a keyword-less message fall through to the product
+    search. Returns the scoreboard label filled, or '' when this reply is
+    not an answer: several gaps open, a field keyword present (the normal
+    editor owns it), a confirm/discard, a product code, or too long to be
+    one value. Alex 03-Sep: 'you asked me, I said potato chip, and you
+    searched it'."""
+    gaps = [g for g in (draft.get("gaps") or []) if g in _GAP_SLOT]
+    if len(gaps) != 1:
+        return ""
+    t = (text or "").strip()
+    if not t or "\n" in t or len(t) > 80 or t.startswith("/"):
+        return ""
+    if _CODE_SHAPE_RE.match(t):
+        return ""
+    if _CONFIRM_RE.match(t) or _DISCARD_RE.match(t):
+        return ""
+    probe = fallback_update(draft, t)
+    if probe.get("action") != "unrelated" or probe.get("clear"):
+        return ""
+    label = gaps[0]
+    slot = _GAP_SLOT[label]
+    if slot == "base":
+        draft["ask"].base = t
+    elif slot == "delivery":
+        draft["ask"].delivery = t
+    elif slot == "need_by":
+        draft["need_by"] = t.upper()
+    else:
+        draft[slot] = t
+    draft.setdefault("src", {})[slot] = "you"
+    draft.setdefault("fields", {})[label] = "you"
+    draft["missing"] = [m for m, val in
+                        (("bag", draft.get("bag")),
+                         ("ship-to", draft.get("attn") or draft.get("addr")),
+                         ("need-by", draft.get("need_by")))
+                        if not val]
+    return label
 
 
 def parsed_to_text(parsed: dict) -> str:

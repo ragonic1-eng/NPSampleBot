@@ -43,7 +43,6 @@ from telegram.ext import (
 )
 
 import ai
-import awb_sync
 import config
 import groq_voice
 import matcher
@@ -646,7 +645,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "",
             "<b>🔧 Admin (hidden from / autocomplete; still work if typed)</b>",
             "/reload — refresh seasoning &amp; customer lists from Sheets",
-            "/syncawb [dry] — run the AWB sync manually (DHL + FedEx → FSL col K)",
             "/diag — diagnostics (auth / sheet visibility)",
             "/whichchat — show this chat's ID (for DAILY_DIGEST_CHAT_ID setup)",
             "/sampleupdate — preview &amp; post today's 6pm digest now",
@@ -660,93 +658,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # were retired in V1.7.1. The MMS → Full Sample Listing sync is now
 # automated via the JobQueue scheduled task in main(); see sync_engine.py
 # for the actual fetch+enrich+append logic.
-
-
-async def cmd_syncawb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Manual AWB sync — ragonic-only. Runs once, posts the result.
-
-    /syncawb           → full run (last 14 days), write + push to group
-    /syncawb dry       → preview run, no writes, no group post
-    /syncawb quiet     → full run, write but DON'T post to group (useful
-                         when re-running just to backfill without spam)
-    /syncawb 365       → deep backfill — scrape the last 365 days of DHL/
-                         FedEx history. Slower (~5-30min depending on
-                         carrier history). Quiet by default. Max 730.
-    """
-    if not await _authorized(update):
-        return
-    if not _is_update_sample_owner(update.effective_user):
-        await send(update, "🛑 This command is admin-only.")
-        return
-    args = [a.lower() for a in (ctx.args or [])]
-    dry_run = any(a in ("dry", "preview", "test") for a in args)
-    quiet = any(a in ("quiet", "nopost", "silent") for a in args)
-    # V1.17.x — accept a numeric arg as days_back so reps can trigger a
-    # deep backfill (e.g. `/syncawb 365` to scrape the last year of DHL
-    # ship-to addresses into FSL col L). Capped at 730 days to avoid
-    # accidental scrapes back to the dawn of MyDHL+. Backfills default
-    # to quiet — a 30-minute scrape shouldn't push a noisy group update.
-    days_back = 14
-    custom_days = False
-    for a in args:
-        try:
-            n = int(a)
-            if n > 0:
-                days_back = min(n, 730)
-                custom_days = True
-                break
-        except ValueError:
-            continue
-    if custom_days and days_back > 30:
-        quiet = True  # backfills don't push to chat by default
-    mode_parts = [f"{days_back}d window"]
-    mode_parts.append("preview" if dry_run else ("live, quiet" if quiet else "live + push"))
-    mode = " · ".join(mode_parts)
-    await send(
-        update,
-        f"📦 <b>Running AWB sync</b> ({mode})…\n\n"
-        "<i>Fetching from DHL + FedEx, matching against the 3 FSL tabs, "
-        f"then writing AWB to col K + address to col L. May take "
-        f"{'~30s' if days_back <= 30 else '5-30min on deep backfills'}.</i>",
-        with_footer=False,
-    )
-    try:
-        result = await awb_sync.run_awb_sync(days_back=days_back, dry_run=dry_run)
-    except Exception as e:  # noqa: BLE001
-        await send(update, f"⚠️ AWB sync crashed: <code>{h(e)}</code>")
-        log.exception("/syncawb crashed")
-        return
-    # Reply to the admin with the result summary first.
-    await send(update, awb_sync.format_result_for_telegram(result))
-
-    # Also push the 'AWB Update' message to the daily digest chat —
-    # same behaviour as the scheduled job — unless this was a dry run
-    # or the rep asked for 'quiet'. Skip silently if nothing was
-    # written or DAILY_DIGEST_CHAT_ID isn't configured.
-    if dry_run or quiet:
-        return
-    msg = awb_sync.format_update_message(result)
-    if not msg:
-        return  # no carrier matches were written → nothing to announce
-    if not config.DAILY_DIGEST_CHAT_ID:
-        await send(
-            update,
-            "<i>ℹ️ Skipped group post — DAILY_DIGEST_CHAT_ID env var is not "
-            "set on Railway.</i>",
-        )
-        return
-    try:
-        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
-        await ctx.bot.send_message(
-            chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML,
-        )
-        await send(
-            update,
-            f"✅ AWB Update posted to chat <code>{h(config.DAILY_DIGEST_CHAT_ID)}</code>.",
-        )
-    except Exception as e:  # noqa: BLE001
-        log.exception("/syncawb: group post failed")
-        await send(update, f"⚠️ Group post failed: <code>{h(e)}</code>")
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -4146,7 +4057,6 @@ async def _show_lastsample_results(
         price_str = _fmt_price(r.get("R&D Price") or "")
         customer = (r.get("Customer Name") or "—").strip()
         sales = (r.get("Sales") or "").strip()
-        awb_raw = (r.get("AWB") or "").strip()
 
         # Line 1: number + product name (bold).
         lines.append(f"<b>{i}. {h(name)}</b>")
@@ -4164,15 +4074,6 @@ async def _show_lastsample_results(
         if scope == "all" and sales:
             cust_line += f"  <i>· sent by {h(sales)}</i>"
         lines.append(cust_line)
-        # Line 4: AWB. Same three-state rendering as the digest +
-        # customer view — real tracking number, 🚗 hand-carry marker,
-        # or '—' when the row is still unmapped.
-        if not awb_raw or _awb_is_price_leak(awb_raw):
-            lines.append("   📦 AWB —")
-        elif _is_hand_carry(awb_raw):
-            lines.append("   🚗 Hand carry")
-        else:
-            lines.append(f"   📦 AWB <code>{h(awb_raw)}</code>")
         # Spacer between results.
         lines.append("")
 
@@ -4591,15 +4492,7 @@ async def _show_customer_samples(
         name = r.get("Product Name") or "—"
         code = r.get("Product Code") or "—"
         price = _fmt_price(r.get("R&D Price") or "")
-        # AWB suffix. The same value the digest shows — real tracking
-        # number, '🚗 Hand carry' marker, or '—' when still unmatched.
-        awb_raw = (r.get("AWB") or "").strip()
-        if not awb_raw or _awb_is_price_leak(awb_raw):
-            awb_suffix = " · AWB —"
-        elif _is_hand_carry(awb_raw):
-            awb_suffix = " · 🚗 Hand carry"
-        else:
-            awb_suffix = f" · AWB <code>{h(awb_raw)}</code>"
+        awb_suffix = ""
         if scope == "all":
             sales = (r.get("Sales") or "").strip() or "—"
             lines.append(
@@ -9036,41 +8929,6 @@ def _fmt_digest_price(raw: str) -> str:
         return s
 
 
-_AWB_PRICE_LEAK_RE = re.compile(
-    r"^(?:usd|thb|idr|sgd|myr|rm|s\$|\$)?\s*\d{1,4}\.\d{1,5}\s*(?:usd)?$",
-    re.IGNORECASE,
-)
-
-
-def _awb_is_price_leak(awb_value: str) -> bool:
-    """True when the AWB cell holds a price, not a tracking number.
-
-    The Singapore FSL tab's column K ('AWB') was historically loaded with
-    the raw-material COST (a small decimal ≈ half the R&D price) instead of
-    an air-waybill number — 15,692 rows across every year 2010–2026. A real
-    AWB is a long digit run (DHL 10, FedEx 12+); a leaked cost looks like
-    '1.9232' or 'SGD 4.36'. Rendering that as '📦 AWB 1.9232' misleads the
-    rep into thinking it's a tracking number, so callers treat a leak as
-    'no AWB' (—). We reject only this specific price shape, never a genuine
-    tracking number.
-    """
-    return bool(_AWB_PRICE_LEAK_RE.match((awb_value or "").strip()))
-
-
-def _is_hand_carry(awb_value: str) -> bool:
-    """Detect manually-entered hand-carry markers in the AWB cell.
-
-    Reps mark a row as hand-delivered by typing one of these in the AWB
-    column (case + whitespace agnostic). The sync's skip-if-non-empty
-    rule preserves the value across re-runs.
-    """
-    s = (awb_value or "").strip().upper()
-    if not s:
-        return False
-    return s in {"HAND CARRY", "HAND-CARRY", "HANDCARRY", "HC"} or \
-        s.startswith("HAND ")
-
-
 async def _build_daily_digest_body() -> tuple[str, int]:
     """Read all 3 FSL tabs, filter to today's SGT date, build the
     formatted digest body. Returns (html_body, total_sample_count).
@@ -9082,24 +8940,6 @@ async def _build_daily_digest_body() -> tuple[str, int]:
     """
     today = _today_sgt()
     log.info("daily_digest: building for SGT date %s", today)
-
-    # Load alias map once and reverse it (FSL Customer Name → carrier
-    # label name). Used to show 'SARL HYGIENIX MANUFACTURE COMPANY' in
-    # parens alongside the FSL-side 'Daiya Food'. Multiple aliases per
-    # FSL name are joined with ' / ' on display. Lookup key is lower-
-    # cased to match the carrier name regardless of capitalisation
-    # variations between the alias sheet and the FSL row.
-    try:
-        raw_aliases = await asyncio.to_thread(sheets.load_customer_aliases)
-    except Exception as e:  # noqa: BLE001
-        log.warning("daily_digest: alias load failed (continuing): %s", e)
-        raw_aliases = {}
-    reverse_aliases: dict[str, list[str]] = {}
-    for carrier_name, fsl_name in raw_aliases.items():
-        key = (fsl_name or "").strip().lower()
-        if not key or not carrier_name:
-            continue
-        reverse_aliases.setdefault(key, []).append(carrier_name.strip())
 
     # Region order fixed (SG → ID → TH) for predictable scanning.
     region_specs = (
@@ -9211,22 +9051,14 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                 suffix = f" — {cnt} samples" if cnt > 1 else ""
 
                 # Build the parenthesised header parts:
-                #   (FSL Name) (Carrier Name) (Country)
-                # The carrier name appears only when there's a known
-                # alias from the OPS sheet's 'AWB Customer Aliases'
-                # tab (reverse lookup). Country only on regions where
-                # show_country is True (Singapore / Intl).
+                #   (FSL Name) (Country)
+                # Country only on regions where show_country is True
+                # (Singapore / Intl).
                 bare_customer = (
                     samples[0].get("Customer Name") or ""
                 ).strip() or "—"
                 country = (samples[0].get("Country") or "").strip()
-                aliases_for_this = reverse_aliases.get(
-                    bare_customer.lower(), []
-                )
                 header_parts = [f"({h(bare_customer)})"]
-                if aliases_for_this:
-                    carrier_display = " / ".join(aliases_for_this)
-                    header_parts.append(f"({h(carrier_display)})")
                 if show_country and country:
                     header_parts.append(f"({h(country)})")
                 lines.append(
@@ -9244,92 +9076,6 @@ async def _build_daily_digest_body() -> tuple[str, int]:
                         f"       • {h(name)} · <code>{h(code)}</code> · "
                         f"{h(qty)} · R&amp;D {h(price)}"
                     )
-
-                # AWB Number on its own line AFTER the samples. The
-                # matcher fills every row in the same customer/date
-                # block with the same AWB (one DHL box → many sample
-                # bags), so usually one distinct value. Multiple
-                # distinct AWBs only happen if a customer got two
-                # separate shipments on the same day — joined with
-                # ' / ' so the digest doesn't silently hide one.
-                # Missing AWBs show as '—' so the reader knows it's
-                # unmapped, not that we forgot to fetch. Hand-carry
-                # samples (rep delivers in person, no DHL/FedEx
-                # record — see _is_hand_carry) render as 🚗 Hand
-                # carry instead of an AWB code.
-                awbs = sorted({
-                    (s.get("AWB") or "").strip()
-                    for s in samples
-                    if (s.get("AWB") or "").strip()
-                    and not _awb_is_price_leak(s.get("AWB") or "")
-                })
-                if any(_is_hand_carry(a) for a in awbs):
-                    lines.append("       🚗 Hand carry")
-                elif awbs:
-                    awb_str = " / ".join(awbs)
-                    lines.append(
-                        f"       AWB Number: <code>{h(awb_str)}</code>"
-                    )
-                else:
-                    lines.append("       AWB Number: —")
-
-    # Unknown-receiver block — carrier records (DHL/FedEx) the bot
-    # couldn't match to any FSL customer. Sales can self-identify these
-    # at a glance and either add the customer to FSL or set an alias.
-    # Appears BEFORE the top-sender divider so the actionable block
-    # sits closer to the regional sections it relates to.
-    #
-    # V1.17.x — read from the OPS "Unmatched AWBs" tab (persisted by
-    # awb_sync). Falls back to in-memory cache for the cold-boot case.
-    unmatched_rows: list[dict] = []
-    try:
-        unmatched_rows = await asyncio.to_thread(sheets.load_unmatched_awbs)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Could not read persisted unmatched AWBs: %s", e)
-    if not unmatched_rows:
-        for s in awb_sync.get_last_unmatched_shipments():
-            unmatched_rows.append({
-                "awb": s.awb, "carrier": s.carrier,
-                "recipient_name": s.recipient_name,
-                "ship_date": s.ship_date.strftime("%Y-%m-%d") if s.ship_date else "",
-                "last_updated_utc": "",
-            })
-
-    # V1.17.x — TODAY-only filter for the digest. The OPS tab keeps a
-    # rolling backlog of every unresolved unmatched AWB (so reps can
-    # triage anytime), but the 6pm digest is about "samples sent
-    # today" — so only today's carrier AWBs without an FSL match
-    # belong in the UNKNOWN RECEIVER section. Sales explicitly
-    # flagged that older entries pollute the daily message.
-    today_iso = today.strftime("%Y-%m-%d")
-    unmatched_rows = [
-        r for r in unmatched_rows
-        if str(r.get("ship_date") or "").strip() == today_iso
-    ]
-
-    # Always render the section, even when there's nothing to surface.
-    # User wants the header visible so the absence is explicit ("None")
-    # rather than ambiguous (header missing → maybe the bot forgot, or
-    # maybe scrape failed). With this layout the message is consistent
-    # day-to-day and reps know zero-state by reading "None" once.
-    lines.append("")
-    lines.append(
-        "<b>UNKNOWN RECEIVER</b> "
-        "<i>(Data from DHL &amp; FEDEX that i can't identify)</i>"
-    )
-    if not unmatched_rows:
-        lines.append("None")
-    else:
-        # Sort by ship date desc — newest first, easiest to triage.
-        unmatched_sorted = sorted(
-            unmatched_rows,
-            key=lambda r: str(r.get("ship_date") or ""),
-            reverse=True,
-        )
-        for r in unmatched_sorted:
-            lines.append("")
-            lines.append(f"{h(r.get('recipient_name', ''))}")
-            lines.append(f"AWB: <code>{h(r.get('awb', ''))}</code>")
 
     # V1.17.x — User flagged that the 'Top sender / Customers' summary
     # was admin-internal stats noise on the group digest. Removed.
@@ -11146,101 +10892,6 @@ async def cmd_sampleupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await send(update, f"❌ Post to group failed: <code>{h(str(e))}</code>")
 
 
-async def _awb_sync_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue callback for the twice-daily AWB sync.
-
-    Runs awb_sync.run_awb_sync(), logs the result, and posts an 'AWB
-    Update' message to the digest chat if any new AWBs were actually
-    written this run. Skip-post when nothing was written so the chat
-    doesn't get 'Update: 0 new AWBs' noise. Failures are caught and
-    logged — a broken DHL scrape must not take down the rest of the
-    bot.
-    """
-    log.info("awb_sync_job: starting")
-    try:
-        result = await awb_sync.run_awb_sync(days_back=14, dry_run=False)
-    except Exception as e:  # noqa: BLE001
-        log.exception("awb_sync_job crashed: %s", e)
-        return
-    log.info(
-        "awb_sync_job: done · fetched %d (DHL %d + FedEx %d) · "
-        "matched %d · written %d · errors %d",
-        result.dhl_count + result.fedex_count,
-        result.dhl_count, result.fedex_count,
-        result.total_matched, result.total_written, len(result.errors),
-    )
-    for err in result.errors:
-        log.warning("awb_sync_job error: %s", err)
-
-    # Push a follow-up "AWB Update" message to the same chat as the
-    # daily digest, when (a) we wrote at least one new AWB AND (b)
-    # DAILY_DIGEST_CHAT_ID is configured. format_update_message
-    # returns None on no-writes so we skip the post then.
-    msg = awb_sync.format_update_message(result)
-    if not msg:
-        return
-    if not config.DAILY_DIGEST_CHAT_ID:
-        log.info(
-            "awb_sync_job: %d update(s) written but DAILY_DIGEST_CHAT_ID "
-            "not set — skipping chat post",
-            result.total_written,
-        )
-        return
-    try:
-        chat_id = int(config.DAILY_DIGEST_CHAT_ID)
-        await context.bot.send_message(
-            chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML,
-        )
-        log.info(
-            "awb_sync_job: posted AWB update (%d shipment(s)) to chat %s",
-            len(result.applied_updates), chat_id,
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("awb_sync_job: chat post failed: %s", e)
-
-
-async def _schedule_awb_sync(application: Application) -> None:
-    """Set up the twice-daily AWB sync.
-
-    Schedule (user-specified):
-      • 17:30 SGT daily — first pass, aligned with the 5:30 PM FSL
-        update window. Catches AWBs that became available during the
-        day for FSL rows already on the sheet.
-      • 00:00 SGT daily — overnight catch-up. Picks up AWBs for FSL
-        rows that arrived after the 17:30 pass (e.g. samples added to
-        MMS in the late afternoon, then MMS-synced into the FSL at
-        17:40 — after our 17:30 AWB pass missed them).
-
-    The matcher's skip-if-non-empty rule means re-runs only fill empty
-    AWB cells, so neither time can clobber a previously-written value
-    (real AWB, HAND CARRY marker, anything else manually entered).
-    The 14-day overlap window in the fetchers means a missed run isn't
-    fatal either — the next pass re-checks the same period.
-    """
-    from datetime import time as _time
-    job_queue = application.job_queue
-    if job_queue is None:
-        log.warning("JobQueue not available — AWB sync NOT scheduled.")
-        return
-    sgt = ZoneInfo("Asia/Singapore")
-    # Both runs fire every day — DHL/FedEx still
-    # record AWBs on weekends if a rep ships then, and we want the
-    # FSL to be current even when the Mon-Fri digest is off.
-    job_queue.run_daily(
-        _awb_sync_job,
-        time=_time(hour=17, minute=30, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4, 5, 6),
-        name="awb_sync_evening",
-    )
-    job_queue.run_daily(
-        _awb_sync_job,
-        time=_time(hour=0, minute=0, tzinfo=sgt),
-        days=(0, 1, 2, 3, 4, 5, 6),
-        name="awb_sync_overnight",
-    )
-    log.info("awb_sync scheduled: 17:30 + 00:00 SGT, daily")
-
-
 async def _schedule_weekly_mms_sync(application: Application) -> None:
     """Set up the recurring weekday sync job + catch-up if overdue.
 
@@ -11380,9 +11031,6 @@ def main():
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("whichchat", cmd_whichchat))
     app.add_handler(CommandHandler("sampleupdate", cmd_sampleupdate))
-    app.add_handler(CommandHandler("syncawb", cmd_syncawb))
-    app.add_handler(CommandHandler("sentout", cmd_sentout))
-    app.add_handler(CommandHandler("sr", cmd_sr))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("watch", cmd_watch))
@@ -11456,19 +11104,6 @@ def main():
         await _install_commands(application)
         await _schedule_weekly_mms_sync(application)
         await _schedule_daily_digest(application)
-        await _schedule_awb_sync(application)
-        await _schedule_watch_check(application)
-        await _schedule_followup_nudges(application)
-        await _schedule_dispatch_reminder(application)
-        await _schedule_monthly_report(application)
-        asyncio.create_task(_warm_fsl_tabs())
-        # Read-only capability API for NPMarketingBot (Eli). Inert unless
-        # SIBLING_API_TOKEN is set.
-        try:
-            from sibling_api import start_in_background
-            start_in_background()
-        except Exception as e:  # noqa: BLE001
-            log.warning("Could not start capability API: %s", e)
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
     # group -1: conversational /sr draft edits run BEFORE the search router;

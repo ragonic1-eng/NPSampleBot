@@ -11031,6 +11031,8 @@ def main():
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("whichchat", cmd_whichchat))
     app.add_handler(CommandHandler("sampleupdate", cmd_sampleupdate))
+    app.add_handler(CommandHandler("sentout", cmd_sentout))
+    app.add_handler(CommandHandler("sr", cmd_sr))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("pp", cmd_pp))
     app.add_handler(CommandHandler("watch", cmd_watch))
@@ -11104,6 +11106,11 @@ def main():
         await _install_commands(application)
         await _schedule_weekly_mms_sync(application)
         await _schedule_daily_digest(application)
+        await _schedule_watch_check(application)
+        await _schedule_followup_nudges(application)
+        await _schedule_dispatch_reminder(application)
+        await _schedule_monthly_report(application)
+        asyncio.create_task(_warm_fsl_tabs())
     app.post_init = _post_init
     app.add_handler(CallbackQueryHandler(on_callback))
     # group -1: conversational /sr draft edits run BEFORE the search router;

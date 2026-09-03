@@ -3,12 +3,6 @@
 # tesseract-ocr: shells out from pytesseract at runtime so /scan can OCR
 # product labels without the (paid) Claude Haiku vision fallback.
 #
-# Chromium system libs: pulled in for Playwright (awb_sync.py twice-
-# daily DHL + FedEx scrape). Headless Chromium needs nss/atk/cups/
-# xrandr/gbm/pango/cairo/asound + a font package or it segfaults on
-# launch. fonts-liberation is the smallest font set that DHL/FedEx
-# don't render as boxes.
-#
 # opencv (pulled in by RapidOCR, the primary OCR engine) links against a
 # handful of X11/GL shared libraries that the slim Railway image doesn't
 # ship. Missing ANY one makes `import cv2` raise ImportError, RapidOCR then
@@ -33,29 +27,9 @@ aptPkgs = [
     "libxfixes3",
     # onnxruntime (RapidOCR's inference backend) links OpenMP.
     "libgomp1",
-    # --- chromium runtime deps ---
-    "libnss3",
-    "libnspr4",
-    "libatk1.0-0",
-    "libatk-bridge2.0-0",
-    "libcups2",
-    "libxcomposite1",
-    "libxdamage1",
-    "libxrandr2",
-    "libgbm1",
-    "libxkbcommon0",
-    "libpango-1.0-0",
-    "libpangocairo-1.0-0",
-    "libcairo2",
-    "libasound2",
-    "fonts-liberation",
 ]
 
-# After pip install we still need to fetch the Chromium binary itself
-# — pip only installs the python bindings. Skip the system-deps step
-# (we handle those above) so this stays fast on rebuilds.
-#
-# We ALSO warm the RapidOCR model cache at BUILD time. RapidOCR downloads
+# We warm the RapidOCR model cache at BUILD time. RapidOCR downloads
 # ~20 MB of ONNX models on first use; if that first use is a rep's scan on a
 # container with slow/absent outbound network, init fails or times out and
 # the bot silently drops to Tesseract. `python warm_ocr_models.py` forces the
@@ -64,7 +38,6 @@ aptPkgs = [
 # registry outage never breaks the whole deploy.
 [phases.build]
 cmds = [
-    "python -m playwright install chromium",
     # RapidOCR pulls the DESKTOP opencv-python, which links X11/GL libs the
     # slim server image lacks — the root cause of the recurring
     # "libGL.so.1 / libxcb.so.1 not found" RapidOCR failures. opencv-python-

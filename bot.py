@@ -9703,6 +9703,16 @@ def _sr_draft_text(draft: dict) -> str:
     if a.item_qty:
         qty = "; ".join(f"{q} {n}".strip() for q, n in a.item_qty)
         qty_tail = ""
+    elif a.form_mode and any(f.get("qty") for f in a.flavours):
+        # Multi-item form: each block carries its own amount. Summarise
+        # them here ('50g x6 . 100g x2'); the note has the per-item detail.
+        _cnt: dict[str, int] = {}
+        for f in a.flavours:
+            _k = f.get("qty") or f"{d['qty']}g"
+            _cnt[_k] = _cnt.get(_k, 0) + 1
+        qty = (" · ".join(f"{k} ×{n}" for k, n in _cnt.items())
+               + "  (per item — see note)")
+        qty_tail = ""
     else:
         qty = (f"{d['qty']} g × {d['sets']} set{'s' if d['sets'] != 1 else ''}"
                + (f" per flavour ({len(a.flavours)} flavours)"
@@ -9764,6 +9774,9 @@ def _sr_draft_text(draft: dict) -> str:
             "Target base": a.base,
             "Budget": draft.get("budget", ""),
             "Compliance": draft.get("compliance", ""),
+            # comments given per item (multi-item form) count as given
+            "Comment": a.ask_text or ("x" if any(
+                (f.get("spec") or []) for f in a.flavours) else ""),
         }
         _srckey = {"Receiver name": "attn", "Address": "addr",
                    "Contact": "contact", "Expected send by": "need_by",

@@ -135,6 +135,7 @@ class Ask:
     base: str = ""          # TARGET BASE / application
     restriction: str = ""   # halal / gluten-free / non-GMO …
     structured: bool = False  # True only when block detection is CONFIDENT
+    form_mode: bool = False   # the repeated SEASONING NAME:/code form was split
     # Alex 02-Sep: never fabricate 'No prefer code.' — say it only when he
     # actually wrote it, and then only inside the Comment block.
     no_prefer_code: bool = False
@@ -338,9 +339,10 @@ _DELIVERY_ADDR_LINE = re.compile(
 # method='Courier' + address='Geylang'
 _METHOD_WORD = re.compile(
     r"\b(courier|self.?collect(?:ion)?|hand.?carry|dhl|fedex|ups|deliver\w*|"
-    r"collect\w*)\b", re.IGNORECASE)
+    r"collect\w*|lala\s*move|lalamove|grab|gojek)\b", re.IGNORECASE)
 _METHOD_DEST = re.compile(
-    r"\b(?:courier|deliver\w*|send|ship|collect\w*)\b[^,]*?\bto\s+(.+)$",
+    r"\b(?:courier|deliver\w*|send|ship|collect\w*|move|lala\s*move|lalamove|"
+    r"grab|drop(?:\s*off)?)\b[^,]*?\bto\s+(.+)$",
     re.IGNORECASE)
 # What a sample quantity actually IS (Alex 02-Sep, confirmed against the
 # corpus): an AMOUNT PHRASE — a leading number followed by an optional short
@@ -467,6 +469,153 @@ def _shipto_kind(line: str) -> str:
             or ("," in st and any(ch.isdigit() for ch in st))):
         return "addr"
     return ""
+
+
+# ------------------------------------------------ multi-item form (03-Sep)
+# Alex's own multi-seasoning layout (Apacific): each item is a block that
+# starts with 'SEASONING NAME: X' (or a bare 'SEASONING NAME:' with X on the
+# next line), a code-led line 'S-K9U15-08 TAKOYAKI SEASONING', a numbered
+# line, or - once a block is open - a short name-shaped line ('SALTED EGG
+# SEASONING'); then its own 'COMMENT: ...' and a quantity line such as
+# '50G SEASONING WITH NO APPLIED SAMPLES' / '50 GRAMS AND NO APPLICATIONS';
+# 'NEW SAMPLE' markers sit between blocks and travel with the next item.
+# Global field lines (budget, customer, delivery...) are never part of a
+# block - they stay for the main parser. Confidence gate: at least two
+# header/code-led starts, otherwise the lines are returned untouched
+# (numbered-only lists keep going through _structure_body, which owns the
+# 'numbering starts at 2' recovery).
+_HDR_SEASONING_VAL = re.compile(
+    r"^seasoning(?:\s*names?)?\s*[:\-]\s*(?!\d+[.)])(.+)$", re.IGNORECASE)
+_CODE_LED_LINE = re.compile(
+    r"^([SJBC]-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s+(\S.*)$", re.IGNORECASE)
+_BLOCK_MARKER = re.compile(
+    r"^(?:new|repeat|modify|mod)\s*(?:sample|request|seasoning)?\s*[:\-]?\s*$",
+    re.IGNORECASE)
+_BLOCK_COMMENT = re.compile(r"^comments?\s*:\s*:?\s*(.*)$", re.IGNORECASE)
+_BLOCK_QTY = re.compile(
+    r"^(?:(?:qty|quantity)\s*[:\-]?\s*)?(\d+(?:\.\d+)?)\s*(kg|grams?|gm|g)\b"
+    r"\s*(.*)$", re.IGNORECASE)
+_GLOBAL_FIELD_RE = re.compile(
+    r"^(?:budget|bag|complian|target\s*base|need\s*by|expected|delivery|"
+    r"send\s*method|shipping|ship\s*to|address|customer|company|receiver|"
+    r"attn|attention|contact|phone|mobile|tel|whatsapp|restriction|"
+    r"application)\b", re.IGNORECASE)
+_NAME_LIKE_LINE = re.compile(
+    r"^[A-Za-z0-9&()'/ \-]{3,60}?\b(?:seasoning|flavou?r|powder|premix|mix)\b"
+    r"\s*[.,]?\s*$", re.IGNORECASE)
+_SENTENCE_WORDS = re.compile(
+    r"\b(?:the|a|an|as|with|like|same|should|must|want|please|use|add|"
+    r"remove|less|more|check|take|if|no|not|for|of|is|are|make|keep|follow)\b",
+    re.IGNORECASE)
+# The LLM path hands us 'CUSTOMER - <first ask line>' as line 0; when that
+# first ask line is itself an item start, split the customer off it.
+_HEAD_WITH_START = re.compile(
+    r"^(.*?)\s+[-–—]\s+((?:seasoning\s*names?\s*[:\-]|[SJBC]-[A-Z0-9-]+\s+\S).*)$",
+    re.IGNORECASE)
+
+
+def _looks_like_person(v: str) -> bool:
+    """A receiver NAME, not a sentence. An SR page once carried 'ached the
+    ingredients list for the Sweet Corn seasoning that must be followed...'
+    in its attn field and the bot proposed it as the receiver (03-Sep)."""
+    s = (v or "").strip()
+    if not s or len(s) > 60 or len(s.split()) > 6:
+        return False
+    return not re.search(r"[.!?;]\s", s)
+
+
+def _person(v: str) -> str:
+    return v if _looks_like_person(v) else ""
+
+
+def _form_blocks(lines: list[str]) -> tuple[list[dict], list[str]]:
+    """Split the multi-item form into per-item blocks
+    [{'name', 'spec': [...], 'qty': '50g'|''}]. Returns (blocks, remaining
+    lines); blocks is [] - and lines come back untouched - when the form
+    isn't confidently present."""
+    if lines:
+        m0 = _HEAD_WITH_START.match(lines[0].strip())
+        if m0:
+            lines = [m0.group(1).strip(), m0.group(2).strip()] + list(lines[1:])
+    blocks: list[dict] = []
+    remaining: list[str] = []
+    cur: dict | None = None
+    pending: list[str] = []   # marker lines waiting for the next block
+    headed = 0                # header/code-led starts: the confidence gate
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i].strip()
+        i += 1
+        if not ln:
+            continue
+        if _GLOBAL_FIELD_RE.match(ln) and not _BLOCK_COMMENT.match(ln):
+            remaining.append(ln)          # global fields never join a block
+            continue
+        if _BLOCK_MARKER.match(ln):
+            pending.append(ln)            # 'NEW SAMPLE' -> next item's note
+            continue
+        # ---- block starts
+        name, is_start = "", False
+        hv = _HDR_SEASONING_VAL.match(ln)
+        if hv:
+            name, is_start = hv.group(1).strip(" .,;"), True
+            headed += 1
+        elif _HDR_SEASONING.match(ln):
+            is_start = True               # bare header: name is the next line
+            headed += 1
+            if i < n:
+                nxt = lines[i].strip()
+                if nxt and not _GLOBAL_FIELD_RE.match(nxt) \
+                        and not _BLOCK_COMMENT.match(nxt):
+                    name = nxt.strip(" .,;")
+                    i += 1
+        elif _CODE_LED_LINE.match(ln):
+            name, is_start = ln.strip(" .,;"), True
+            headed += 1
+        elif _NUM_ITEM.match(ln):
+            name, is_start = _NUM_ITEM.match(ln).group(2).strip(" .,;"), True
+        elif (cur is not None and _NAME_LIKE_LINE.match(ln)
+              and len(ln.split()) <= 5 and not _SENTENCE_WORDS.search(ln)):
+            name, is_start = ln.strip(" .,;"), True
+        if is_start:
+            if name:
+                cur = {"name": name, "spec": list(pending), "qty": ""}
+                pending = []
+                blocks.append(cur)
+            continue
+        # ---- lines inside the open block
+        if cur is None:
+            remaining.append(ln)
+            continue
+        cm = _BLOCK_COMMENT.match(ln)
+        if cm:
+            if cm.group(1).strip():
+                cur["spec"].append(cm.group(1).strip())
+            continue
+        qm = _BLOCK_QTY.match(ln)
+        if qm and not cur["qty"]:
+            num, unit, rest = qm.group(1), qm.group(2).lower(), qm.group(3)
+            cur["qty"] = f"{num}{'kg' if unit == 'kg' else 'g'}"
+            rest = re.sub(r"^(?:and|with|of|[-,:])\s*", "", rest.strip(),
+                          flags=re.I)
+            if rest:
+                cur["spec"].append(rest)
+            continue
+        cur["spec"].append(ln)
+    if headed < 2:
+        return [], list(lines)
+    # A note that sits right before an item and NAMES it ('NO PH CODE -
+    # PENDING FOR REGENT SALTED EGG CODE.' then 'SALTED EGG SEASONING')
+    # belongs to that item, not to the one above.
+    def _toks(s: str) -> set:
+        return {w for w in re.findall(r"[a-z0-9]{3,}", s.lower())
+                if w not in ("seasoning", "flavour", "flavor", "the", "and",
+                             "for", "code", "with")}
+    for k in range(len(blocks) - 1):
+        here, nxt = blocks[k], blocks[k + 1]
+        if here["spec"] and len(_toks(here["spec"][-1]) & _toks(nxt["name"])) >= 2:
+            nxt["spec"].insert(0, here["spec"].pop())
+    return blocks, remaining
 
 
 def _extract_shipto(a: Ask, body: list[str]) -> None:
@@ -619,6 +768,15 @@ def parse_ask(text: str) -> Ask:
             ln, flags=re.IGNORECASE)
         _split.extend(p.strip() for p in parts if p.strip())
     lines = _split
+    # Alex's multi-item form (03-Sep, Apacific): split repeated 'SEASONING
+    # NAME:' / code-led item blocks FIRST, each with its own comment and qty;
+    # only global field lines stay behind for the passes below.
+    _blocks, lines = _form_blocks(lines)
+    if _blocks:
+        a.flavours = _blocks
+        a.structured = True
+        a.form_mode = True
+    lines = lines or [""]
     # Section headers ('Seasoning name' / 'Qty of sample') own the lines
     # beneath them until the next labelled line — Alex's standard form.
     flat: list[str] = []
@@ -914,6 +1072,9 @@ def parse_ask(text: str) -> Ask:
     kept_body: list[str] = []
     for line in body:
         s = line.strip().rstrip(".")
+        if a.form_mode:
+            kept_body.append(line)    # items ARE the form blocks; the rest is comment
+            continue
         if (a.items and _CODE_RE.fullmatch(s)
                 and not _CODE_RE.search(a.items[-1])):
             a.items[-1] = f"{a.items[-1]} {s.upper()}"
@@ -996,7 +1157,11 @@ a distinct name+spec pair — the renderer builds the 'Seasoning name:' /
 Mobile / Phone / WhatsApp / Tel lines are the contact and 'Company:' names
 the customer - never leave them inside "ask". A line you extracted into a
 key (need_by, contact, addr, budget...) must not ALSO remain inside "ask".
-'X - no specific code' means no preferred code for X, not a second item."""
+'X - no specific code' means no preferred code for X, not a second item.
+If he wrote repeated 'SEASONING NAME:' / 'COMMENT:' / '50G ...' blocks, or
+code-led lines like 'S-K9U15-08 TAKOYAKI SEASONING', keep every one of those
+lines inside "ask" verbatim and in order - the parser splits them into
+items itself; never merge, renumber, reorder or drop the headers."""
 
 _UPDATE_PROMPT = """A salesperson is editing a draft sample request by chatting.
 Current draft:
@@ -2278,18 +2443,25 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
     ship_intent = bool(ask.delivery or ask.delivery_addr
                        or ask.overrides.get("addr") or ask.overrides.get("attn")
                        or ask.overrides.get("contact"))
+    # Receiver/contact from history ONLY when the sample goes to the
+    # customer's own place. A stated destination ('Lala move to Geylang')
+    # is somewhere else - the last request's Cavite contact would be wrong
+    # there (Alex 03-Sep) - so those slots are asked instead. A history
+    # value must also look like a PERSON: an SR page once held a whole
+    # sentence in its attn field.
+    hist_ok = ship_intent and not ask.delivery_addr
     attn = pick("attn", ask.overrides.get("attn"),
-                *([("their last request", ship["attn"]),
-                   ("remembered", mem_get(customer, "attn")),
+                *([("their last request", _person(ship["attn"])),
+                   ("remembered", _person(mem_get(customer, "attn"))),
                    ("customer master",
-                    (master_rec or {}).get("receiving_person", ""))]
-                  if ship_intent else []))
+                    _person((master_rec or {}).get("receiving_person", "")))]
+                  if hist_ok else []))
     contact = pick("contact", ask.overrides.get("contact"),
                    *([("their last request", ship["contact"]),
                       ("remembered", mem_get(customer, "contact")),
                       ("customer master",
                        (master_rec or {}).get("receiver_number", ""))]
-                     if ship_intent else []))
+                     if hist_ok else []))
     # A stated delivery address IS the ship-to — explicit always wins over
     # the customer-master default (Alex 02-Sep: courier-to-Geylang must not
     # sit next to the Dhaka master address).
@@ -2433,7 +2605,13 @@ def render_reqnote(draft: dict) -> str:
         lines.append(f"Comment: {comment_lead}".rstrip())
         lines.append("")
         for i, f in enumerate(ask.flavours, 1):
-            lines.append(f"{i}. {f['name'].upper()} - {qty_str}")
+            # A block with its OWN quantity (Alex's form: '50G ...' under each
+            # item) shows it in its header; the others use the request
+            # default - so 50g and 100g items never share one figure.
+            _bq = f.get("qty") or ""
+            _sets = f"{d['sets']} set" + ("s" if d["sets"] != 1 else "")
+            _hdr_qty = f"{_bq} x {_sets}" if _bq else qty_str
+            lines.append(f"{i}. {f['name'].upper()} - {_hdr_qty}")
             lines.extend(s for s in f["spec"] if s.strip())
             lines.append("")
         ask_txt = _filter_ask_text(ask.ask_text, ask.flavours, no_code)

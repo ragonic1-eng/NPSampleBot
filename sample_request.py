@@ -904,6 +904,13 @@ def parse_ask(text: str) -> Ask:
     # (Alex 02-Sep: 'Smoke cheese / SPICY TOMATO SEASONING repeated twice?').
     # A bare product code on the line AFTER an item belongs to that item
     # ('SPICY TOMATO SEASONING' / 'S-31P26-05-04' → one seasoning).
+    # Ship-to block and numbered flavour blocks FIRST, bare items LAST. The
+    # bare-item pass (02-Sep) used to run before these and ate the very lines
+    # they need - the phone/name mailing block, and the flavour-1 name that
+    # the 'numbering starts at 2' recovery looks for - which is what broke
+    # the Pran 3-flavour regressions (03-Sep repair).
+    _extract_shipto(a, body)
+    _structure_body(a, body)
     kept_body: list[str] = []
     for line in body:
         s = line.strip().rstrip(".")
@@ -921,9 +928,6 @@ def parse_ask(text: str) -> Ask:
             continue
         kept_body.append(line)
     body[:] = kept_body
-
-    _extract_shipto(a, body)
-    _structure_body(a, body)
     a.ask_text = "\n".join(body).strip()
     # Codes/qty are scanned over the FULL original text, not the post-
     # structure ask_text — structuring moves flavour blocks out of ask_text,

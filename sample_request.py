@@ -2163,6 +2163,21 @@ async def screenshot_sr(session, sr_code: str, section: int | None = None):
 
 # ------------------------------------------------------------ draft object
 
+def compliance_for(ask) -> tuple[str, str]:
+    """(value, source) for Compliance - a REGULATORY field, so: ask, don't
+    assume (Alex 03-Sep). Only what he states in THIS request counts. Never
+    an old SR's value, never the customer's country, and NOT memory either:
+    memory was written from every submit, so a guessed value that slipped
+    through one tap would have been 'remembered' and re-proposed forever.
+    Same contract as build_draft's pick(): explicit -> 'you'; a mentioned-
+    but-unreadable value -> 'confirm' (please confirm); else blank -> asked."""
+    if ask.overrides.get("compliance"):
+        return ask.overrides["compliance"], "you"
+    if "compliance" in ask.hints:
+        return "", "confirm"
+    return "", ""
+
+
 def build_draft(user_id: int, text: str, force_customer: str = "",
                 force_sr_code: str = "") -> dict:
     """Everything needed to render + submit. Fetches the SR page once for
@@ -2240,10 +2255,8 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
 
     bag = pick("bag", ask.overrides.get("bag"),
                ("remembered", mem_get(customer, "bag")))
-    compliance = pick("compliance", ask.overrides.get("compliance"),
-                      ("remembered", mem_get(customer, "compliance")),
-                      ("their last request", ship["compliance"]),
-                      ("their country", d["country"]))
+    # Compliance: ask, don't assume - see compliance_for().
+    compliance, src["compliance"] = compliance_for(ask)
     budget = pick("budget", ask.overrides.get("budget"),
                   ("remembered", mem_get(customer, "budget")),
                   (d.get("budget_src") or "history", d["budget"]))
@@ -2589,6 +2602,9 @@ def remember_submitted(draft: dict) -> None:
     the 'learn from every correction' loop: whatever Alex overrode this
     time is proposed next time."""
     c = draft["customer"]
-    for key in ("bag", "budget", "compliance", "attn", "contact", "addr"):
+    # compliance deliberately NOT remembered - it is asked every time (Alex
+    # 03-Sep: 'ask, don't assume'); a remembered value would only re-propose
+    # a regulatory claim he may never have checked.
+    for key in ("bag", "budget", "attn", "contact", "addr"):
         if draft.get(key):
             mem_set(c, key, draft[key])

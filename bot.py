@@ -10004,6 +10004,7 @@ def _sr_draft_text(draft: dict) -> str:
     # Smart-fill scoreboard for the standard request form: what he gave,
     # what the bot filled in for him, and what nobody knows yet.
     _fields = dict(draft.get("fields") or {})
+    draft["gaps"] = []
     if _fields:
         # Re-derive the fields a button or reply can change AFTER the
         # build, or the list goes stale ('Still missing: Address' right
@@ -10014,17 +10015,32 @@ def _sr_draft_text(draft: dict) -> str:
             "Receiver name": draft.get("attn", ""),
             "Contact": draft.get("contact", ""),
             "Address": draft.get("addr", ""),
+            "Target base": a.base,
+            "Budget": draft.get("budget", ""),
+            "Compliance": draft.get("compliance", ""),
         }
+        _srckey = {"Receiver name": "attn", "Address": "addr",
+                   "Contact": "contact", "Expected send by": "need_by",
+                   "Budget": "budget", "Compliance": "compliance",
+                   "Target base": "base", "Send method": "delivery"}
+        # Sync in BOTH directions: a slot filled after the build stops
+        # showing as missing, and a value the rep removed (🚫 / 'no
+        # compliance') stops showing as 'I filled in for you'.
         for _k, _v in _live.items():
-            if _k in _fields and _v and not _fields[_k]:
-                _fields[_k] = src.get(
-                    {"Receiver name": "attn", "Address": "addr",
-                     "Contact": "contact", "Expected send by": "need_by"}
-                    .get(_k, ""), "you") or "you"
+            if _k not in _fields:
+                continue
+            _s = src.get(_srckey.get(_k, ""), "")
+            if _v:
+                _fields[_k] = _s or "you"
+            elif _s != "confirm":
+                _fields[_k] = ""      # cleared by the rep, or never known
         if a.delivery and a.delivery.lower().startswith("hand"):
             _fields.pop("Contact", None)   # no phone needed for a desk drop
         _filled = [(k, v) for k, v in _fields.items() if v and v != "you"]
         _gap = [k for k, v in _fields.items() if not v]
+        # Remember what we just asked for - on_sr_text files a bare reply
+        # ('potato chip') into the one open slot instead of searching it.
+        draft["gaps"] = _gap
         if _filled:
             lines.append("\n🤖 <b>I filled in for you:</b> " + ", ".join(
                 f"{h(k)} <i>({h(v)})</i>" for k, v in _filled))
@@ -10099,6 +10115,21 @@ def _sr_draft_kb(draft: dict):
         if draft.get("addr"):
             drow.append(("📦 Courier to that address", f"srb:dlv:{t}:last"))
         rows.append(drow)
+    # One-tap answers for an open 'Target base' slot (the APP_BASES presets)
+    # and one-tap removal of a value the bot proposed but the rep never gave
+    # (Alex 03-Sep: Compliance came from an old request with no way to take
+    # it back). Both appear only when relevant, so the bar stays short.
+    if "Target base" in (draft.get("gaps") or []):
+        _b = [(b, f"srb:base:{t}:{b}") for b in APP_BASES]
+        for i in range(0, len(_b), 3):
+            rows.append(_b[i:i + 3])
+    _src = draft.get("src") or {}
+    _clr = [(lbl, f"srb:clr:{t}:{f}")
+            for f, lbl in (("compliance", "🚫 No compliance"),
+                           ("budget", "🚫 No budget"))
+            if draft.get(f) and _src.get(f) not in ("you", "confirm", "")]
+    if _clr:
+        rows.append(_clr)
     rows.append([("✅ Raise it in MMS", f"srb:go:{t}"),
                  ("❌ Discard", f"srb:x:{t}")])
     return kb(rows)
@@ -10507,6 +10538,18 @@ async def _sr_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         draft["missing"] = [m for m in draft["missing"] if m != "bag"]
         await _sr_show(update, draft, srq)
         return
+    if verb == "base":
+        draft["ask"].base = arg
+        draft.setdefault("src", {})["base"] = "you"
+        draft.setdefault("fields", {})["Target base"] = "you"
+        await _sr_show(update, draft, srq)
+        return
+    if verb == "clr":
+        # The rep removes a value the bot proposed - his word, never
+        # re-derived (apply_fields pins src[field] = 'you').
+        srq.apply_fields(draft, {}, clear=[arg])
+        await _sr_show(update, draft, srq)
+        return
     if verb == "go":
         await _sr_do_submit(update, draft, token, srq)
         return
@@ -10712,6 +10755,12 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _SR_ACTIVE.pop(user.id, None)
         await _sr_build_with_customer(update, draft, name, srq)
         raise ApplicationHandlerStop
+    # The card just asked for ONE field and this is a bare answer to it -
+    # file it before the LLM can call it 'unrelated' (which is exactly what
+    # sent Alex's 'potato chip' to the product search, 03-Sep).
+    if srq.answer_gap(draft, text):
+        await _sr_show(update, draft, srq)
+        raise ApplicationHandlerStop
     upd = await srq.llm_update(draft, text)
     if upd is None:
         # LLM UNAVAILABLE (API down / no credits) — the deterministic
@@ -10749,7 +10798,8 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _sr_show(update, new, srq)
         raise ApplicationHandlerStop
     # modify (possibly with a clarifying question)
-    srq.apply_fields(draft, upd.get("fields") or {})
+    srq.apply_fields(draft, upd.get("fields") or {},
+                     clear=upd.get("clear") or [])
     if upd.get("question"):
         await send(update, f"❓ {h(str(upd['question']))}", with_footer=False)
         raise ApplicationHandlerStop

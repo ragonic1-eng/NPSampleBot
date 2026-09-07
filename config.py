@@ -100,9 +100,12 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
 # keys on Railway 07-Sep after the Anthropic balance ran dry and /sr fell
 # back to rules-only parsing. Order is tried left→right; a provider with
 # no key is skipped. Both MiniMax and Groq speak the OpenAI chat format.
-# Groq first by default: Alex's MiniMax key (sk-…, 51 chars) is rejected
-# by both MiniMax hosts (error 1004) — platform keys are JWTs. Once a
-# valid MiniMax key is in place, set LLM_PROVIDERS=minimax,groq,claude.
+# Groq first by default. Alex's MiniMax key is a coneverse.com reseller
+# token (sk-…, 51 chars) that only works against that gateway — Railway
+# sets MINIMAX_BASE_URL=https://infistar.ai/v1; MiniMax's own hosts reject
+# it with 1004. Measured 07-Sep-2026 on the real /sr corpus: Groq
+# gpt-oss-120b 7/7 parsed in 1-2 s; MiniMax-M2 via gateway 6/7 in 8-45 s.
+# Flip with LLM_PROVIDERS=minimax,groq,claude if MiniMax must lead.
 LLM_PROVIDERS = [p.strip().lower() for p in
                  os.getenv("LLM_PROVIDERS", "groq,minimax,claude,ollama").split(",")
                  if p.strip()]

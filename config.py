@@ -96,6 +96,24 @@ DISPATCH_REMINDER_CHAT_ID = os.getenv("DISPATCH_REMINDER_CHAT_ID", "626790042").
 # candidates and ~3x cheaper than Sonnet ($1/$5 input/output per Mtok
 # vs Sonnet's $3/$15). Override via env if a future task needs Sonnet.
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
+# V1.17.x — provider chain for ai._ask. Alex supplied MiniMax (and Groq)
+# keys on Railway 07-Sep after the Anthropic balance ran dry and /sr fell
+# back to rules-only parsing. Order is tried left→right; a provider with
+# no key is skipped. Both MiniMax and Groq speak the OpenAI chat format.
+# Groq first by default: Alex's MiniMax key (sk-…, 51 chars) is rejected
+# by both MiniMax hosts (error 1004) — platform keys are JWTs. Once a
+# valid MiniMax key is in place, set LLM_PROVIDERS=minimax,groq,claude.
+LLM_PROVIDERS = [p.strip().lower() for p in
+                 os.getenv("LLM_PROVIDERS", "groq,minimax,claude,ollama").split(",")
+                 if p.strip()]
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "").strip()
+MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1").rstrip("/")
+MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+# llama-3.3-70b was retired on Groq (404). gpt-oss-120b is the strongest
+# model the account lists (verified via GET /models, 07-Sep-2026).
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 # V1.17.1 — local_llm.py runs the taste/category enrichment on the PC's CPU

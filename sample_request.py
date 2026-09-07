@@ -1305,10 +1305,46 @@ async def llm_parse(text: str) -> dict | None:
             _PARSE_PROMPT.format(text=text), max_tokens=1000)
         d = _json_from(out)
         if d and d.get("customer") and d.get("ask"):
-            return d
+            return _ground(d, text)
     except Exception as e:  # noqa: BLE001
         log.warning("SR llm_parse failed: %s", e)
     return None
+
+
+def _ground(d: dict, text: str) -> dict:
+    """The not-assume rule, applied to the MODEL (Alex 02-Sep: 'help as
+    much as possible but not assume'). A language model is more prone to
+    confident invention than the rules were, so every extracted value
+    must be traceable to the rep's own words: a number must appear in
+    the text; a phrase must share a distinctive token (fuzzy, so
+    'Phlippines' → 'Philippines' still passes). Anything ungrounded is
+    dropped and logged — the bot then asks instead of guessing."""
+    from rapidfuzz import fuzz
+    low = " " + " ".join(text.lower().split()) + " "
+    toks = set(re.findall(r"[a-z0-9]+", low))
+
+    def grounded(val) -> bool:
+        s = str(val).strip().lower()
+        if not s:
+            return False
+        for n in re.findall(r"\d+(?:\.\d+)?", s):
+            if n in low:
+                return True
+        for t in re.findall(r"[a-z]{4,}", s):
+            if t in toks or any(fuzz.ratio(t, u) >= 80 for u in toks
+                                if len(u) >= 4):
+                return True
+        return False
+
+    for key in ("qty_g", "sets", "bag", "budget", "compliance", "attn",
+                "contact", "addr", "need_by", "base_code"):
+        v = d.get(key)
+        if v in (None, "", [], 0):
+            continue
+        if not grounded(v):
+            log.info("SR llm_parse: dropped ungrounded %s=%r", key, v)
+            d[key] = None
+    return d
 
 
 async def llm_update(draft: dict, text: str) -> dict | None:

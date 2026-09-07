@@ -97,48 +97,111 @@ async def rerank_seasonings(
         return candidates, tin, tout
 
 
-async def _ask(prompt: str, max_tokens: int = 200, http_timeout: float = 20) -> tuple[str, int, int]:
-    """Try Claude, fall back to Ollama. Returns (text, input_tokens, output_tokens).
+import re as _re
 
-    Claude call is wrapped in asyncio.to_thread so we don't block the event loop.
+# MiniMax M2-family models return their reasoning inside <think>…</think>
+# in the content. Callers extract JSON with a greedy brace regex, so a
+# think block containing braces would poison the parse — strip it first.
+_THINK_RE = _re.compile(r"<think>.*?</think>\s*", _re.S | _re.I)
+
+
+def _compat_payload(model: str, prompt: str, max_tokens: int) -> dict:
+    """Build the chat body; reasoning models get extra headroom.
+
+    Groq's gpt-oss models bill their hidden reasoning against the same
+    max_tokens as the answer, and at default effort a 600-token /sr
+    message burned the whole 1000-token budget thinking, so the JSON
+    came back truncated (3 of 6 corpus parses failed on 07-Sep-2026).
+    Low effort is plenty for extraction; the headroom keeps the answer
+    from being cut off even when the model thinks longer than expected.
     """
-    client = _claude()
-    if client is not None:
-        try:
-            msg = await asyncio.to_thread(
-                lambda: client.messages.create(
-                    model=config.CLAUDE_MODEL,
-                    max_tokens=max_tokens,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            )
-            text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
-            tin = getattr(msg.usage, "input_tokens", 0) or 0
-            tout = getattr(msg.usage, "output_tokens", 0) or 0
-            return text, tin, tout
-        except Exception as e:  # noqa: BLE001
-            log.warning("Claude failed, falling back to Ollama: %s", e)
+    body = {"model": model, "max_tokens": max_tokens, "temperature": 0,
+            "messages": [{"role": "user", "content": prompt}]}
+    if "gpt-oss" in model or "qwen3" in model:
+        body["max_tokens"] = max_tokens + 2000
+        body["reasoning_effort"] = "low"
+        body["include_reasoning"] = False
+    return body
 
-    try:
-        async with httpx.AsyncClient(timeout=http_timeout) as http:
-            r = await http.post(
-                f"{config.OLLAMA_URL}/api/generate",
-                json={
-                    "model": config.OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            return (
-                data.get("response", ""),
-                int(data.get("prompt_eval_count", 0) or 0),
-                int(data.get("eval_count", 0) or 0),
-            )
-    except Exception as e:  # noqa: BLE001
-        log.warning("Ollama failed: %s", e)
-        return "", 0, 0
+
+async def _openai_compat(base_url: str, api_key: str, model: str, prompt: str,
+                         max_tokens: int, http_timeout: float,
+                         label: str) -> tuple[str, int, int]:
+    """One call against an OpenAI-style /chat/completions endpoint
+    (MiniMax, Groq). Raises on any failure so the chain moves on."""
+    async with httpx.AsyncClient(timeout=max(http_timeout, 45)) as http:
+        r = await http.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json=_compat_payload(model, prompt, max_tokens),
+        )
+        r.raise_for_status()
+        data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    text = ((choice.get("message") or {}).get("content") or "")
+    text = _THINK_RE.sub("", text).strip()
+    usage = data.get("usage") or {}
+    log.info("%s ok (%s): %s in / %s out", label, model,
+             usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"))
+    return text, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+
+
+async def _ask(prompt: str, max_tokens: int = 200, http_timeout: float = 20) -> tuple[str, int, int]:
+    """Ask the first working provider in config.LLM_PROVIDERS
+    (default minimax → groq → claude → ollama). Returns
+    (text, input_tokens, output_tokens); ('', 0, 0) if every provider
+    failed — callers treat that as 'LLM unavailable' and use rules.
+
+    Claude's SDK call is wrapped in asyncio.to_thread so it doesn't block
+    the event loop; the OpenAI-style providers are async httpx.
+    """
+    for prov in config.LLM_PROVIDERS:
+        try:
+            if prov == "minimax" and config.MINIMAX_API_KEY:
+                return await _openai_compat(
+                    config.MINIMAX_BASE_URL, config.MINIMAX_API_KEY,
+                    config.MINIMAX_MODEL, prompt, max_tokens, http_timeout,
+                    "MiniMax")
+            if prov == "groq" and config.GROQ_API_KEY:
+                return await _openai_compat(
+                    config.GROQ_BASE_URL, config.GROQ_API_KEY,
+                    config.GROQ_MODEL, prompt, max_tokens, http_timeout,
+                    "Groq")
+            if prov == "claude":
+                client = _claude()
+                if client is None:
+                    continue
+                msg = await asyncio.to_thread(
+                    lambda: client.messages.create(
+                        model=config.CLAUDE_MODEL,
+                        max_tokens=max_tokens,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                )
+                text = "".join(b.text for b in msg.content
+                               if getattr(b, "type", "") == "text")
+                tin = getattr(msg.usage, "input_tokens", 0) or 0
+                tout = getattr(msg.usage, "output_tokens", 0) or 0
+                return text, tin, tout
+            if prov == "ollama":
+                async with httpx.AsyncClient(timeout=http_timeout) as http:
+                    r = await http.post(
+                        f"{config.OLLAMA_URL}/api/generate",
+                        json={"model": config.OLLAMA_MODEL, "prompt": prompt,
+                              "stream": False},
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                    return (
+                        _THINK_RE.sub("", data.get("response", "")).strip(),
+                        int(data.get("prompt_eval_count", 0) or 0),
+                        int(data.get("eval_count", 0) or 0),
+                    )
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s failed, trying next provider: %s", prov, str(e)[:200])
+    log.warning("all LLM providers failed (%s)", ",".join(config.LLM_PROVIDERS))
+    return "", 0, 0
 
 
 # ---------- Sample-master taste blurbs (V1.0.2 /updatesamplelist) ----------

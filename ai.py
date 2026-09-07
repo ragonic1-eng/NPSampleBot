@@ -121,6 +121,14 @@ def _compat_payload(model: str, prompt: str, max_tokens: int) -> dict:
         body["max_tokens"] = max_tokens + 2000
         body["reasoning_effort"] = "low"
         body["include_reasoning"] = False
+    elif "minimax" in model.lower():
+        # MiniMax M2.x (via Alex's coneverse/infistar gateway, 07-Sep-2026)
+        # thinks for thousands of tokens: with max_tokens=4000 and no
+        # split, M2 still hit finish=length with EMPTY content after 40 s.
+        # reasoning_split moves the thinking out of the answer budget —
+        # same message then finished in 9 s with clean JSON.
+        body["max_tokens"] = max_tokens + 3000
+        body["reasoning_split"] = True
     return body
 
 
@@ -161,7 +169,8 @@ async def _ask(prompt: str, max_tokens: int = 200, http_timeout: float = 20) -> 
             if prov == "minimax" and config.MINIMAX_API_KEY:
                 return await _openai_compat(
                     config.MINIMAX_BASE_URL, config.MINIMAX_API_KEY,
-                    config.MINIMAX_MODEL, prompt, max_tokens, http_timeout,
+                    config.MINIMAX_MODEL, prompt, max_tokens,
+                    max(http_timeout, 90.0),  # M2.x can take 10-40 s
                     "MiniMax")
             if prov == "groq" and config.GROQ_API_KEY:
                 return await _openai_compat(

@@ -5,6 +5,11 @@ rapidfuzz==3.10.1
 python-dotenv==1.0.1
 anthropic==0.39.0
 httpx==0.27.2
+# Headless Chromium for the /sr screenshots (post-submit proof + new-customer
+# preview). Removed by mistake with the AWB scrape (e5bc6ed) — the Dockerfile
+# still runs `playwright install chromium`, but without this package the
+# import fails and screenshot_sr() silently returns None on Railway.
+playwright==1.49.0
 requests==2.32.3
 beautifulsoup4==4.12.3
 pytesseract==0.3.13

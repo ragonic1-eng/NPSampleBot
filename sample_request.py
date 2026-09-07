@@ -139,6 +139,7 @@ class Ask:
     # Alex 02-Sep: never fabricate 'No prefer code.' — say it only when he
     # actually wrote it, and then only inside the Comment block.
     no_prefer_code: bool = False
+    qty_text: str = ""      # the rep's own 'Qty:' phrasing ('5kg powder only')
     # Alex 02-Sep: delivery METHOD and delivery ADDRESS are two separate
     # inputs. A stated delivery address is an EXPLICIT ship-to and must
     # replace the derived customer-master address, never sit beside it
@@ -259,8 +260,21 @@ _HDR_ADDRESS = re.compile(
     re.IGNORECASE)
 # 'Seasoning name: 1. Spicy Korean Gochujang 2. Korean Cream Cheese ...'
 # — the whole list on the header line, numbered inline.
+# 'Seasoning name: 1. X 2. Y' (numbered) OR 'seasoning name:5kg Salted Egg
+# Seasoning' (a single item, possibly led by its quantity). The old form
+# only accepted the numbered shape, so the single-item line kept its
+# label and became an item called 'seasoning name:5kg …' (Alex 04-Sep).
 _HDR_SEASONING_INLINE = re.compile(
-    r"^seasoning\s*names?\s*[:\-]?\s*(?=\d+[.)])(.+)$", re.IGNORECASE)
+    r"^seasoning\s*names?\s*[:\-]\s*(.+)$", re.IGNORECASE)
+# 'Qty: 5kg powder only' — the rep's own quantity phrasing, kept verbatim.
+_QTY_INLINE = re.compile(
+    r"^(?:qty|quantity)(?:\s*of\s*samples?)?\s*[:\-]\s*(.+)$", re.IGNORECASE)
+# 'No modifications required' / 'same as current code' / 'as is' — the
+# word 'modif…' inside a NEGATION must not turn a repeat into a Modify.
+_NO_MOD_RE = re.compile(
+    r"\b(?:no|without|not\s+any)\s+(?:modif\w*|change\w*|adjust\w*)|"
+    r"\bsame\s+(?:as\s+)?(?:the\s+)?(?:current|existing)\s+(?:code|formula|recipe)|"
+    r"\bas[\s-]is\b|\bno\s+change\b", re.IGNORECASE)
 _INLINE_NUMBERED = re.compile(r"\d+[.)]\s*")
 # Any field header the form uses — if the message STARTS with one, there is
 # no customer on the head line and we must not invent one from its words.
@@ -339,7 +353,16 @@ _DELIVERY_ADDR_LINE = re.compile(
 # method='Courier' + address='Geylang'
 _METHOD_WORD = re.compile(
     r"\b(courier|self.?collect(?:ion)?|hand.?carry|dhl|fedex|ups|deliver\w*|"
-    r"collect\w*|lala\s*move|lalamove|grab|gojek)\b", re.IGNORECASE)
+    r"collect\w*|lala\s*move|lalamove|grab(?:\s*express)?|gojek|ninja\s*van|"
+    r"qxpress|aramex|tnt|sf\s*express)\b", re.IGNORECASE)
+# Canonical spelling for a courier word found in the rep's text.
+_COURIER_NAME = {"lalamove": "Lalamove", "lala move": "Lalamove",
+                 "grab": "Grab", "grab express": "GrabExpress",
+                 "gojek": "Gojek", "ninja van": "Ninja Van",
+                 "ninjavan": "Ninja Van", "dhl": "DHL", "fedex": "Fedex",
+                 "ups": "UPS", "qxpress": "Qxpress", "aramex": "Aramex",
+                 "tnt": "TNT", "sf express": "SF Express",
+                 "courier": "Courier"}
 _METHOD_DEST = re.compile(
     r"\b(?:courier|deliver\w*|send|ship|collect\w*|move|lala\s*move|lalamove|"
     r"grab|drop(?:\s*off)?)\b[^,]*?\bto\s+(.+)$",
@@ -789,11 +812,39 @@ def parse_ask(text: str) -> Ask:
     for idx, ln in enumerate(lines):
         im = _HDR_SEASONING_INLINE.match(ln)
         if im:
-            for part in _INLINE_NUMBERED.split(im.group(1)):
-                part = part.strip(" .,;")
-                if part:
+            val = im.group(1).strip()
+            if re.match(r"\d+[.)]", val):
+                parts = [p.strip(" .,;") for p in _INLINE_NUMBERED.split(val)]
+            else:
+                parts = [val.strip(" .,;")]
+            for part in parts:
+                if not part:
+                    continue
+                # '5kg Salted Egg Seasoning' → item 'Salted Egg Seasoning'
+                # with its own quantity, never a name that starts with 5kg
+                # No separator here, so the split can only be made on a
+                # known unit word — '5kg Salted Egg Seasoning' must peel
+                # '5kg', not '5kg Salted'. (The open-vocabulary amount rule
+                # still applies everywhere a dash/colon separates the two.)
+                lead = re.match(
+                    r"^(\d+(?:\.\d+)?\s*(?:kgs?|g|gm|grams?|pkts?|packets?|"
+                    r"pcs?|pieces?|bottles?|sets?|bags?|tins?|sachets?|"
+                    r"boxes|box|cartons?))\s+(.+)$", part, re.I)
+                if lead and not _CODE_RE.match(part):
+                    a.items.append(lead.group(2).strip())
+                    a.item_qty.append((_norm_qty(lead.group(1)), lead.group(2).strip()))
+                else:
                     a.items.append(part)
             section = "seasoning"   # any further lines beneath still count
+            continue
+        qm_inline = _QTY_INLINE.match(ln)
+        if qm_inline:
+            a.qty_text = qm_inline.group(1).strip(" .")
+            m_amt = _QTY_RE.search(a.qty_text)
+            if m_amt and a.qty_g is None:
+                n_ = float(m_amt.group(1))
+                a.qty_g = int(n_ * 1000) if m_amt.group(2).lower() == "kg" else int(n_)
+            section = ""
             continue
         if _HDR_SEASONING.match(ln):
             section = "seasoning"
@@ -1068,6 +1119,29 @@ def parse_ask(text: str) -> Ask:
     # the 'numbering starts at 2' recovery looks for - which is what broke
     # the Pran 3-flavour regressions (03-Sep repair).
     _extract_shipto(a, body)
+    # Delivery sanity (Alex 04-Sep, Apacific): 'Address: lala move via
+    # Geylang' + 'Send method: geylang'. The courier name sat in the
+    # address field and a place sat in the method field. If the 'address'
+    # is really a courier line (courier word, no digits/street) treat it
+    # as the METHOD; a place in the method field becomes the destination.
+    _addr_o = a.overrides.get("addr", "")
+    _cw = _METHOD_WORD.search(_addr_o)
+    if _cw and not re.search(r"\d|\b(road|rd|street|st|jalan|blk|block|"
+                              r"ave|lane|lorong)\b", _addr_o, re.I):
+        _meth = _COURIER_NAME.get(re.sub(r"\s+", " ", _cw.group(1).lower()),
+                                  _cw.group(1).title())
+        _place = re.sub(r".*?\b(?:via|to|at)\s+", "", _addr_o, flags=re.I).strip(" .")
+        a.delivery = _meth if not a.delivery or not _METHOD_WORD.search(a.delivery) \
+            else a.delivery
+        if _place and _place.lower() != _addr_o.lower() and not a.delivery_addr:
+            a.delivery_addr = _place[:1].upper() + _place[1:]
+        a.overrides.pop("addr", None)
+    if a.delivery and not _METHOD_WORD.search(a.delivery):
+        # the 'method' is a place name ('geylang') — it's the destination
+        _pl = a.delivery.strip(" .")
+        if len(_pl.split()) <= 3 and not a.delivery_addr:
+            a.delivery_addr = _pl[:1].upper() + _pl[1:]
+        a.delivery = ""
     _structure_body(a, body)
     kept_body: list[str] = []
     for line in body:
@@ -1078,6 +1152,11 @@ def parse_ask(text: str) -> Ask:
         if (a.items and _CODE_RE.fullmatch(s)
                 and not _CODE_RE.search(a.items[-1])):
             a.items[-1] = f"{a.items[-1]} {s.upper()}"
+            continue
+        if _FIELD_HEAD.match(s):
+            # a labelled form line ('Qty: …', 'Address: …') is never an
+            # item — 'Qty: 5kg powder only' was listed as a seasoning
+            kept_body.append(line)
             continue
         if (2 <= len(s.split()) <= 6 and len(s) < 55
                 and not s.endswith((":", ","))
@@ -1791,11 +1870,15 @@ def derive_defaults(hist: list[dict], ask: Ask) -> dict:
     d["country"] = countries.most_common(1)[0][0] if countries else ""
     # request type — inferred, never defaulted (the 49% fix)
     hist_codes = {str(r.get("Product Code") or "").strip().upper() for r in hist}
-    if ask.codes and all(c in hist_codes for c in ask.codes) \
-            and not _MOD_RE.search(ask.body_text()):
+    # 'No modifications required' contains 'modif…' but means the opposite
+    # — a negated modify word is a REPEAT signal (Alex 04-Sep, Apacific).
+    body_txt = ask.body_text()
+    wants_mod = bool(_MOD_RE.search(body_txt)) and not _NO_MOD_RE.search(body_txt)
+    if ask.codes and (all(c in hist_codes for c in ask.codes)
+                      or _NO_MOD_RE.search(body_txt)) and not wants_mod:
         d["rtype"], d["rtype_label"] = "rep", "Repeat"
         d["base_code"] = ask.codes[0]
-    elif ask.codes and _MOD_RE.search(ask.body_text()):
+    elif ask.codes and wants_mod:
         d["rtype"], d["rtype_label"] = "mod", "Modify"
         d["base_code"] = ask.codes[0]
     else:
@@ -2456,12 +2539,8 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
                    ("customer master",
                     _person((master_rec or {}).get("receiving_person", "")))]
                   if hist_ok else []))
-    contact = pick("contact", ask.overrides.get("contact"),
-                   *([("their last request", ship["contact"]),
-                      ("remembered", mem_get(customer, "contact")),
-                      ("customer master",
-                       (master_rec or {}).get("receiver_number", ""))]
-                     if hist_ok else []))
+    # (contact is picked AFTER the address — see below — because a phone
+    # number from history only belongs with that history's address.)
     # A stated delivery address IS the ship-to — explicit always wins over
     # the customer-master default (Alex 02-Sep: courier-to-Geylang must not
     # sit next to the Dhaka master address).
@@ -2473,6 +2552,19 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
                    ("customer master",
                     _ok_addr((master_rec or {}).get("address", "")))]
                   if ship_intent else []))
+    # A phone number from history belongs to THAT history address. When
+    # the rep gave his own destination (Geylang, hand-carry) an old
+    # Philippine mobile is a different shipment's contact, not this one's
+    # (Alex 04-Sep, Apacific). Propose it only if the address itself came
+    # from the same history.
+    _addr_from_history = src.get("addr") in ("their last request",
+                                             "remembered", "customer master")
+    contact = pick("contact", ask.overrides.get("contact"),
+                   *([("their last request", ship["contact"]),
+                      ("remembered", mem_get(customer, "contact")),
+                      ("customer master",
+                       (master_rec or {}).get("receiver_number", ""))]
+                     if (hist_ok and _addr_from_history) else []))
     if ask.overrides.get("qty"):
         m = _QTY_RE.search(ask.overrides["qty"] + "g")
         if m:
@@ -2663,7 +2755,8 @@ def render_reqnote(draft: dict) -> str:
     # QTY: each numbered header already carries '- {qty}' for structured
     # multi-flavour notes — repeating it in the footer was Alex's 01-Sep
     # duplicate complaint. Footer QTY only when the headers don't show it.
-    if ask.item_qty:
+    if ask.item_qty and (len(ask.item_qty) > 1 or not ask.qty_text):
+        # (an explicit 'Qty:' line beats a single peeled amount — his words)
         # Per-item quantities — Alex 02-Sep: '100g - Tomato seasoning,
         # 500g - Texture improver 2', never a bare figure that reads as
         # the whole request. Items he didn't price get the default qty so
@@ -2699,6 +2792,8 @@ def render_reqnote(draft: dict) -> str:
             lines.extend(parts)
         else:
             lines.append(f"QTY: {parts[0]}")
+    elif ask.qty_text:
+        lines.append(f"QTY: {ask.qty_text}")   # the rep's own words
     elif not (ask.structured and len(ask.flavours) > 1):
         if ask.qty_each:
             lines.append(f"QTY: {qty_str} each")

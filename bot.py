@@ -9700,9 +9700,13 @@ def _sr_draft_text(draft: dict) -> str:
             return "❓ couldn't read it — tell me"
         return draft.get(key) or missing
 
-    if a.item_qty:
+    if a.item_qty and len(a.item_qty) > 1:
         qty = "; ".join(f"{q} {n}".strip() for q, n in a.item_qty)
         qty_tail = ""
+    elif a.qty_text:
+        qty, qty_tail = a.qty_text, ""      # the rep's own words
+    elif a.item_qty:
+        qty, qty_tail = f"{a.item_qty[0][0]} {a.item_qty[0][1]}".strip(), ""
     elif a.form_mode and any(f.get("qty") for f in a.flavours):
         # Multi-item form: each block carries its own amount. Summarise
         # them here ('50g x6 . 100g x2'); the note has the per-item detail.

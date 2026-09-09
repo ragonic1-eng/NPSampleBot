@@ -10096,7 +10096,7 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             import time as _clock
             ntok = _secrets.token_hex(3)
             srq.DRAFTS[ntok] = {"pending_newcust": True, "name": asked,
-                                "raw_text": draft.get("raw_text", build_text),
+                                "raw_text": draft.get("raw_text", text),
                                 "user_id": update.effective_user.id,
                                 "created_at": _clock.time(),
                                 "chat_id": (update.effective_chat.id
@@ -10122,7 +10122,7 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ptok = _secrets.token_hex(3)
         srq.DRAFTS[ptok] = {"pending_pick": True, "candidates": cands,
                             "name": asked,   # for the 'new customer' button
-                            "raw_text": draft.get("raw_text", build_text),
+                            "raw_text": draft.get("raw_text", text),
                             "user_id": update.effective_user.id,
                             "created_at": _clock.time(),
                             "chat_id": (update.effective_chat.id

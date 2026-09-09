@@ -10039,20 +10039,16 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # structured ';key: value' syntax still works silently underneath as
     # the fallback and for anyone who prefers it.
     parsed = await srq.llm_parse(text)
-    build_text = srq.parsed_to_text(parsed) if parsed else text
+    # Alex 09-Sep: build from HIS raw words (structure is his); the LLM
+    # only fills blanks, or reads the customer when the rules cannot.
+    # See sample_request.draft_from.
     try:
         draft = await asyncio.to_thread(
-            srq.build_draft, update.effective_user.id, build_text)
+            srq.draft_from, update.effective_user.id, text, parsed)
     except Exception as e:  # noqa: BLE001
         log.exception("sr build_draft failed")
         await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
         return
-    if parsed and parsed.get("need_by") and not draft.get("error"):
-        # Only if the rep actually wrote a deadline — a phantom '11 Sep'
-        # appeared on a Yusheng draft with no date in the message at all.
-        if re.search(r"\b(need|by|deadline|expected|target|asap|urgent|"
-                     r"week)\b", text, re.I):
-            draft["need_by"] = str(parsed["need_by"]).upper()
     if update.effective_chat:
         # Scope conversational edits to this chat — see on_sr_text.
         draft["chat_id"] = update.effective_chat.id
@@ -10544,12 +10540,11 @@ async def on_sr_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         raise ApplicationHandlerStop
     if action == "new_request":
         parsed = await srq.llm_parse(text)
-        build_text = srq.parsed_to_text(parsed) if parsed else text
         await send(update, "🔎 New request — assembling the draft…",
                    with_footer=False)
         try:
             new = await asyncio.to_thread(
-                srq.build_draft, user.id, build_text)
+                srq.draft_from, user.id, text, parsed)
         except Exception as e:  # noqa: BLE001
             await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
             raise ApplicationHandlerStop

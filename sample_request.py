@@ -1497,8 +1497,12 @@ def _ground(d: dict, text: str) -> dict:
         v = d.get(key)
         if v in (None, "", [], 0):
             continue
-        if not grounded(v) or (key == "addr" and _ATTN_LINE.match(str(v))):
-            # an 'Attention: Mr Sajib' line is a receiver, never an address
+        if not grounded(v) or (key == "addr" and (
+                _ATTN_LINE.match(str(v)) or _CODE_TOKEN.search(str(v))
+                or not _looks_like_address(str(v)))):
+            # an 'Attention: Mr Sajib' line is a receiver, never an address;
+            # 'CORN BBQ SEASONING S-B8SL1 - Reduce salt by 20% 200g' is a
+            # seasoning line the model mislabelled (Pran, 09-Sep)
             log.info("SR llm_parse: dropped ungrounded %s=%r", key, v)
             d[key] = None
     return d
@@ -1773,6 +1777,48 @@ def answer_gap(draft: dict, text: str) -> str:
                          ("need-by", draft.get("need_by")))
                         if not val]
     return label
+
+
+_DEADLINE_WORDS = re.compile(
+    r"\b(need|by|deadline|expected|target|asap|urgent|week)\b", re.IGNORECASE)
+
+
+def draft_from(user_id: int, text: str, parsed: dict | None) -> dict:
+    """The one entry point cmd_sr uses. Alex 09-Sep ("same input and your
+    output is shitier than ever"): the draft was being built from the
+    LLM's PARAPHRASE of his message (parsed_to_text), so section headers
+    and item lines came back reordered and the two-section form never
+    triggered live. Now:
+      1. build from HIS raw words - structure is always his;
+      2. only if the rules could not resolve the customer, fall back to
+         the LLM's reading of the whole message (casual one-liners:
+         'haritage, repeat the mala crawfish ...');
+      3. then let the LLM fill ONLY fields the rules left blank, values
+         already grounded in his words by _ground()."""
+    draft = build_draft(user_id, text)
+    if draft.get("error") == "ambiguous" and parsed and parsed.get("customer"):
+        alt = build_draft(user_id, parsed_to_text(parsed))
+        if not alt.get("error"):
+            return alt
+    if parsed and not draft.get("error"):
+        fills = {k: v for k, v in parsed.items()
+                 if k in ("bag", "budget", "compliance", "attn", "contact", "addr")
+                 and v and not draft.get(k)}
+        if parsed.get("need_by") and _DEADLINE_WORDS.search(text) \
+                and draft.get("src", {}).get("need_by") != "you":
+            fills["need_by"] = str(parsed["need_by"]).upper()
+        d = draft["derived"]
+        if parsed.get("base_code") and not d.get("base_code") \
+                and _CODE_ONLY.match(str(parsed["base_code"])):
+            fills["base_code"] = parsed["base_code"]
+            if parsed.get("rtype") in ("rep", "mod"):
+                fills["rtype"] = parsed["rtype"]
+        if fills:
+            apply_fields(draft, fills)
+            # apply_fields stamps 'you' (his words, read by the model) and
+            # recomputes 'missing'; need-by stays a proposal if untouched
+    return draft
+
 
 
 def parsed_to_text(parsed: dict) -> str:

@@ -9730,9 +9730,16 @@ def _sr_draft_text(draft: dict) -> str:
                 else f"{draft['need_by']}  (no date read — until box empty)")
     else:
         need = "❓ tap 📅 to pick a date"
+    _type = d["rtype_label"] + (f" — base {d['base_code']}" if d["base_code"] else "")
+    if d.get("base_code_unknown"):
+        _type += (" ⚠ not a product in MMS — check the code (reply "
+                  "“base: S-…” or “new”)")
+    _other_unknown = [c for c in (d.get("unknown_codes") or [])
+                      if c != (d.get("base_code") or "").upper()]
+    if _other_unknown:
+        _type += " ⚠ not in MMS: " + ", ".join(_other_unknown)
     rows = [
-        ("Type", d["rtype_label"]
-         + (f" — base {d['base_code']}" if d["base_code"] else "")),
+        ("Type", _type),
         ("Qty", qty + qty_tail),
         ("Bag", val_or("bag", "❓ NP or empty?") + tail("bag")),
         ("Budget", val_or("budget", "—") + tail("budget")),
@@ -9921,6 +9928,15 @@ async def _sr_do_submit(update, draft, token, srq) -> None:
                    "🛑 No existing SR for this customer — creating brand-new "
                    "SRs isn't wired up yet. Raise the empty SR once in MMS, "
                    "then this works for them.")
+        return
+    if draft["derived"].get("base_code_unknown"):
+        # Pran 10-Sep: MMS silently refuses a Repeat/Modify whose base
+        # code is not a product it knows - nothing is written.
+        await send(update,
+                   f"🛑 <b>{h(draft['derived']['base_code'])}</b> isn't a "
+                   "product in MMS, so MMS would refuse this request. "
+                   "Reply <code>base: S-…</code> with the right code, or "
+                   "<code>new</code> to raise it as a New request.")
         return
     if not draft.get("need_by"):
         # No default (Alex, 01 Sep): the rep must key in when the customer

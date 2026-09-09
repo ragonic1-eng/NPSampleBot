@@ -2608,19 +2608,33 @@ async def screenshot_sr(session, sr_code: str, section: int | None = None):
 
 # ------------------------------------------------------------ draft object
 
-def compliance_for(ask) -> tuple[str, str]:
-    """(value, source) for Compliance - a REGULATORY field, so: ask, don't
-    assume (Alex 03-Sep). Only what he states in THIS request counts. Never
-    an old SR's value, never the customer's country, and NOT memory either:
-    memory was written from every submit, so a guessed value that slipped
-    through one tap would have been 'remembered' and re-proposed forever.
-    Same contract as build_draft's pick(): explicit -> 'you'; a mentioned-
-    but-unreadable value -> 'confirm' (please confirm); else blank -> asked."""
+def compliance_for(ask, country: str = "") -> tuple[str, str]:
+    """(value, source) for Compliance - a REGULATORY field. What he states
+    in THIS request wins ('you'); a mentioned-but-unreadable value is
+    'confirm'. Otherwise the customer's COUNTRY is proposed, labelled
+    'their country' so the card shows it as a proposal to confirm - Alex
+    09-Sep: "you are expected to know: pran is from bangladesh". Still
+    never an old SR's value and never memory (a guess that slipped through
+    one tap would have been re-proposed forever)."""
     if ask.overrides.get("compliance"):
         return ask.overrides["compliance"], "you"
     if "compliance" in ask.hints:
         return "", "confirm"
+    if country:
+        return country, "their country"
     return "", ""
+
+
+def _proposed_need_by(src: dict) -> str:
+    """No date given -> propose one week out (next weekday), labelled so the
+    card shows it as a proposal with the calendar to change it. Alex 09-Sep:
+    "you also missed out expected sample ready date" / "user can be lazy"."""
+    from datetime import datetime, timedelta, timezone
+    day = datetime.now(timezone(timedelta(hours=8))).date() + timedelta(days=7)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    src["need_by"] = "proposed: 1 week"
+    return f"BY {day.strftime('%d %b %Y').upper()}"
 
 
 def build_draft(user_id: int, text: str, force_customer: str = "",
@@ -2701,7 +2715,7 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
     bag = pick("bag", ask.overrides.get("bag"),
                ("remembered", mem_get(customer, "bag")))
     # Compliance: ask, don't assume - see compliance_for().
-    compliance, src["compliance"] = compliance_for(ask)
+    compliance, src["compliance"] = compliance_for(ask, d.get("country", ""))
     budget = pick("budget", ask.overrides.get("budget"),
                   ("remembered", mem_get(customer, "budget")),
                   (d.get("budget_src") or "history", d["budget"]))
@@ -2725,7 +2739,11 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
     # there (Alex 03-Sep) - so those slots are asked instead. A history
     # value must also look like a PERSON: an SR page once held a whole
     # sentence in its attn field.
-    hist_ok = ship_intent and not ask.delivery_addr
+    # Alex 09-Sep ("pran receiver is sajib and his address" - the bot is
+    # expected to know): history ship-to is PROPOSED even without a
+    # delivery signal, labelled with its source; the card's hand-carry
+    # button clears it. A stated other destination still blocks it.
+    hist_ok = not ask.delivery_addr
     attn = pick("attn", ask.overrides.get("attn"),
                 *([("their last request", _person(ship["attn"])),
                    ("remembered", _person(mem_get(customer, "attn"))),
@@ -2744,7 +2762,7 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
                    ("remembered", _ok_addr(mem_get(customer, "addr"))),
                    ("customer master",
                     _ok_addr((master_rec or {}).get("address", "")))]
-                  if ship_intent else []))
+                  if not ask.delivery_addr else []))
     # A phone number from history belongs to THAT history address. When
     # the rep gave his own destination (Geylang, hand-carry) an old
     # Philippine mobile is a different shipment's contact, not this one's
@@ -2780,14 +2798,14 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
         "ask": ask, "derived": d, "bag": bag, "budget": budget,
         "compliance": compliance, "attn": attn, "contact": contact,
         "addr": addr, "assignee": assignee,
-        "need_by": (ask.overrides.get("need_by") or "").upper(),
+        "need_by": ((ask.overrides.get("need_by") or "").upper()
+                    or _proposed_need_by(src)),
         "page_err": page_err, "src": src,
         # need-by has NO default (Alex, 01 Sep): the rep keys in when the
         # customer expects the seasoning; the bot writes it into the note
         # and sets the SR's until dropdown. Submit refuses while missing.
         "missing": [k for k, v in
-                    (("bag", bag), ("ship-to", attn or addr),
-                     ("need-by", ask.overrides.get("need_by")))
+                    (("bag", bag), ("ship-to", attn or addr))
                     if not v],
         # Smart-fill status for Alex's standard form (each '*' field):
         # 'you' = he wrote it · a source label = the bot filled it from
@@ -2878,6 +2896,15 @@ def _item_qty(ask: "Ask", f: dict, default: str) -> str:
 
 
 
+_CODE_TOKEN = re.compile(r"\s*\b[SJBC]-[A-Z0-9]+(?:-[A-Z0-9]+)*\b", re.IGNORECASE)
+
+
+def _strip_codes(name: str) -> str:
+    """'ROASTED CORN SEASONING S-83NJ1-11' -> 'ROASTED CORN SEASONING'."""
+    return _CODE_TOKEN.sub("", name).strip(" -\u2013\u2014:,;") or name
+
+
+
 def render_reqnote(draft: dict) -> str:
     """The text written into MMS — the thing R&D actually reads.
 
@@ -2910,10 +2937,10 @@ def render_reqnote(draft: dict) -> str:
         # block holding the numbered spec list (with 'No prefer code.'
         # folded in as its opening line), shared footer once at the end.
         lines.append("Seasoning name:")
+        # Alex 09-Sep: "just the product name will do" - codes stay in
+        # the Comment section where the notes refer to them.
         for f in ask.flavours:
-            lines.append(f["name"].upper())
-            if f.get("code_line"):
-                lines.append(f["code"])
+            lines.append(_strip_codes(f["name"]).upper())
         lines.append("")
         comment_lead = "No prefer code." if no_code else ""
         lines.append(f"Comment: {comment_lead}".rstrip())
@@ -2978,7 +3005,7 @@ def render_reqnote(draft: dict) -> str:
         # words minus the "each sample" lead-in, else the default.
         lines.append("QTY:")
         for f in ask.flavours:
-            lines.append(f"{f['name'].upper()}- {_item_qty(ask, f, qty_str)}")
+            lines.append(f"{_strip_codes(f['name']).upper()}- {_item_qty(ask, f, qty_str)}")
     elif ask.item_qty and (len(ask.item_qty) > 1 or not ask.qty_text):
         # (an explicit 'Qty:' line beats a single peeled amount — his words)
         # Per-item quantities — Alex 02-Sep: '100g - Tomato seasoning,

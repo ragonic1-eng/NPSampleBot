@@ -114,7 +114,7 @@ def test_rendered_note_is_one_numbered_item_per_block():
     assert "x 1 set" not in note.split("QTY:")[0]
     qty = note.split("QTY:")[1]
     assert "SAMBAL CHILLI SEASONING- 50g" in qty
-    assert "S-K9U15-08 TAKOYAKI SEASONING- 100g" in qty
+    assert "TAKOYAKI SEASONING- 100g" in qty        # names only, no code
     assert "SALTED EGG SEASONING- 50g x 1 set" in qty   # request default
     assert "AMERICAN DORITOS CORIANDER FLAVOR CORN CHIPS- 50g" in qty
     assert "SEASONING NAME:" not in note and "NEW SAMPLE\nSEASONING" not in note

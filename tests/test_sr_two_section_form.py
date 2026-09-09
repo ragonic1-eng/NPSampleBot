@@ -93,7 +93,8 @@ def test_global_fields_are_untouched():
 def test_rendered_note_mirrors_his_lines_and_puts_qty_in_its_own_block():
     a = srq.parse_ask(MSG)
     note = srq.render_reqnote(_draft(a))
-    assert "Seasoning name:\nCHILLI SEASONING\nS-83EH5-08\nROASTED CORN SEASONING S-83NJ1-11\n" in note
+    # names only under Seasoning name (Alex 09-Sep); codes live in Comment
+    assert "Seasoning name:\nCHILLI SEASONING\nROASTED CORN SEASONING\nSEAFOOD SEASONING\nCORN BBQ SEASONING\n" in note
     assert "1. CHILLI SEASONING\nS-83EH5-08 - short listed. Same code same profile repeat sample" in note
     assert "2. ROASTED CORN SEASONING S-83NJ1-11\nDecrease salt by 20%" in note
     assert "x 1 set" not in note                       # no qty in Comment

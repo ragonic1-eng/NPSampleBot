@@ -2192,6 +2192,18 @@ class SRWriter:
         return len(set(re.findall(r'name="sreq1\[(\d+)\]\.seq"', html)))
 
     @staticmethod
+    def _indices(html: str) -> set:
+        return {int(i) for i in re.findall(r'name="sreq1\[(\d+)\]\.seq"', html)}
+
+    @staticmethod
+    def _mms_error(html: str) -> str:
+        """Whatever MMS/Struts printed as an error, for the log."""
+        import html as _h
+        flat = re.sub(r"<[^>]+>", " ", _h.unescape(html))
+        m = re.search(r"(?i)(exception|error|invalid|failed)[^\n]{0,200}", flat)
+        return re.sub(r"\s+", " ", m.group(0))[:240] if m else ""
+
+    @staticmethod
     def _assignee_id(html: str, name: str) -> str:
         """Resolve the assignee's user-id from the live select options."""
         m = re.search(
@@ -2229,7 +2241,11 @@ class SRWriter:
         if after != before + 1:
             return {"ok": False,
                     "detail": f"additem: expected {before + 1} sections, got {after}"}
-        n = after - 1  # 0-based index of the new section
+        # The new row is the index that APPEARED, not necessarily the last:
+        # S-18CS43-002 carries an empty orphan item (3) in the middle of
+        # four saved ones, so positions and item numbers do not line up.
+        new_idx = self._indices(html2) - self._indices(html)
+        n = min(new_idx) if new_idx else after - 1
 
         try:
             form2 = BeautifulSoup(html2, "html.parser").find("form")
@@ -2248,12 +2264,21 @@ class SRWriter:
             # unique to THIS request — 'No prefer code.' appears in older
             # items on the same SR, so it proved nothing.
             import html as _html
+            # Probe with the LONGEST line of this note - the first line is
+            # the shared header 'Seasoning name:', which every older item
+            # on the SR also carries, so it proved nothing (Pran, 09-Sep:
+            # MMS had dropped the row and the check still passed).
             probe_lines = [l.strip() for l in reqnote.splitlines()
-                           if l.strip() and l.strip() != "No prefer code."]
-            probe = (probe_lines[0] if probe_lines else "")[:40]
-            if probe and probe not in _html.unescape(html3):
+                           if l.strip() and l.strip() != "No prefer code."
+                           and not re.match(r"(?i)^(seasoning name|comment)\s*:", l.strip())]
+            probe = max(probe_lines, key=len)[:60] if probe_lines else ""
+            page3 = _html.unescape(html3)
+            if n not in self._indices(html3) or (probe and probe not in page3):
+                log.warning("SR request%s: MMS did not keep the item (probe=%r) %s",
+                            n, probe, self._mms_error(html3))
                 return self._bail(sr_code,
-                                  f"request{n}: submitted text not found on page")
+                                  f"request{n}: MMS did not keep the new item "
+                                  f"(your text is not on the page)")
             # Resolve the assignee's user-id from THIS page: the new section
             # now exists and carries the 'Next action by' dropdown. A brand
             # new SR has no dropdown at all before this point (SUBEIH).
@@ -2279,8 +2304,13 @@ class SRWriter:
                 html4, re.S,
             )
             if not sel:
+                if n not in self._indices(html4) or (probe and probe not in _html.unescape(html4)):
+                    log.warning("SR save%s: item gone after save %s", n, self._mms_error(html4))
+                    return {"ok": False, "section": n + 1,
+                            "detail": ("MMS did not keep the item after save — "
+                                       "nothing was written; check the SR and try again")}
                 return {"ok": False, "section": n + 1,
-                        "detail": ("request saved but assignee NOT confirmed "
+                        "detail": ("item saved but assignee NOT confirmed "
                                    "selected — set it manually in MMS")}
             prep_note = ""
             if prepdate:

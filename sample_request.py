@@ -2908,9 +2908,12 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
         if _uc:
             ask.delivery = _uc
             src["delivery"] = f"usual for {d['country']}"
+    # Alex 10-Sep (Cocola): "for budget can we have user to input themself
+    # instead of guessing" - the realised price band from history is no
+    # longer proposed. His words this request, else what he typed for
+    # this customer last time (labelled remembered), else asked.
     budget = pick("budget", ask.overrides.get("budget"),
-                  ("remembered", mem_get(customer, "budget")),
-                  (d.get("budget_src") or "history", d["budget"]))
+                  ("remembered", mem_get(customer, "budget")))
     # Ship-to stacks every source we hold (Alex: propose and confirm, don't
     # say 'not known yet'): explicit > SR-page logs > memory > customer
     # master (address/receiver/phone).

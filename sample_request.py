@@ -551,6 +551,131 @@ def _person(v: str) -> str:
     return v if _looks_like_person(v) else ""
 
 
+_SECTION_HDR = re.compile(
+    r"^(?:seasoning(?:\s*names?)?|comments?)\s*[:\-]?\s*$", re.IGNORECASE)
+_CODE_ONLY = re.compile(r"^([SJBC]-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s*$", re.IGNORECASE)
+_NAME_CODE = re.compile(
+    r"^(.+?)\s+([SJBC]-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s*$", re.IGNORECASE)
+_CODE_NOTE = re.compile(
+    r"^(?:(.+?)\s+)?([SJBC]-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s*[-\u2013\u2014:]+\s*(.+)$",
+    re.IGNORECASE)
+
+
+def _two_section_form(lines: list[str]) -> tuple[list[dict], list[str]]:
+    """Alex's two-section form (Pran Foods, 09-Sep-2026):
+
+        SEASONING NAME:            COMMENT:
+        CHILLI SEASONING           CHILLI SEASONING
+        S-83EH5-08                 S-83EH5-08 - short listed ...
+        ROASTED CORN S-83NJ1-11    ROASTED CORN S-83NJ1-11 - less salt
+
+    The SEASONING NAME section lists the items (name, then its code on
+    the next line, or 'NAME CODE' on one line). The COMMENT section
+    repeats each item and adds ' - note' after its code. Both refer to
+    the same items, so the note is matched to the item BY CODE (or by
+    name when the note line carries no code). Returns (blocks, remaining
+    global-field lines); ([], lines) unless BOTH headers are present and
+    at least one item was read - every other layout is untouched."""
+    idx = {i for i, ln in enumerate(lines) if _SECTION_HDR.match(ln.strip())}
+    heads = [i for i in sorted(idx)]
+    if len(heads) < 2:
+        return [], list(lines)
+    kinds = [("comment" if lines[i].strip().lower().startswith("comment")
+              else "names") for i in heads]
+    if "names" not in kinds or "comment" not in kinds:
+        return [], list(lines)
+
+    def section(start: int) -> tuple[list[str], int]:
+        """Lines under a header until the next header/global field."""
+        out, j = [], start + 1
+        while j < len(lines):
+            ln = lines[j].strip()
+            if j in idx or (_GLOBAL_FIELD_RE.match(ln)
+                            or re.match(r"(?i)^(?:qty|quantity)(?![a-z])", ln)):
+                break
+            if ln:
+                out.append(ln)
+            j += 1
+        return out, j
+
+    blocks: list[dict] = []
+    used: set[int] = set()
+    for h, kind in zip(heads, kinds):
+        if kind != "names":
+            continue
+        body, end = section(h)
+        used.update(range(h, end))
+        pending = ""
+        for ln in body:
+            m = _CODE_ONLY.match(ln)
+            if m and pending:
+                blocks.append({"name": f"{pending} {m.group(1).upper()}",
+                               "code": m.group(1).upper(), "spec": [], "qty": ""})
+                pending = ""
+                continue
+            m = _NAME_CODE.match(ln) or _CODE_LED_LINE.match(ln)
+            if m:
+                if pending:
+                    blocks.append({"name": pending, "code": "", "spec": [], "qty": ""})
+                code = next(g for g in m.groups() if g and _CODE_ONLY.match(g))
+                blocks.append({"name": ln.strip(" .,;"), "code": code.upper(),
+                               "spec": [], "qty": ""})
+                pending = ""
+                continue
+            if pending:
+                blocks.append({"name": pending, "code": "", "spec": [], "qty": ""})
+            pending = ln.strip(" .,;")
+        if pending:
+            blocks.append({"name": pending, "code": "", "spec": [], "qty": ""})
+    if not blocks or not any(b["code"] for b in blocks):
+        # no codes → not this form (a pasted-back note has both bare
+        # headers but no codes; it belongs to the plain-list path)
+        return [], list(lines)
+
+    def find(code: str, name: str) -> dict | None:
+        if code:
+            for b in blocks:
+                if b["code"] == code.upper():
+                    return b
+        if name:
+            sq = re.sub(r"[^a-z0-9]", "", name.lower())
+            for b in blocks:
+                if sq and sq in re.sub(r"[^a-z0-9]", "", b["name"].lower()):
+                    return b
+        return None
+
+    loose: list[str] = []
+    for h, kind in zip(heads, kinds):
+        if kind != "comment":
+            continue
+        body, end = section(h)
+        used.update(range(h, end))
+        last_name = ""
+        for ln in body:
+            m = _CODE_NOTE.match(ln)
+            if m:
+                b = find(m.group(2), m.group(1) or last_name)
+                if b is not None:
+                    b["spec"].append(m.group(3).strip())
+                    last_name = ""
+                    continue
+            if _CODE_ONLY.match(ln) or find("", ln) is not None:
+                last_name = ln          # a bare item name/code introduces its note
+                continue
+            b = find("", last_name) if last_name else None
+            if b is not None:
+                b["spec"].append(ln)
+            else:
+                loose.append(ln)
+    if not any(b["spec"] for b in blocks):
+        return [], list(lines)   # no note matched any item → leave it alone
+    remaining = [ln for i, ln in enumerate(lines) if i not in used]
+    if loose:
+        remaining = loose + remaining
+    return blocks, remaining
+
+
+
 def _form_blocks(lines: list[str]) -> tuple[list[dict], list[str]]:
     """Split the multi-item form into per-item blocks
     [{'name', 'spec': [...], 'qty': '50g'|''}]. Returns (blocks, remaining
@@ -814,7 +939,9 @@ def parse_ask(text: str) -> Ask:
     # Alex's multi-item form (03-Sep, Apacific): split repeated 'SEASONING
     # NAME:' / code-led item blocks FIRST, each with its own comment and qty;
     # only global field lines stay behind for the passes below.
-    _blocks, lines = _form_blocks(lines)
+    _blocks, lines = _two_section_form(lines)
+    if not _blocks:
+        _blocks, lines = _form_blocks(lines)
     if _blocks:
         a.flavours = _blocks
         a.structured = True
@@ -1363,7 +1490,8 @@ def _ground(d: dict, text: str) -> dict:
         v = d.get(key)
         if v in (None, "", [], 0):
             continue
-        if not grounded(v):
+        if not grounded(v) or (key == "addr" and _ATTN_LINE.match(str(v))):
+            # an 'Attention: Mr Sajib' line is a receiver, never an address
             log.info("SR llm_parse: dropped ungrounded %s=%r", key, v)
             d[key] = None
     return d

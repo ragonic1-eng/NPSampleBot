@@ -9917,6 +9917,99 @@ async def _sr_show(update, draft, srq):
     await send(update, _sr_draft_text(draft), _sr_draft_kb(draft))
 
 
+class _Progress:
+    """One message that stays alive while the bot works (Alex 10-Sep:
+    "can we have some cute animated loader or something"). Telegram
+    can't animate text, but it can EDIT a message once a second: the
+    current step gets a rotating shaker/chilli/popcorn/noodle frame and
+    growing dots, finished steps turn into ✅ lines, and the chat header
+    shows the native 'typing…' indicator. A loader must never break the
+    job, so every Telegram call in here swallows its own errors.
+
+        prog = await _Progress.start(update, "Writing to MMS")
+        ...long work...
+        await prog.step("Saved the customer", "Assembling the draft")
+        ...
+        await prog.finish()            # delete it, the result follows
+        await prog.finish("✅ Done")   # or leave a final line
+    """
+    FRAMES = ("🧂", "🌶️", "🍿", "🍜")
+
+    def __init__(self, update, step: str):
+        self.update = update
+        self.done: list[str] = []
+        self.current = step
+        self.msg = None
+        self.task = None
+        self.tick = 0
+
+    @classmethod
+    async def start(cls, update, step: str) -> "_Progress":
+        prog = cls(update, step)
+        try:
+            prog.msg = await send(update, prog._text(), with_footer=False,
+                                  force_new=True)
+            prog.task = asyncio.create_task(prog._spin())
+        except Exception:  # noqa: BLE001
+            log.exception("progress loader failed to start")
+        return prog
+
+    def _text(self) -> str:
+        frame = self.FRAMES[self.tick % len(self.FRAMES)]
+        dots = "·" * (self.tick % 4)
+        lines = [f"✅ {s}" for s in self.done]
+        lines.append(f"{frame} {self.current}{dots}")
+        return "\n".join(lines)
+
+    async def _spin(self) -> None:
+        from telegram.constants import ChatAction
+        chat = self.update.effective_chat
+        while True:
+            await asyncio.sleep(1.0)
+            self.tick += 1
+            try:
+                await self.msg.edit_text(self._text(), parse_mode=ParseMode.HTML)
+            except Exception:  # noqa: BLE001 — rate limit, same text, gone
+                pass
+            if chat is not None and self.tick % 4 == 1:
+                try:
+                    await chat.send_chat_action(ChatAction.TYPING)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    async def step(self, done: str, nxt: str) -> None:
+        """Tick the current step off and start spinning on the next."""
+        self.done.append(done)
+        self.current = nxt
+        self.tick = 0
+        if self.msg is not None:
+            try:
+                await self.msg.edit_text(self._text(), parse_mode=ParseMode.HTML)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def finish(self, text: str | None = None) -> None:
+        """Stop spinning; delete the loader (the result follows) or leave
+        `text` as its final line."""
+        if self.task is not None:
+            self.task.cancel()
+            try:
+                await self.task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self.task = None
+        if self.msg is None:
+            return
+        try:
+            if text:
+                await self.msg.edit_text(text, parse_mode=ParseMode.HTML)
+            else:
+                await self.msg.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        self.msg = None
+
+
 async def _sr_do_submit(update, draft, token, srq) -> None:
     """Shared submit path (✅ button AND a typed 'yes raise it')."""
     if draft.get("prefix") != "S":
@@ -9941,13 +10034,13 @@ async def _sr_do_submit(update, draft, token, srq) -> None:
                    "the SR's until-date.",
                    _sr_draft_kb(draft))
         return
-    await send(update, "📨 Writing to MMS… (each step is verified)",
-               with_footer=False)
+    prog = await _Progress.start(update, "Writing to MMS (each step is verified)")
     reqnote = srq.render_reqnote(draft)
     d = draft["derived"]
     try:
         w = srq.SRWriter()
         if not w.login():
+            await prog.finish()
             await send(update, "🛑 MMS login failed — stopping (no retry).")
             return
         result = await asyncio.to_thread(
@@ -9957,9 +10050,11 @@ async def _sr_do_submit(update, draft, token, srq) -> None:
         )
     except Exception as e:  # noqa: BLE001
         log.exception("sr submit crashed")
+        await prog.finish()
         await send(update, f"🛑 Submit crashed: {h(str(e)[:200])} — "
                            "check the SR in MMS before retrying.")
         return
+    await prog.finish()
     if result.get("ok"):
         srq.DRAFTS.pop(token, None)
         _SR_ACTIVE.pop(update.effective_user.id, None)
@@ -10042,11 +10137,12 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dry = False
     if text.lower().startswith("dry "):
         dry, text = True, text[4:].strip()
-    await send(update, "🔎 Assembling the draft…", with_footer=False)
+    prog = await _Progress.start(update, "Reading your request")
     # Natural-language first (the way Alex actually types); the old
     # structured ';key: value' syntax still works silently underneath as
     # the fallback and for anyone who prefers it.
     parsed = await srq.llm_parse(text)
+    await prog.step("Read your request", "Assembling the draft")
     # Alex 09-Sep: build from HIS raw words (structure is his); the LLM
     # only fills blanks, or reads the customer when the rules cannot.
     # See sample_request.draft_from.
@@ -10055,8 +10151,10 @@ async def cmd_sr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             srq.draft_from, update.effective_user.id, text, parsed)
     except Exception as e:  # noqa: BLE001
         log.exception("sr build_draft failed")
+        await prog.finish()
         await send(update, f"😕 Couldn't build the draft: {h(str(e)[:200])}")
         return
+    await prog.finish()
     if update.effective_chat:
         # Scope conversational edits to this chat — see on_sr_text.
         draft["chat_id"] = update.effective_chat.id
@@ -10382,37 +10480,41 @@ async def _sr_create_new_customer(update, draft, token, srq) -> None:
     shipping = draft.get("shipping", "Hand")
     srq.DRAFTS.pop(token, None)
     _SR_ACTIVE.pop(update.effective_user.id, None)
-    await send(update, f"🛠 Saving <b>{h(name)}</b> in MMS…",
-               with_footer=False)
+    prog = await _Progress.start(update, f"Saving <b>{h(name)}</b> in MMS")
     try:
         w = srq.SRWriter()
         if not w.login():
+            await prog.finish()
             await send(update, "🛑 MMS login failed — stopping (no retry).")
             return
         result = await asyncio.to_thread(w.create_sr, name, "S-", shipping)
     except Exception as e:  # noqa: BLE001
         log.exception("sr create_sr crashed")
+        await prog.finish()
         await send(update, f"🛑 Create crashed: {h(str(e)[:200])} — check "
                            "MMS before retrying, a duplicate would be worse.")
         return
     if not result.get("ok"):
+        await prog.finish()
         await send(update, f"🛑 <b>Not created:</b> {h(result['detail'])}")
         return
-    await send(update, f"✅ {h(result['detail'])} — now the request draft…",
-               with_footer=False)
+    await prog.step(h(result["detail"]), "Assembling the request draft")
     try:
         new = await asyncio.to_thread(
             srq.build_draft, update.effective_user.id,
             draft["raw_text"], name, result["code"])
     except Exception as e:  # noqa: BLE001
+        await prog.finish()
         await send(update, f"😕 SR <code>{h(result['code'])}</code> exists "
                            f"but I couldn't build the draft: {h(str(e)[:160])}")
         return
     if new.get("error"):
+        await prog.finish()
         await send(update, f"😕 SR <code>{h(result['code'])}</code> exists "
                            "but the draft failed — resend the /sr line "
                            "and it will pick the new SR up.")
         return
+    await prog.finish(f"✅ {h(result['detail'])}")
     await _sr_show(update, new, srq)
 
 

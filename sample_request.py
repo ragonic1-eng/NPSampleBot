@@ -136,6 +136,7 @@ class Ask:
     restriction: str = ""   # halal / gluten-free / non-GMO …
     structured: bool = False  # True only when block detection is CONFIDENT
     form_mode: bool = False   # the repeated SEASONING NAME:/code form was split
+    comment_verbatim: list[str] = field(default_factory=list)  # his Comment section, as typed
     # Alex 02-Sep: never fabricate 'No prefer code.' — say it only when he
     # actually wrote it, and then only inside the Comment block.
     no_prefer_code: bool = False
@@ -247,6 +248,11 @@ _HDR_QTY = re.compile(
     # Alex's own wording on his existing SRs
     r"^sample\s*(?:to\s*be\s*given|size|qty)[^:]*:?\s*$", re.IGNORECASE)
 _HDR_COMMENT = re.compile(r"^comments?\s*[:\-]\s*(.*)$", re.IGNORECASE)
+# 'Expected send out: 16 Sept' / 'Expected date: ...' (Alex 10-Sep, Liwayway)
+_EXPECTED_OUT_LINE = re.compile(
+    r"^expected\s*(?:to\s+)?(?:send|ship|sample|delivery|dispatch)?(?:\s*out)?"
+    r"(?:\s*(?:by|date|on))?\s*[:\-]\s*(.+)$", re.IGNORECASE)
+
 _RECEIVER_LINE = re.compile(
     r"^(?:receiver|recipient|attention)\s*(?:name)?\s*[:\-]?\s*(.+)$",
     re.IGNORECASE)
@@ -391,8 +397,14 @@ _AMOUNT_U = r"\d+(?:\.\d+)?\s*[A-Za-z][A-Za-z.]{0,9}(?:\s+[A-Za-z]{1,8})?"
 _QTY_ITEM_RE = re.compile(
     rf"^({_AMOUNT_U})\s*{_QTY_SEP}\s*(.+)$", re.IGNORECASE)
 # 'texture improver 2 - 500g'
+# A labelled field line is never an item/amount pair: 'Expected send out:
+# 16 Sept' matched as amount "16 Sept" for item "Expected send out"
+# and flipped QTY into per-item mode (Alex 10-Sep, Liwayway).
+_NOT_A_FIELD = (r"(?!(?:expected|need|budget|bag|complian|target|delivery|"
+                r"send|shipping|attention|attn|contact|mobile|phone|tel|"
+                r"address|customer|company|receiver)[^a-z])")
 _ITEM_QTY_RE = re.compile(
-    rf"^(.+?)\s*[-–—:]\s*({_AMOUNT_U})\s*$", re.IGNORECASE)
+    rf"^{_NOT_A_FIELD}(.+?)\s*[-–—:]\s*({_AMOUNT_U})\s*$", re.IGNORECASE)
 # A bare amount on its own line ('1 small bottle', '100g sample',
 # '1pcs Noodle Cake'). Only used UNDER a quantity heading — in that
 # context the whole line is the quantity, so 'starts with a number' is
@@ -520,7 +532,8 @@ _BLOCK_QTY = re.compile(
     r"\s*(.*)$", re.IGNORECASE)
 _GLOBAL_FIELD_RE = re.compile(
     r"^(?:budget|bag|complian(?:ce|t)|target\s*base|need\s*by|expected|delivery|"
-    r"send\s*method|shipping|ship\s*to|address|customer|company|receiver|"
+    r"send\s*method|shipping|ship\s*to|address|"
+    r"(?:customer|company)(?=\s*(?:name\s*)?[:\-])|receiver|"
     r"attn|attention|contact|phone|mobile|tel|whatsapp|restriction|"
     r"application)\b", re.IGNORECASE)
 _NAME_LIKE_LINE = re.compile(
@@ -559,6 +572,10 @@ _NAME_CODE = re.compile(
 _CODE_NOTE = re.compile(
     r"^(?:(.+?)\s+)?([SJBC]-[A-Z0-9]+(?:-[A-Z0-9]+)*)\s*[-\u2013\u2014:]+\s*(.+)$",
     re.IGNORECASE)
+
+
+def _sq(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
 def _two_section_form(lines: list[str]) -> tuple[list[dict], list[str]]:
@@ -648,13 +665,24 @@ def _two_section_form(lines: list[str]) -> tuple[list[dict], list[str]]:
         return None
 
     loose: list[str] = []
+    verbatim: list[str] = []
     for h, kind in zip(heads, kinds):
         if kind != "comment":
             continue
         body, end = section(h)
         used.update(range(h, end))
         last_name = ""
+        verbatim.extend(body)
         for ln in body:
+            pb = next((b for b in blocks
+                       if _sq(ln).startswith(_sq(b["name"]))
+                       and len(_sq(ln)) > len(_sq(b["name"]))), None)
+            if pb is not None and not _CODE_NOTE.match(ln):
+                # 'Milk seasoning- customer wants ...' -> that item's note
+                rest = ln[len(pb["name"]):].lstrip(" -\u2013\u2014:") if ln.lower().startswith(pb["name"].lower()) else ln
+                pb["spec"].append(rest.strip())
+                last_name = pb["name"]
+                continue
             m = _CODE_NOTE.match(ln)
             if m:
                 b = find(m.group(2), m.group(1) or last_name)
@@ -674,8 +702,11 @@ def _two_section_form(lines: list[str]) -> tuple[list[dict], list[str]]:
                 b["spec"].append(ln)
             else:
                 loose.append(ln)
-    if not any(b["spec"] for b in blocks):
-        return [], list(lines)   # no note matched any item → leave it alone
+    if not verbatim:
+        return [], list(lines)   # an empty Comment section → leave it alone
+    # Alex 10-Sep: "for Comment I already clearly did for you! why did
+    # you self add and change it?!" - the section is written verbatim.
+    blocks[0]["comment_verbatim"] = verbatim
     remaining = [ln for i, ln in enumerate(lines) if i not in used]
     if loose:
         remaining = loose + remaining
@@ -947,6 +978,8 @@ def parse_ask(text: str) -> Ask:
     # NAME:' / code-led item blocks FIRST, each with its own comment and qty;
     # only global field lines stay behind for the passes below.
     _blocks, lines = _two_section_form(lines)
+    if _blocks and _blocks[0].get("comment_verbatim"):
+        a.comment_verbatim = _blocks[0].pop("comment_verbatim")
     if not _blocks:
         _blocks, lines = _form_blocks(lines)
     if _blocks:
@@ -1099,7 +1132,7 @@ def parse_ask(text: str) -> Ask:
             a.overrides["bag"] = ("NP bag" if gm.group(1).lower() == "np"
                                   else "Empty bag")
             consumed = consumed or len(line) < 40
-        nm = _NEEDBY_LINE.search(line)
+        nm = _NEEDBY_LINE.search(line) or _EXPECTED_OUT_LINE.search(line)
         if nm and "need_by" not in a.overrides:
             a.overrides["need_by"] = (
                 nm.group(1) or nm.group(2) or nm.group(3) or "").strip()
@@ -2756,6 +2789,25 @@ def unknown_codes(codes) -> list[str]:
     return out
 
 
+def _country_tokens(s: str) -> set:
+    """Country names the text mentions (from the compliance market list)."""
+    toks = set(re.findall(r"[a-z]+", (s or "").lower()))
+    return {m for m in _MARKETS if m.lower() in toks}
+
+
+def _usual_courier(country: str) -> str:
+    """Most common preferred courier among master customers in that country."""
+    if not country:
+        return ""
+    from collections import Counter
+    c = Counter()
+    for rec in sheets.load_merged_customers():
+        blob = f"{rec.get('name', '')} {rec.get('address', '')}".lower()
+        if country.lower() in blob and (rec.get("courier") or "").strip():
+            c[rec["courier"].strip()] += 1
+    return c.most_common(1)[0][0] if c else ""
+
+
 def build_draft(user_id: int, text: str, force_customer: str = "",
                 force_sr_code: str = "") -> dict:
     """Everything needed to render + submit. Fetches the SR page once for
@@ -2766,6 +2818,17 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
         customer = force_customer
     else:
         best, candidates = resolve_customer(ask.customer_text)
+        if best is not None:
+            # "liwayway bangladesh" resolved to Myanmar Liwayway with no
+            # question (Alex 10-Sep). A country in his words that clashes
+            # with the country in the match is a different company or a
+            # new one - ask, never pick.
+            qc = _country_tokens(ask.customer_text)
+            nc = _country_tokens(best.get("name", ""))
+            if qc and nc and not (qc & nc):
+                candidates = [best] + [c for c in (candidates or [])
+                                       if c.get("name") != best.get("name")]
+                best = None
         if best is None:
             return {"error": "ambiguous", "candidates": candidates,
                     "customer_text": ask.customer_text, "raw_text": text}
@@ -2834,7 +2897,17 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
     bag = pick("bag", ask.overrides.get("bag"),
                ("remembered", mem_get(customer, "bag")))
     # Compliance: ask, don't assume - see compliance_for().
+    if not d.get("country"):
+        # a new customer has no history: his own words name the country
+        _cc = _country_tokens(f"{customer} {ask.overrides.get('addr', '')} {ask.delivery_addr}")
+        if len(_cc) == 1:
+            d["country"] = next(iter(_cc))
     compliance, src["compliance"] = compliance_for(ask, d.get("country", ""))
+    if not ask.delivery and not ask.delivery_addr and d.get("country"):
+        _uc = _usual_courier(d["country"])
+        if _uc:
+            ask.delivery = _uc
+            src["delivery"] = f"usual for {d['country']}"
     budget = pick("budget", ask.overrides.get("budget"),
                   ("remembered", mem_get(customer, "budget")),
                   (d.get("budget_src") or "history", d["budget"]))
@@ -3073,12 +3146,21 @@ def render_reqnote(draft: dict) -> str:
         # Alex 09-Sep: "just the product name will do" - codes stay in
         # the Comment section where the notes refer to them.
         for f in ask.flavours:
-            lines.append(_strip_codes(f["name"]).upper())
+            lines.append(_strip_codes(f["name"]))     # as he typed it
         lines.append("")
         comment_lead = "No prefer code." if no_code else ""
         lines.append(f"Comment: {comment_lead}".rstrip())
-        lines.append("")
-        for i, f in enumerate(ask.flavours, 1):
+        if ask.comment_verbatim:
+            # His Comment section, word for word; a blank line before
+            # each item paragraph (Alex 10-Sep expected output).
+            names_sq = [_sq(_strip_codes(f["name"])) for f in ask.flavours]
+            for j, cl in enumerate(ask.comment_verbatim):
+                if j and any(_sq(cl).startswith(n) for n in names_sq if n) \
+                        and lines[-1] != "":
+                    lines.append("")
+                lines.append(cl)
+            lines.append("")
+        for i, f in enumerate(ask.flavours if not ask.comment_verbatim else [], 1):
             # A block with its OWN quantity (Alex's form: '50G ...' under each
             # item) shows it in its header; the others use the request
             # default - so 50g and 100g items never share one figure.
@@ -3131,14 +3213,18 @@ def render_reqnote(draft: dict) -> str:
     # QTY: each numbered header already carries '- {qty}' for structured
     # multi-flavour notes — repeating it in the footer was Alex's 01-Sep
     # duplicate complaint. Footer QTY only when the headers don't show it.
-    if ask.structured and len(ask.flavours) > 1:
+    _per_item_qty = ask.structured and len(ask.flavours) > 1 and (
+        any(n for _q, n in ask.item_qty)          # he paired amounts with items
+        or any(f.get("qty") for f in ask.flavours)
+        or not ask.qty_text)   # one figure for all -> one line, his words
+    if _per_item_qty:
         # Alex 09-Sep: "just mention it in qty not comment, like
         # corn bbq seasoning- 200g powder no need application" - one
         # line per item; each item's own figure, else his global
         # words minus the "each sample" lead-in, else the default.
         lines.append("QTY:")
         for f in ask.flavours:
-            lines.append(f"{_strip_codes(f['name']).upper()}- {_item_qty(ask, f, qty_str)}")
+            lines.append(f"{_strip_codes(f['name'])}- {_item_qty(ask, f, qty_str)}")
     elif ask.item_qty and (len(ask.item_qty) > 1 or not ask.qty_text):
         # (an explicit 'Qty:' line beats a single peeled amount — his words)
         # Per-item quantities — Alex 02-Sep: '100g - Tomato seasoning,

@@ -609,8 +609,11 @@ def _two_section_form(lines: list[str]) -> tuple[list[dict], list[str]]:
         for ln in body:
             m = _CODE_ONLY.match(ln)
             if m and pending:
-                blocks.append({"name": f"{pending} {m.group(1).upper()}",
-                               "code": m.group(1).upper(), "spec": [], "qty": ""})
+                # code on its own line under the name - printed that way
+                # too (Alex 09-Sep: "it wont always be the case that ill
+                # put seasoning name and code together")
+                blocks.append({"name": pending, "code": m.group(1).upper(),
+                               "code_line": True, "spec": [], "qty": ""})
                 pending = ""
                 continue
             m = _NAME_CODE.match(ln) or _CODE_LED_LINE.match(ln)
@@ -656,7 +659,11 @@ def _two_section_form(lines: list[str]) -> tuple[list[dict], list[str]]:
             if m:
                 b = find(m.group(2), m.group(1) or last_name)
                 if b is not None:
-                    b["spec"].append(m.group(3).strip())
+                    note = m.group(3).strip()
+                    # the header repeats his name line; the code is
+                    # already there unless he typed it on its own line
+                    b["spec"].append(f"{m.group(2).upper()} - {note}"
+                                     if b.get("code_line") else note)
                     last_name = ""
                     continue
             if _CODE_ONLY.match(ln) or find("", ln) is not None:
@@ -2849,6 +2856,28 @@ def _filter_ask_text(ask_text: str, flavours: list, no_code: bool) -> str:
     return "\n".join(out).strip()
 
 
+_EACH_LEAD = re.compile(
+    r"^(?:(?:for\s+)?(?:each|every|per)\s+(?:sample|seasoning|item|flavou?r)?\s*[:\-]?\s*)",
+    re.IGNORECASE)
+
+
+def _item_qty(ask: "Ask", f: dict, default: str) -> str:
+    """Quantity text for one item of a structured note: the block's own
+    figure, else the amount he paired with this item, else his global
+    Qty words without the 'each sample' lead-in, else the request default."""
+    if f.get("qty"):
+        return f["qty"]
+    nm = f["name"].lower()
+    for q, n in ask.item_qty:
+        if n and (n.lower() in nm or nm in n.lower()):
+            return q
+    if ask.qty_text:
+        return _EACH_LEAD.sub("", ask.qty_text).strip() or ask.qty_text
+    return default
+
+
+
+
 def render_reqnote(draft: dict) -> str:
     """The text written into MMS — the thing R&D actually reads.
 
@@ -2881,7 +2910,10 @@ def render_reqnote(draft: dict) -> str:
         # block holding the numbered spec list (with 'No prefer code.'
         # folded in as its opening line), shared footer once at the end.
         lines.append("Seasoning name:")
-        lines.extend(f["name"].upper() for f in ask.flavours)
+        for f in ask.flavours:
+            lines.append(f["name"].upper())
+            if f.get("code_line"):
+                lines.append(f["code"])
         lines.append("")
         comment_lead = "No prefer code." if no_code else ""
         lines.append(f"Comment: {comment_lead}".rstrip())
@@ -2890,10 +2922,8 @@ def render_reqnote(draft: dict) -> str:
             # A block with its OWN quantity (Alex's form: '50G ...' under each
             # item) shows it in its header; the others use the request
             # default - so 50g and 100g items never share one figure.
-            _bq = f.get("qty") or ""
-            _sets = f"{d['sets']} set" + ("s" if d["sets"] != 1 else "")
-            _hdr_qty = f"{_bq} x {_sets}" if _bq else qty_str
-            lines.append(f"{i}. {f['name'].upper()} - {_hdr_qty}")
+            # Alex 09-Sep: quantities go in the QTY block, not here
+            lines.append(f"{i}. {f['name'].upper()}")
             lines.extend(s for s in f["spec"] if s.strip())
             lines.append("")
         ask_txt = _filter_ask_text(ask.ask_text, ask.flavours, no_code)
@@ -2941,7 +2971,15 @@ def render_reqnote(draft: dict) -> str:
     # QTY: each numbered header already carries '- {qty}' for structured
     # multi-flavour notes — repeating it in the footer was Alex's 01-Sep
     # duplicate complaint. Footer QTY only when the headers don't show it.
-    if ask.item_qty and (len(ask.item_qty) > 1 or not ask.qty_text):
+    if ask.structured and len(ask.flavours) > 1:
+        # Alex 09-Sep: "just mention it in qty not comment, like
+        # corn bbq seasoning- 200g powder no need application" - one
+        # line per item; each item's own figure, else his global
+        # words minus the "each sample" lead-in, else the default.
+        lines.append("QTY:")
+        for f in ask.flavours:
+            lines.append(f"{f['name'].upper()}- {_item_qty(ask, f, qty_str)}")
+    elif ask.item_qty and (len(ask.item_qty) > 1 or not ask.qty_text):
         # (an explicit 'Qty:' line beats a single peeled amount — his words)
         # Per-item quantities — Alex 02-Sep: '100g - Tomato seasoning,
         # 500g - Texture improver 2', never a bare figure that reads as

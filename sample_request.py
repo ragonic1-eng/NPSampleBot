@@ -2119,11 +2119,17 @@ def derive_defaults(hist: list[dict], ask: Ask) -> dict:
     # — a negated modify word is a REPEAT signal (Alex 04-Sep, Apacific).
     body_txt = ask.body_text()
     wants_mod = bool(_MOD_RE.search(body_txt)) and not _NO_MOD_RE.search(body_txt)
-    if ask.codes and (all(c in hist_codes for c in ask.codes)
-                      or _NO_MOD_RE.search(body_txt)) and not wants_mod:
+    # Repeat/Modify carry ONE base product in MMS. With several codes in
+    # the request the bot was picking the first as the base and the
+    # Modify radio on its own (Alex 10-Sep: "I have never ask you to
+    # select modify") - a multi-code request is raised as New; the
+    # note carries every code and instruction he typed.
+    single = len({c.upper() for c in ask.codes}) == 1
+    if single and (all(c in hist_codes for c in ask.codes)
+                   or _NO_MOD_RE.search(body_txt)) and not wants_mod:
         d["rtype"], d["rtype_label"] = "rep", "Repeat"
         d["base_code"] = ask.codes[0]
-    elif ask.codes and wants_mod:
+    elif single and wants_mod:
         d["rtype"], d["rtype_label"] = "mod", "Modify"
         d["base_code"] = ask.codes[0]
     else:

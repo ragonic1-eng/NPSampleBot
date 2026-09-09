@@ -58,11 +58,12 @@ def test_reqnote_counts_three_flavours():
     note = srq.render_reqnote(draft)
     assert "1. LEMON HABANERO SEASONING" in note
     assert "3. SALSA VERDE FLAVORED SEASONING" in note
-    # 01-Sep dedupe: qty lives in each numbered header, never repeated in
-    # a footer QTY line; 'no prefer code' appears exactly once (the
-    # Comment: header), Alex's own restatement line is dropped.
-    assert note.count("1000g x 1 set") == 3
-    assert "QTY:" not in note and "per flavour" not in note
+    # Alex 09-Sep: qty lives in the QTY block, one line per flavour,
+    # never in the numbered headers; 'no prefer code' appears exactly
+    # once (the Comment: header), Alex's own restatement line is dropped.
+    head, qty = note.split("QTY:")
+    assert "1000g" not in head and qty.count("1000g x 1 set") == 3
+    assert "per flavour" not in note
     assert note.lower().count("no prefer code") == 1
     assert "Customer want" not in note
 

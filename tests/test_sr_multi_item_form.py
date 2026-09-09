@@ -107,11 +107,16 @@ def test_rendered_note_is_one_numbered_item_per_block():
     note = srq.render_reqnote(_draft(a))
     assert note.count("Seasoning name:") == 1
     assert note.count("Comment:") == 1
-    assert "1. SAMBAL CHILLI SEASONING - 50g x 1 set" in note
-    assert "2. S-K9U15-08 TAKOYAKI SEASONING - 100g x 1 set" in note
-    assert "7. SALTED EGG SEASONING - 50g x 1 set" in note   # request default
-    assert "8. AMERICAN DORITOS CORIANDER FLAVOR CORN CHIPS - 50g x 1 set" in note
-    assert "QTY:" not in note                       # headers carry it
+    # Alex 09-Sep: quantities live in the QTY block, one line per item,
+    # never in the Comment headers.
+    assert "1. SAMBAL CHILLI SEASONING\n" in note
+    assert "2. S-K9U15-08 TAKOYAKI SEASONING\n" in note
+    assert "x 1 set" not in note.split("QTY:")[0]
+    qty = note.split("QTY:")[1]
+    assert "SAMBAL CHILLI SEASONING- 50g" in qty
+    assert "S-K9U15-08 TAKOYAKI SEASONING- 100g" in qty
+    assert "SALTED EGG SEASONING- 50g x 1 set" in qty   # request default
+    assert "AMERICAN DORITOS CORIANDER FLAVOR CORN CHIPS- 50g" in qty
     assert "SEASONING NAME:" not in note and "NEW SAMPLE\nSEASONING" not in note
     assert note.count("TAKE FROM LIBRARY IF HAVE") == 2
     assert "Delivery method: Lala move" in note

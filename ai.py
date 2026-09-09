@@ -150,6 +150,16 @@ async def _openai_compat(base_url: str, api_key: str, model: str, prompt: str,
     text = ((choice.get("message") or {}).get("content") or "")
     text = _THINK_RE.sub("", text).strip()
     usage = data.get("usage") or {}
+    if not text:
+        # MiniMax-M2 via the gateway can burn the whole budget thinking
+        # and return finish=length with EMPTY content (Pran Foods /sr,
+        # 09-Sep-2026: 4000 out, nothing usable). An empty answer is a
+        # failure, not a result — raise so _ask tries the next provider
+        # instead of handing callers "" and silently falling to regex.
+        raise RuntimeError(
+            f"{label} returned empty content "
+            f"(finish={choice.get('finish_reason')}, "
+            f"out={usage.get('completion_tokens', '?')})")
     log.info("%s ok (%s): %s in / %s out", label, model,
              usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"))
     return text, int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)

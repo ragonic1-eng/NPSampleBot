@@ -519,7 +519,7 @@ _BLOCK_QTY = re.compile(
     r"^(?:(?:qty|quantity)\s*[:\-]?\s*)?(\d+(?:\.\d+)?)\s*(kg|grams?|gm|g)\b"
     r"\s*(.*)$", re.IGNORECASE)
 _GLOBAL_FIELD_RE = re.compile(
-    r"^(?:budget|bag|complian|target\s*base|need\s*by|expected|delivery|"
+    r"^(?:budget|bag|complian(?:ce|t)|target\s*base|need\s*by|expected|delivery|"
     r"send\s*method|shipping|ship\s*to|address|customer|company|receiver|"
     r"attn|attention|contact|phone|mobile|tel|whatsapp|restriction|"
     r"application)\b", re.IGNORECASE)
@@ -574,6 +574,9 @@ def _form_blocks(lines: list[str]) -> tuple[list[dict], list[str]]:
         if _GLOBAL_FIELD_RE.match(ln) and not _BLOCK_COMMENT.match(ln):
             remaining.append(ln)          # global fields never join a block
             continue
+        if re.match(r"(?i)^(?:qty|quantity)(?![a-z])", ln) and not _BLOCK_QTY.match(ln):
+            remaining.append(ln)          # 'Qty: each sample 200g' — global, not this item's
+            continue
         if _BLOCK_MARKER.match(ln):
             pending.append(ln)            # 'NEW SAMPLE' -> next item's note
             continue
@@ -590,13 +593,30 @@ def _form_blocks(lines: list[str]) -> tuple[list[dict], list[str]]:
                 nxt = lines[i].strip()
                 if nxt and not _GLOBAL_FIELD_RE.match(nxt) \
                         and not _BLOCK_COMMENT.match(nxt):
-                    name = nxt.strip(" .,;")
+                    nm = _NUM_ITEM.match(nxt)
+                    name = (nm.group(2) if nm else nxt).strip(" .,;")
                     i += 1
+        elif _CODE_LED_LINE.match(ln) and cur is not None \
+                and _CODE_LED_LINE.match(ln).group(2).lstrip()[:1] in "-–—" \
+                and not _CODE_RE.search(cur["name"]) \
+                and not any(_CODE_RE.search(x) for x in cur["spec"]):
+            # "S-CODE - note" under an item that has no code yet IS that
+            # item's code (+ note), not a new item — Pran Foods 09-Sep:
+            # "1. CHILLI SEASONING" / "S-83EH5-08 -SHORT LISTED..." had
+            # produced 6 items for a 3-item list. "S-CODE NAME" (no dash,
+            # Apacific form) still starts an item.
+            cur["spec"].append(ln)
+            continue
         elif _CODE_LED_LINE.match(ln):
             name, is_start = ln.strip(" .,;"), True
             headed += 1
         elif _NUM_ITEM.match(ln):
             name, is_start = _NUM_ITEM.match(ln).group(2).strip(" .,;"), True
+            if headed:
+                # Under a 'Seasoning name:' header the rep's own numbering
+                # IS the form (Pran Foods 09-Sep: header + 1./2./3. with a
+                # code line under each) — count it toward the gate.
+                headed += 1
         elif (cur is not None and _NAME_LIKE_LINE.match(ln)
               and len(ln.split()) <= 5 and not _SENTENCE_WORDS.search(ln)):
             name, is_start = ln.strip(" .,;"), True
@@ -1327,6 +1347,8 @@ def _ground(d: dict, text: str) -> dict:
         s = str(val).strip().lower()
         if not s:
             return False
+        if " ".join(s.split()) in low:
+            return True   # verbatim in the message (e.g. 'NP BAG' — all short tokens)
         for n in re.findall(r"\d+(?:\.\d+)?", s):
             if n in low:
                 return True

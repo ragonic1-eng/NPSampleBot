@@ -1690,10 +1690,13 @@ def apply_fields(draft: dict, fields: dict,
                 pass
         elif k == "rtype" and v in ("new", "rep", "mod"):
             d["rtype"] = v
+            if v == "new":
+                d["base_code"], d["base_code_unknown"] = "", False
             d["rtype_label"] = {"new": "New", "rep": "Repeat",
                                 "mod": "Modify"}[v]
         elif k == "base_code":
             d["base_code"] = str(v).upper()
+            d["base_code_unknown"] = bool(unknown_codes([d["base_code"]]))
         elif k == "base":
             draft["ask"].base = str(v)
             draft.setdefault("src", {})["base"] = "you"
@@ -2276,9 +2279,12 @@ class SRWriter:
             if n not in self._indices(html3) or (probe and probe not in page3):
                 log.warning("SR request%s: MMS did not keep the item (probe=%r) %s",
                             n, probe, self._mms_error(html3))
+                hint = (f" — MMS refuses a {rtype} request whose base code "
+                        f"({base_code}) is not a product it knows"
+                        if rtype in ("rep", "mod") and base_code else "")
                 return self._bail(sr_code,
                                   f"request{n}: MMS did not keep the new item "
-                                  f"(your text is not on the page)")
+                                  f"(your text is not on the page){hint}")
             # Resolve the assignee's user-id from THIS page: the new section
             # now exists and carries the 'Next action by' dropdown. A brand
             # new SR has no dropdown at all before this point (SUBEIH).
@@ -2713,6 +2719,34 @@ def _proposed_need_by(src: dict) -> str:
     return f"BY {day.strftime('%d %b %Y').upper()}"
 
 
+_CODE_KNOWN: dict[str, bool] = {}
+
+
+def unknown_codes(codes) -> list[str]:
+    """Codes MMS's product master does NOT know. Pran Foods 10-Sep:
+    'S-83EH5-08' was a typo, and MMS silently refused the whole request
+    (the Repeat/Modify base code must be a real product) - the bot said
+    'saved' and nothing was written. Checked read-only, cached per
+    process; a network hiccup counts as 'unknown status', never as
+    'missing', so it can't block a raise by itself."""
+    out = []
+    for code in dict.fromkeys(c.upper() for c in (codes or []) if c):
+        if code not in _CODE_KNOWN:
+            try:
+                import mms_product
+                mms_product.get_client().find_sid(code)   # light: search only
+                _CODE_KNOWN[code] = True
+            except Exception as e:  # noqa: BLE001
+                if type(e).__name__ == "ProductNotFound":
+                    _CODE_KNOWN[code] = False
+                else:
+                    log.warning("code check skipped for %s: %s", code, e)
+                    continue
+        if _CODE_KNOWN.get(code) is False:
+            out.append(code)
+    return out
+
+
 def build_draft(user_id: int, text: str, force_customer: str = "",
                 force_sr_code: str = "") -> dict:
     """Everything needed to render + submit. Fetches the SR page once for
@@ -2865,6 +2899,13 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
     # guessing; an explicit override still wins for flexibility.
     assignee = ask.overrides.get("assignee") or TERRITORY_ASSIGNEE[prefix]
 
+    # Every code he typed is checked against MMS before the card shows;
+    # an unknown BASE code blocks the submit (MMS would refuse silently).
+    # Only the BASE code is checked (one MMS search, ~1-2 s): it is the
+    # one MMS validates. Checking every code cost 113 s on a 4-code ask.
+    d["unknown_codes"] = (unknown_codes([d["base_code"]])
+                          if d.get("rtype") in ("rep", "mod") and d.get("base_code") else [])
+    d["base_code_unknown"] = bool(d["unknown_codes"])
     import time as _time
     token = secrets.token_hex(3)
     draft = {
@@ -2881,7 +2922,8 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
         # customer expects the seasoning; the bot writes it into the note
         # and sets the SR's until dropdown. Submit refuses while missing.
         "missing": [k for k, v in
-                    (("bag", bag), ("ship-to", attn or addr))
+                    (("bag", bag), ("ship-to", attn or addr),
+                     ("base-code", "" if d["base_code_unknown"] else "ok"))
                     if not v],
         # Smart-fill status for Alex's standard form (each '*' field):
         # 'you' = he wrote it · a source label = the bot filled it from

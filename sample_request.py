@@ -1691,12 +1691,15 @@ def apply_fields(draft: dict, fields: dict,
         elif k == "rtype" and v in ("new", "rep", "mod"):
             d["rtype"] = v
             if v == "new":
-                d["base_code"], d["base_code_unknown"] = "", False
+                d["base_code"] = ""
+                d.pop("fallback_new_from", None)
             d["rtype_label"] = {"new": "New", "rep": "Repeat",
                                 "mod": "Modify"}[v]
         elif k == "base_code":
             d["base_code"] = str(v).upper()
-            d["base_code_unknown"] = bool(unknown_codes([d["base_code"]]))
+            if unknown_codes([d["base_code"]]):
+                d["fallback_new_from"] = d["base_code"]
+                d["rtype"], d["rtype_label"], d["base_code"] = "new", "New", ""
         elif k == "base":
             draft["ask"].base = str(v)
             draft.setdefault("src", {})["base"] = "you"
@@ -2905,7 +2908,14 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
     # one MMS validates. Checking every code cost 113 s on a 4-code ask.
     d["unknown_codes"] = (unknown_codes([d["base_code"]])
                           if d.get("rtype") in ("rep", "mod") and d.get("base_code") else [])
-    d["base_code_unknown"] = bool(d["unknown_codes"])
+    d["base_code_unknown"] = False
+    if d["unknown_codes"]:
+        # Alex 10-Sep: never block on this. Repeat/Modify was the bot's
+        # own guess; MMS refuses it when the base code is not a product
+        # it knows, so raise as New (no base code) - the note carries
+        # every code he typed. The card says so on the Type row.
+        d["fallback_new_from"] = d["base_code"]
+        d["rtype"], d["rtype_label"], d["base_code"] = "new", "New", ""
     import time as _time
     token = secrets.token_hex(3)
     draft = {
@@ -2922,8 +2932,7 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
         # customer expects the seasoning; the bot writes it into the note
         # and sets the SR's until dropdown. Submit refuses while missing.
         "missing": [k for k, v in
-                    (("bag", bag), ("ship-to", attn or addr),
-                     ("base-code", "" if d["base_code_unknown"] else "ok"))
+                    (("bag", bag), ("ship-to", attn or addr))
                     if not v],
         # Smart-fill status for Alex's standard form (each '*' field):
         # 'you' = he wrote it · a source label = the bot filled it from

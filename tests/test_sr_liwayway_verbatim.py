@@ -36,10 +36,11 @@ BEEF BBQ CONCENTRATE
 Milk seasoning
 
 Comment:
-BEEF BBQ CONCENTRATE-
+BEEF BBQ CONCENTRATE S-D3J23-02-Y2 -
 Customer wants to do final trial. So requesting more seasoning.
 
-Milk seasoning- customer wants to run market trial also. Shortlisted seasoning.
+Milk seasoning S-AA7L4-Y2 -
+customer wants to run market trial also. Shortlisted seasoning.
 
 TARGET BASE: Corn puff
 BAG: NP BAG
@@ -102,3 +103,16 @@ def test_customer_wants_sentence_is_not_a_customer_label():
     assert not srq._GLOBAL_FIELD_RE.match("Customer wants to do final trial.")
     assert srq._GLOBAL_FIELD_RE.match("Customer: liwayway bangladesh")
     assert srq._GLOBAL_FIELD_RE.match("Customer name: Apacific")
+
+
+def test_comment_header_carries_the_code_and_the_note_starts_below():
+    """Alex 10-Sep: "only comment is required to include the product code"."""
+    a = srq.parse_ask(MSG)
+    body = srq.render_reqnote(_draft(a)).split("Comment:")[1].split("TARGET BASE")[0]
+    assert "BEEF BBQ CONCENTRATE S-D3J23-02-Y2 -" in body
+    assert "Milk seasoning S-AA7L4-Y2 -" in body
+    # the note is never left on the header line
+    assert "S-AA7L4-Y2 - customer wants" not in body
+    # and the codes stay OUT of the Seasoning name section
+    head = srq.render_reqnote(_draft(a)).split("Comment:")[0]
+    assert "S-D3J23-02-Y2" not in head and "S-AA7L4-Y2" not in head

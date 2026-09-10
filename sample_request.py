@@ -3171,6 +3171,63 @@ def _strip_codes(name: str) -> str:
 
 
 
+def _comment_paragraphs(ask) -> list[list[str]]:
+    """His Comment section split into one paragraph per item: a line that
+    starts with an item's name opens a new paragraph, everything under it
+    belongs to that item."""
+    paras: list[list[str]] = []
+    for ln in ask.comment_verbatim:
+        if _comment_head(ask, ln) is not None or not paras:
+            paras.append([ln])
+        else:
+            paras[-1].append(ln)
+    return paras
+
+
+def _comment_head(ask, line: str):
+    """(block, name as he typed it here, rest of the line) when `line`
+    opens an item's paragraph; else None."""
+    # longest name first: 'Cheese Seasoning Extra' must win over 'Cheese
+    # Seasoning' when both are on the request
+    for f in sorted(ask.flavours, key=lambda b: -len(_strip_codes(b["name"]))):
+        name = _strip_codes(f["name"])
+        if not name:
+            continue
+        m = re.match(re.escape(name) + r"\s*[-\u2013\u2014:]*\s*(.*)$",
+                     line.strip(), re.IGNORECASE)
+        if m:
+            return f, line.strip()[:len(name)], m.group(1).strip()
+    return None
+
+
+def _comment_block(ask) -> list[str]:
+    """The Comment section as it goes into MMS.
+
+    Alex 10-Sep: "only comment is required to include the product code" —
+    each item's header line reads 'NAME S-CODE -' with the note on the
+    next line. His own lines are otherwise untouched, and a paragraph
+    that ALREADY carries its code (Pran Foods: the code sits on its own
+    line under the name) is left exactly as he typed it."""
+    out: list[str] = []
+    for para in _comment_paragraphs(ask):
+        if out:
+            out.append("")                      # blank line between items
+        head = _comment_head(ask, para[0])
+        if head is None:
+            out.extend(para)
+            continue
+        f, typed, rest = head
+        code = (f.get("code") or "").strip()
+        if code and code.lower() not in " ".join(para).lower():
+            out.append(f"{typed} {code} -")
+            if rest:
+                out.append(rest)                # the note starts on its own line
+            out.extend(para[1:])
+        else:
+            out.extend(para)
+    return out
+
+
 def render_reqnote(draft: dict) -> str:
     """The text written into MMS — the thing R&D actually reads.
 
@@ -3211,14 +3268,9 @@ def render_reqnote(draft: dict) -> str:
         comment_lead = "No prefer code." if no_code else ""
         lines.append(f"Comment: {comment_lead}".rstrip())
         if ask.comment_verbatim:
-            # His Comment section, word for word; a blank line before
-            # each item paragraph (Alex 10-Sep expected output).
-            names_sq = [_sq(_strip_codes(f["name"])) for f in ask.flavours]
-            for j, cl in enumerate(ask.comment_verbatim):
-                if j and any(_sq(cl).startswith(n) for n in names_sq if n) \
-                        and lines[-1] != "":
-                    lines.append("")
-                lines.append(cl)
+            # His Comment section: his words, one paragraph per item,
+            # each header carrying that item's product code.
+            lines.extend(_comment_block(ask))
             lines.append("")
         for i, f in enumerate(ask.flavours if not ask.comment_verbatim else [], 1):
             # A block with its OWN quantity (Alex's form: '50G ...' under each

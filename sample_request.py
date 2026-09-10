@@ -2808,12 +2808,65 @@ def _usual_courier(country: str) -> str:
     return c.most_common(1)[0][0] if c else ""
 
 
+def _sr_customer_label(page_html: str) -> str:
+    """The customer printed on an SR page: '(liwayway bangladesh)' for a
+    temporary-name customer, 'S-UDP041 Pran Foods Ltd' for a registered
+    one. Returns the bare name."""
+    import html as _html
+    flat = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", _html.unescape(page_html)))
+    m = re.search(r"Customer ID\s+(.+?)\s+Customer List", flat)
+    if not m:
+        return ""
+    raw = m.group(1).strip()
+    if raw.startswith("(") and raw.endswith(")"):
+        return raw[1:-1].strip()
+    m2 = re.match(r"^[SJBC]-[A-Z0-9]+\s*:?\s*(.+)$", raw, re.I)
+    return (m2.group(1) if m2 else raw).strip()
+
+
+def _known_in_mms(name: str):
+    """(customer label, SR code, logged-in writer) when MMS already holds
+    an SR for exactly this customer name; else None.
+
+    Alex 10-Sep: he created 'liwayway bangladesh' through the bot
+    (S-19AS43-001) and the next /sr asked 'existing or new?' again - the
+    bot's customer knowledge came only from the Google master and the
+    sample history, never from MMS. Memory first (instant, written at
+    creation and at every raise), then MMS's SR list by name, accepted
+    only when the SR's own customer label equals the typed name - a
+    partial like 'liwayway' must still ask."""
+    key = " ".join((name or "").lower().split())
+    if not key:
+        return None
+    code = mem_get(name, "sr_code")
+    if code:
+        return name, code, None
+    try:
+        w = SRWriter()
+        if not w.login():
+            return None
+        code = w.find_sr_by_name(name)
+        if not code:
+            return None
+        label = _sr_customer_label(w.get_page(code))
+        if _sq(label) != _sq(name):
+            log.info("SR by name %r is %r (%s) - not an exact match, asking",
+                     name, label, code)
+            return None
+        mem_set(name, "sr_code", code)
+        return (label or name), code, w
+    except Exception as e:  # noqa: BLE001
+        log.warning("MMS customer lookup for %r failed: %s", name, e)
+        return None
+
+
 def build_draft(user_id: int, text: str, force_customer: str = "",
                 force_sr_code: str = "") -> dict:
     """Everything needed to render + submit. Fetches the SR page once for
     ship-to/compliance provenance and section count. `force_customer`
     skips name resolution (the 'which one did you mean' button flow)."""
     ask = parse_ask(text)
+    pre_w = None   # an MMS session already opened by the customer lookup
     if force_customer:
         customer = force_customer
     else:
@@ -2829,10 +2882,14 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
                 candidates = [best] + [c for c in (candidates or [])
                                        if c.get("name") != best.get("name")]
                 best = None
-        if best is None:
+        known = _known_in_mms(ask.customer_text) if best is None else None
+        if known:
+            customer, force_sr_code, pre_w = known
+        elif best is None:
             return {"error": "ambiguous", "candidates": candidates,
                     "customer_text": ask.customer_text, "raw_text": text}
-        customer = best["name"]
+        else:
+            customer = best["name"]
     hist = customer_history(customer)
     d = derive_defaults(hist, ask)
 
@@ -2842,8 +2899,8 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
     page_err = ""
     sr_code = force_sr_code or ""
     try:
-        w = SRWriter()
-        if w.login():
+        w = pre_w or SRWriter()
+        if pre_w is not None or w.login():
             if not sr_code:
                 sr_code = w.newest_sr_for(customer)
             if not sr_code:
@@ -3362,3 +3419,5 @@ def remember_submitted(draft: dict) -> None:
     for key in ("bag", "budget", "attn", "contact", "addr"):
         if draft.get(key):
             mem_set(c, key, draft[key])
+    if draft.get("sr_code"):
+        mem_set(c, "sr_code", draft["sr_code"])   # next /sr finds them instantly

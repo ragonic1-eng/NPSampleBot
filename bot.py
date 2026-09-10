@@ -10499,6 +10499,9 @@ async def _sr_create_new_customer(update, draft, token, srq) -> None:
         await send(update, f"🛑 <b>Not created:</b> {h(result['detail'])}")
         return
     await prog.step(h(result["detail"]), "Assembling the request draft")
+    # remember the new SR so the next /sr for this name never asks
+    # "existing or new?" again (Alex 10-Sep, liwayway bangladesh)
+    await asyncio.to_thread(srq.mem_set, name, "sr_code", result["code"])
     try:
         new = await asyncio.to_thread(
             srq.build_draft, update.effective_user.id,

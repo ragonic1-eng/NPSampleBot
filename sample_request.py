@@ -308,8 +308,15 @@ _COMPANY_LINE = re.compile(
 # A carrier name alone on a line is the delivery method. Only the names
 # _DELIVERY_LINE doesn't already catch - courier / hand-carry / self-collect
 # keep their existing, richer handling (desk address etc.).
+# 'fedex' alone, or 'Send by DHL' / 'ship via FedEx' / 'courier: Lalamove'
+# - a line that is nothing but the carrier is the method, never comment
+# text (Alex 11-Sep: it printed beside 'Delivery method: DHL').
 _BARE_METHOD_LINE = re.compile(
-    r"^\s*(fedex|fed\s*ex|dhl|ups)\s*\.?\s*$", re.IGNORECASE)
+    r"^\s*(?:(?:send|ship|deliver|courier|dispatch|post|sent)\s*(?:it\s+)?"
+    r"(?:out\s+)?(?:by|via|through|using|with|:)?\s*)?"
+    r"(fedex|fed\s*ex|dhl|ups|aramex|tnt|lala\s*move|lalamove|"
+    r"grab(?:\s*express)?|ninja\s*van|qxpress|sf\s*express)\s*\.?\s*$",
+    re.IGNORECASE)
 _METHOD_NAMES = {"fedex": "FedEx", "dhl": "DHL", "ups": "UPS"}
 
 
@@ -804,8 +811,12 @@ def _form_blocks(lines: list[str]) -> tuple[list[dict], list[str]]:
             cur["qty"] = f"{num}{'kg' if unit == 'kg' else 'g'}"
             rest = re.sub(r"^(?:and|with|of|[-,:])\s*", "", rest.strip(),
                           flags=re.I)
+            # '50G SEASONING WITH NO APPLIED SAMPLES' is ONE quantity
+            # phrase: the words travel with the figure into the QTY line,
+            # not into the comment under every item (Alex 11-Sep: "no
+            # repeat of content").
             if rest:
-                cur["spec"].append(rest)
+                cur["qty_note"] = rest
             continue
         cur["spec"].append(ln)
     if headed < 2:
@@ -857,6 +868,60 @@ def _extract_shipto(a: Ask, body: list[str]) -> None:
     if addr_ls:
         a.overrides.setdefault("addr", ", ".join(addr_ls))
     del body[lo:hi + 1]
+
+
+# The snack the seasoning goes on, said in passing: 'for potato chips',
+# 'on corn puffs'. Only these base words - a customer or a code after 'for'
+# is not a base.
+_HEAD_BASE = re.compile(
+    r"\b(?:for|on|onto)\s+((?:potato|corn|tortilla|cassava|plantain|banana|"
+    r"prawn|shrimp|fish|rice|wheat|pellet|extruded|puff|puffed|nut|nuts|peanut|"
+    r"peanuts|cracker|crackers|chip|chips|crisp|crisps|snack|snacks|noodle|"
+    r"noodles|popcorn|biscuit|biscuits|wafer|wafers|pretzel|pretzels|seaweed|"
+    r"kurkure|namkeen|chanachur|charnachur|sticks?|balls?)[A-Za-z ]{0,30}?)\s*$",
+    re.IGNORECASE)
+_HEAD_JOIN = re.compile(r"\s*(?:,|\band\b|&|\+)\s*", re.IGNORECASE)
+_HEAD_QTY_TAIL = re.compile(
+    r"\s*(\d+(?:\.\d+)?\s*(?:kg|g)\b(?:\s*(?:each|per\s+\w+|x\s*\d+\s*(?:sets?)?))?)"
+    r"\s*$", re.IGNORECASE)
+
+
+def _peel_head(a: Ask, first_ask: str) -> list[str]:
+    """The casual one-liner (Alex 11-Sep: 'no repeat of content'):
+
+        chilli seasoning and seafood seasoning 200g each for potato chips,
+        need by next friday, budget below 2 usd
+
+    Comma clauses come back as lines so the ordinary field loop can take
+    'need by …' / 'budget …' into the footer instead of leaving them in
+    the Comment. In the item clause a trailing 'for potato chips' is the
+    target base and a trailing amount is the quantity; what is left is a
+    list of items when EVERY part reads as a product name ('X and Y'),
+    otherwise his sentence stays as typed - never a guessed split."""
+    clauses = [c.strip() for c in re.split(r"\s*[,;]\s*", first_ask) if c.strip()]
+    if not clauses:
+        return []
+    out: list[str] = []
+    for c in clauses:
+        s = c
+        m = _HEAD_BASE.search(s)
+        if m and not a.base and m.start() > 0:
+            a.base = m.group(1).strip()
+            s = s[:m.start()].strip(" ,.-")
+        qm = _HEAD_QTY_TAIL.search(s)
+        if qm and qm.start() > 0:
+            s = s[:qm.start()].strip(" ,.-")
+            out.append(qm.group(1).strip())
+        parts = [p.strip(" .") for p in _HEAD_JOIN.split(s) if p.strip(" .")]
+        if (len(parts) >= 2
+                and all(_NAME_LIKE_LINE.match(p) and not _SENTENCE_WORDS.search(p)
+                        for p in parts)):
+            for p in parts:
+                _add_item(a, p)
+            continue
+        if s:
+            out.append(s)
+    return out
 
 
 def _structure_body(a: Ask, body: list[str]) -> None:
@@ -1027,6 +1092,8 @@ def parse_ask(text: str) -> Ask:
         qm_inline = _QTY_INLINE.match(ln)
         if qm_inline:
             a.qty_text = qm_inline.group(1).strip(" .")
+            if re.search(r"\beach\b|\bper\b", a.qty_text, re.I):
+                a.qty_each = True
             m_amt = _QTY_RE.search(a.qty_text)
             if m_amt and a.qty_g is None:
                 n_ = float(m_amt.group(1))
@@ -1108,16 +1175,23 @@ def parse_ask(text: str) -> Ask:
             a.customer_text, first_ask = " ".join(words[:3]), " ".join(words[3:])
         rest = lines[1:]
 
-    body: list[str] = [first_ask] if first_ask else []
+    body: list[str] = []
+    if first_ask:
+        rest = _peel_head(a, first_ask) + list(rest)
     for line in rest:
         consumed = False
         bm = _BUDGET_LINE.search(line)
-        if bm and "budget" not in a.overrides:
+        # A labelled line ('Budget: <2 usd', 'Need by: 20 Sept') is the
+        # field itself: it is consumed even when a sentence above already
+        # mentioned the value, or it prints twice (Alex 11-Sep). The
+        # sentence stays - those are his words; the label was for us.
+        _lab_budget = bool(re.match(r"^\s*budget\b", line, re.I))
+        if bm and ("budget" not in a.overrides or _lab_budget):
             val = (bm.group(1) or bm.group(2) or bm.group(3) or "").strip()
             if val:
                 a.overrides["budget"] = val
                 consumed = True
-            else:
+            elif "budget" not in a.overrides:
                 a.hints.add("budget")
         cm = _COMPLIANCE_PRE.match(line) or _COMPLIANCE_LINE.search(line)
         if cm and "compliance" not in a.overrides:
@@ -1133,10 +1207,12 @@ def parse_ask(text: str) -> Ask:
                                   else "Empty bag")
             consumed = consumed or len(line) < 40
         nm = _NEEDBY_LINE.search(line) or _EXPECTED_OUT_LINE.search(line)
-        if nm and "need_by" not in a.overrides:
+        _lab_need = bool(re.match(
+            r"^\s*(?:need(?:ed)?(?:\s+it)?\s+by|expected|target\s+to)\b", line, re.I))
+        if nm and ("need_by" not in a.overrides or _lab_need):
             a.overrides["need_by"] = (
-                nm.group(1) or nm.group(2) or nm.group(3) or "").strip()
-            consumed = consumed or len(line) < 60
+                nm.group(1) or nm.group(2) or nm.group(3) or "").strip(" .")
+            consumed = consumed or len(line) < 60 or _lab_need
         rc = _RECEIVER_LINE.match(line)
         if rc and len(line) < 90 and "attn" not in a.overrides:
             a.overrides["attn"] = rc.group(1).strip()
@@ -1178,6 +1254,16 @@ def parse_ask(text: str) -> Ask:
             if re.search(r"\beach\b|\bper\b", line, re.I):
                 a.qty_each = True
             consumed = consumed or len(line) < 30
+            # '100g each no application' - the words after the figure are
+            # part of the quantity and print in QTY as typed; a bare
+            # '200g' / '200g each' keeps the derived 'x 1 set' form.
+            _extra = re.sub(r"\b\d+(?:\.\d+)?\s*(?:kg|g)\b", " ", line, flags=re.I)
+            _extra = re.sub(r"\b(?:each|per|for|every|all|x\s*\d+|sets?|of|the|"
+                            r"samples?|mention(?:ed)?|flavou?rs?|seasonings?|items?)\b",
+                            " ", _extra, flags=re.I)
+            if (consumed and not a.qty_text
+                    and len(re.findall(r"[A-Za-z]{2,}", _extra)) >= 2):
+                a.qty_text = line.strip(" .")
         if not consumed:
             body.append(line)
 
@@ -1189,8 +1275,9 @@ def parse_ask(text: str) -> Ask:
         mwl = _BARE_METHOD_LINE.match(line)
         if mwl:
             if not a.delivery:
-                a.delivery = _METHOD_NAMES.get(
-                    re.sub(r"\s", "", mwl.group(1)).lower(), mwl.group(1))
+                _cw = " ".join(mwl.group(1).lower().split())
+                a.delivery = (_METHOD_NAMES.get(re.sub(r"\s", "", _cw))
+                              or _COURIER_NAME.get(_cw) or mwl.group(1).title())
             continue
         # A 'Comment:' header with nothing behind it, or with only another
         # bare header behind it ('Comment: Seasoning:'), is scaffolding from
@@ -1411,7 +1498,10 @@ not stated:
 verbatim), "qty_g": int|null, "sets": int|null, "bag": str|null,
 "budget": str|null, "compliance": str|null, "attn": str|null,
 "contact": str|null, "addr": str|null, "need_by": str|null,
-"rtype": "new"|"rep"|"mod"|null, "base_code": str|null}}
+"rtype": "new"|"rep"|"mod"|null, "base_code": str|null,
+"base": str|null (the snack the seasoning goes ON - "potato chips", "corn
+puff" - only when he says so), "items": [str] (every distinct seasoning /
+product name he asks for, exactly as he typed each; [] if none)}}
 
 Rules: 'repeat X' → rtype rep, base_code X. 'modify/change X' → rtype mod.
 "cheap as possible" etc → budget as stated. Never invent values.
@@ -1525,8 +1615,16 @@ def _ground(d: dict, text: str) -> dict:
                 return True
         return False
 
+    # items: each must sit in his message as typed (whitespace aside)
+    items = d.get("items")
+    if isinstance(items, list):
+        d["items"] = [str(i).strip() for i in items
+                      if isinstance(i, str) and i.strip()
+                      and " ".join(str(i).lower().split()) in low]
+    else:
+        d["items"] = []
     for key in ("qty_g", "sets", "bag", "budget", "compliance", "attn",
-                "contact", "addr", "need_by", "base_code"):
+                "contact", "addr", "need_by", "base_code", "base"):
         v = d.get(key)
         if v in (None, "", [], 0):
             continue
@@ -1840,12 +1938,45 @@ def draft_from(user_id: int, text: str, parsed: dict | None) -> dict:
         if not alt.get("error"):
             return alt
     if parsed and not draft.get("error"):
+        src = draft.setdefault("src", {})
+        # His words, read by the model and grounded in the message, beat a
+        # value the bot PROPOSED from history or country ('CHECK
+        # PHILIPPINES RA' beats the customer's home Singapore) - never a
+        # value he stated himself ('you') or one flagged for confirming.
         fills = {k: v for k, v in parsed.items()
                  if k in ("bag", "budget", "compliance", "attn", "contact", "addr")
-                 and v and not draft.get(k)}
+                 and v and (not draft.get(k) or src.get(k) not in ("you", "confirm"))}
+        if fills.get("compliance"):
+            fills["compliance"] = _normalize_markets(str(fills["compliance"])) \
+                or str(fills["compliance"])
         if parsed.get("need_by") and _DEADLINE_WORDS.search(text) \
-                and draft.get("src", {}).get("need_by") != "you":
-            fills["need_by"] = str(parsed["need_by"]).upper()
+                and src.get("need_by") != "you":
+            fills["need_by"] = _need_by_text(str(parsed["need_by"]), src)
+        ask = draft["ask"]
+        if parsed.get("base") and not ask.base:
+            ask.base = str(parsed["base"]).strip()
+            src["base"] = "you"
+            if "fields" in draft:
+                draft["fields"]["Target base"] = "you"
+        _items = [i for i in (parsed.get("items") or []) if i]
+        if len(_items) >= 2 and not ask.flavours:
+            _sq = lambda s: " ".join(str(s).lower().split())  # noqa: E731
+            blob = ask.items[0] if len(ask.items) == 1 else ""
+            line = next((l for l in ask.ask_text.splitlines()
+                         if all(_sq(i) in _sq(l) for i in _items)), "")
+            if blob and all(_sq(i) in _sq(blob) for i in _items):
+                # 'Naga seasoning jalapenos seasoning Chilli seasoning' on
+                # one line was one item - his three, in his order
+                ask.items = []
+                for i in _items:
+                    _add_item(ask, i)
+            elif not ask.items and line and len(line) < 120:
+                for i in _items:
+                    _add_item(ask, i)
+                ask.ask_text = "\n".join(
+                    l for l in ask.ask_text.splitlines() if l != line).strip()
+            if ask.items and "fields" in draft:
+                draft["fields"]["Seasoning name"] = "you"
         d = draft["derived"]
         if parsed.get("base_code") and not d.get("base_code") \
                 and _CODE_ONLY.match(str(parsed["base_code"])):
@@ -2749,6 +2880,54 @@ def compliance_for(ask, country: str = "") -> tuple[str, str]:
     return "", ""
 
 
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday",
+             "saturday", "sunday")
+
+
+def _relative_need_by(phrase: str, today=None):
+    """'next friday', 'this week', 'in 2 weeks', 'end of month', 'tomorrow'
+    -> a date, or None when the words are not a date ('asap' stays words).
+    Sundays/Saturdays roll to the next weekday. Alex 11-Sep: MMS wants a
+    date and the rep typed one - just not in numbers."""
+    from datetime import datetime, timedelta, timezone
+    s = " ".join((phrase or "").lower().replace("nxt", "next").split())
+    today = today or datetime.now(timezone(timedelta(hours=8))).date()
+    day = None
+    m = re.search(r"\b(next|this|coming)\s+(" + "|".join(_WEEKDAYS) + r")\b", s)
+    if m:
+        want = _WEEKDAYS.index(m.group(2))
+        day = today + timedelta(days=(want - today.weekday()) % 7 or 7)
+    elif re.search(r"\btomorrow\b", s):
+        day = today + timedelta(days=1)
+    elif re.search(r"\b(?:end\s+of\s+(?:this\s+)?(?:the\s+)?week|this\s+week)\b", s):
+        day = today + timedelta(days=(4 - today.weekday()) % 7 or 7)
+    elif re.search(r"\bnext\s+week\b", s):
+        day = today + timedelta(days=7)
+    elif (m := re.search(r"\b(?:in|within)\s+(\d+)\s+(day|week|month)s?\b", s)):
+        n = int(m.group(1))
+        day = today + timedelta(days=n * {"day": 1, "week": 7, "month": 30}[m.group(2)])
+    elif re.search(r"\b(?:end\s+of\s+(?:this\s+|the\s+)?month|month\s*end)\b", s):
+        nxt = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
+        day = nxt - timedelta(days=1)
+    if day is None:
+        return None
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
+def _need_by_text(typed: str, src: dict) -> str:
+    """What NEED BY says for the words he typed: a real date is proposed
+    from a relative phrase (labelled with his words, calendar to change),
+    otherwise his words in capitals."""
+    typed = (typed or "").strip(" .")
+    day = _relative_need_by(typed) if typed else None
+    if day is not None:
+        src["need_by"] = f"from '{typed}'"
+        return f"BY {day.strftime('%d %b %Y').upper()}"
+    return typed.upper()
+
+
 def _proposed_need_by(src: dict) -> str:
     """No date given -> propose one week out (next weekday), labelled so the
     card shows it as a proposal with the calendar to change it. Alex 09-Sep:
@@ -3064,7 +3243,7 @@ def build_draft(user_id: int, text: str, force_customer: str = "",
         "ask": ask, "derived": d, "bag": bag, "budget": budget,
         "compliance": compliance, "attn": attn, "contact": contact,
         "addr": addr, "assignee": assignee,
-        "need_by": ((ask.overrides.get("need_by") or "").upper()
+        "need_by": (_need_by_text(ask.overrides.get("need_by") or "", src)
                     or _proposed_need_by(src)),
         "page_err": page_err, "src": src,
         # need-by has NO default (Alex, 01 Sep): the rep keys in when the
@@ -3150,7 +3329,7 @@ def _item_qty(ask: "Ask", f: dict, default: str) -> str:
     figure, else the amount he paired with this item, else his global
     Qty words without the 'each sample' lead-in, else the request default."""
     if f.get("qty"):
-        return f["qty"]
+        return (f["qty"] + " " + (f.get("qty_note") or "")).strip()
     nm = f["name"].lower()
     for q, n in ask.item_qty:
         if n and (n.lower() in nm or nm in n.lower()):

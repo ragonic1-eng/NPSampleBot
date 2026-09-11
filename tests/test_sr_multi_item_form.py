@@ -84,7 +84,10 @@ def test_each_item_keeps_its_own_comment_and_quantity():
     assert f["TAIWAN SAUSAGE SEASONING"]["qty"] == "100g"
     assert f["TAIWAN SAUSAGE SEASONING"]["spec"][0] == "NEW SAMPLE"
     assert f["S-B5KL1 ONION MUSTARD SEASONING"]["qty"] == "50g"
-    assert f["S-B5KL1 ONION MUSTARD SEASONING"]["spec"] == ["NO APPLICATIONS"]
+    # Alex 11-Sep: the words after the figure belong to the quantity line,
+    # not to a comment repeated under every item
+    assert f["S-B5KL1 ONION MUSTARD SEASONING"]["spec"] == []
+    assert f["S-B5KL1 ONION MUSTARD SEASONING"]["qty_note"] == "NO APPLICATIONS"
     # the PH-code note names the salted egg item -> travels with it
     assert f["SALTED EGG SEASONING"]["spec"] == [
         "NO PH CODE – PENDING FOR REGENT SALTED EGG CODE."]
@@ -113,7 +116,11 @@ def test_rendered_note_is_one_numbered_item_per_block():
     assert "2. S-K9U15-08 TAKOYAKI SEASONING\n" in note
     assert "x 1 set" not in note.split("QTY:")[0]
     qty = note.split("QTY:")[1]
-    assert "SAMBAL CHILLI SEASONING- 50g" in qty
+    assert "SAMBAL CHILLI SEASONING- 50g SEASONING WITH NO APPLIED SAMPLES" in qty
+    # three items carry that phrase (the Doritos one says SAMPLE): each
+    # prints it once, in QTY, never under the item in the comment
+    assert note.count("SEASONING WITH NO APPLIED SAMPLES") == 3
+    assert "APPLIED SAMPLE" not in note.split("QTY:")[0]
     assert "TAKOYAKI SEASONING- 100g" in qty        # names only, no code
     assert "SALTED EGG SEASONING- 50g x 1 set" in qty   # request default
     assert "AMERICAN DORITOS CORIANDER FLAVOR CORN CHIPS- 50g" in qty

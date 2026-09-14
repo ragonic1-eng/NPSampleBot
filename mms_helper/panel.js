@@ -45,16 +45,35 @@
   const notes = () => [...document.querySelectorAll('textarea[name^="sreq1["][name$=".reqnote"]')];
   const idxOf = (el) => Number((el.name.match(/sreq1\[(\d+)\]/) || [])[1]);
   const emptySection = () => notes().find((t) => !t.value.trim()) || null;
+  // the item to write into: the one we already filled on this page, else an empty one
+  const openItem = () => notes().find((t) => idxOf(t) === state.writtenTo) || emptySection();
 
-  const flat = document.body.innerText.replace(/\s+/g, ' ');
+  /* The real page (checked 14-Sep on S13ES43-001) prints the header as
+       S13ES43-001 (20221)   14/Mar/2026
+       S-UDP035   Pham Asset Joint Venture Co.
+     and each saved item's request log as plain text with its line breaks
+     ("27/May/2026   Request from Alex" / "New sample" / the note). The
+     note textarea (sreq1[N].reqnote) only exists on an item added and not
+     yet requested. So everything is read from the page TEXT, the way the
+     bot's shipto_from_sr_page does, and the dropdowns' option lists are
+     dropped first. */
+  const pageLines = (() => {
+    const clone = document.body.cloneNode(true);
+    clone.querySelectorAll('select, script, style, #nph-root, #nph-toast').forEach((e) => e.remove());
+    clone.style.cssText = 'position:absolute;left:-99999px;top:0;white-space:normal';
+    document.body.appendChild(clone);
+    const t = clone.innerText;
+    clone.remove();
+    return t.split(/\r?\n/).map((l) => l.replace(/ /g, ' ').trim());
+  })();
   let customer = '';
   {
-    const m = flat.match(/Customer ID\s+(.+?)\s+Customer List/);
-    if (m) {
-      let raw = m[1].trim();
-      if (raw.startsWith('(') && raw.endsWith(')')) raw = raw.slice(1, -1);
-      const m2 = raw.match(/^[SJBC]-[A-Z0-9]+\s*:?\s*(.+)$/i);
-      customer = (m2 ? m2[1] : raw).trim();
+    const at = pageLines.findIndex((l) => l.toUpperCase().startsWith(SR.toUpperCase()));
+    for (const ln of pageLines.slice(at + 1, at + 6)) {
+      if (!ln) continue;
+      const reg = ln.match(/^[SJBC]-[A-Z0-9]+\s+(.+)$/i);          // registered: S-UDP035  Name
+      const tmp = ln.match(/^\((.+)\)$/);                          // temporary-name customer
+      if (reg || tmp) { customer = (reg ? reg[1] : tmp[1]).trim(); break; }
     }
   }
 
@@ -74,12 +93,15 @@
   };
   const history = { attn: '', contact: '', addr: '', compliance: '', bag: '', budget: '', base: '', method: '', qty: '',
                     src: {}, names: [] };
-  const saved = notes().filter((t) => t.value.trim());
-  saved.forEach((t) => {
-    const n = idxOf(t) + 1;
-    const lines = t.value.split(/\r?\n/).map((l) => l.trim());
+  {
+    // walk the page text; '(N)  Next action by' opens item N, so a value
+    // found below it came from that item — the last one found wins
+    let n = 0;
     let inNames = false;
-    for (const ln of lines) {
+    for (const ln of pageLines) {
+      const item = ln.match(/^\((\d+)\)\s*Next action by/i);
+      if (item) { n = Number(item[1]); inNames = false; continue; }
+      if (!n) continue;
       if (/^seasoning\s*names?\s*:?\s*$/i.test(ln)) { inNames = true; continue; }
       if (!ln || /^[A-Za-z][A-Za-z .]{1,24}:/.test(ln) || /^comment/i.test(ln)) inNames = false;
       if (inNames && ln && ln.length < 70 && !/^[SJBC]-[A-Z0-9-]+$/i.test(ln)) {
@@ -97,10 +119,34 @@
         }
       }
     }
-  });
+  }
   // Compliance is a regulatory field: never an old note's value, propose
   // the customer's country from the address instead (bot rule, 09-Sep).
-  const country = MARKETS.find((c) => new RegExp(`\\b${c}\\b`, 'i').test(`${history.addr} ${customer}`)) || '';
+  // Addresses often name only the city ('HO CHI MINH CITY'), so the phone's
+  // dialling code and the big cities count too (checked on S13ES43-001).
+  const DIAL = { '+880': 'Bangladesh', '+84': 'Vietnam', '+62': 'Indonesia', '+66': 'Thailand', '+60': 'Malaysia',
+    '+63': 'Philippines', '+65': 'Singapore', '+92': 'Pakistan', '+977': 'Nepal', '+94': 'Sri Lanka', '+95': 'Myanmar',
+    '+855': 'Cambodia', '+86': 'China', '+886': 'Taiwan', '+852': 'Hong Kong', '+81': 'Japan', '+82': 'Korea',
+    '+91': 'India', '+962': 'Jordan', '+966': 'Saudi Arabia', '+971': 'UAE', '+965': 'Kuwait', '+974': 'Qatar',
+    '+973': 'Bahrain', '+968': 'Oman', '+963': 'Syria', '+961': 'Lebanon', '+90': 'Turkey', '+20': 'Egypt',
+    '+234': 'Nigeria', '+27': 'South Africa', '+61': 'Australia', '+64': 'New Zealand', '+52': 'Mexico' };
+  const CITY = [[/ho chi minh|hanoi|saigon|da nang/i, 'Vietnam'], [/dhaka|chittagong|chattogram|gazipur/i, 'Bangladesh'],
+    [/jakarta|surabaya|bandung|tangerang|bekasi/i, 'Indonesia'], [/bangkok|samut|nonthaburi/i, 'Thailand'],
+    [/kuala lumpur|selangor|johor|penang/i, 'Malaysia'], [/manila|cavite|laguna|quezon/i, 'Philippines'],
+    [/karachi|lahore|islamabad/i, 'Pakistan'], [/kathmandu|lalitpur|biratnagar/i, 'Nepal'], [/colombo/i, 'Sri Lanka'],
+    [/yangon|mandalay/i, 'Myanmar'], [/phnom penh/i, 'Cambodia'], [/amman/i, 'Jordan'], [/riyadh|jeddah|dammam/i, 'Saudi Arabia'],
+    [/dubai|sharjah|abu dhabi/i, 'UAE'], [/doha/i, 'Qatar'], [/damascus|aleppo/i, 'Syria'], [/beirut/i, 'Lebanon']];
+  const countryFrom = () => {
+    const blob = `${history.addr} ${customer}`;
+    const named = MARKETS.find((c) => new RegExp(`\\b${c}\\b`, 'i').test(blob));
+    if (named) return [named, 'their address'];
+    const city = CITY.find(([re]) => re.test(history.addr));
+    if (city) return [city[1], 'their address'];
+    const tel = (history.contact || '').replace(/[\s\-()]/g, '');
+    const code = Object.keys(DIAL).sort((a, b) => b.length - a.length).find((k) => tel.startsWith(k));
+    return code ? [DIAL[code], 'their phone number'] : ['', ''];
+  };
+  const [country, countryWhy] = countryFrom();
 
   const assigneeOpts = (() => {
     const sel = document.querySelector('select[name$=".nextActUserId"]');
@@ -122,11 +168,11 @@
     assignee: (assigneeOpts.find((o) => o.t.toLowerCase() === DEFAULT_ASSIGNEE.toLowerCase()) || assigneeOpts[0] || {}).v || '',
     src: {
       bag: history.bag ? history.src.bag : '', budget: history.budget ? history.src.budget : '',
-      compliance: country ? `their address says ${country}` : '', need_by: 'proposed: 1 week',
+      compliance: country ? `from ${countryWhy}` : '', need_by: 'proposed: 1 week',
       method: history.method ? history.src.method : '', addr: history.src.addr || '',
       attn: history.src.attn || '', contact: history.src.contact || '',
     },
-    open: true, pendingWrite: false,
+    open: true, pendingWrite: false, writtenTo: null, assignPending: null,
   };
   const store = (chrome && chrome.storage && chrome.storage.local) || null;
   const save = () => { try { store ? store.set({ [KEY]: state }) : localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* ignore */ } };
@@ -204,7 +250,7 @@
 
   function render() {
     const g = gaps();
-    const empty = emptySection();
+    const empty = openItem();
     root.className = state.open ? '' : 'is-min';
     root.innerHTML = `
       <div class="nph-head">
@@ -242,7 +288,7 @@
         <details class="nph-preview"><summary>Preview the note</summary><pre>${esc(renderNote())}</pre></details>
         <div class="nph-actions">
           <button type="button" class="nph-btn" data-act="copy">Copy note</button>
-          <button type="button" class="nph-btn nph-primary" data-act="write" ${g.length ? 'disabled title="Fill the missing fields first"' : ''}>${empty ? `Write into item ${idxOf(empty) + 1}` : 'Add item + write'}</button>
+          <button type="button" class="nph-btn nph-primary" data-act="write" ${g.length ? 'disabled title="Fill the missing fields first"' : ''}>${empty ? `${state.writtenTo === idxOf(empty) ? 'Rewrite' : 'Write into'} item ${idxOf(empty) + 1}` : 'Add item + write'}</button>
         </div>
         <p class="nph-foot">Nothing is saved until <b>you</b> press Save in MMS.</p>
         <datalist id="nph-bases">${BASES.map((b) => `<option value="${esc(b)}">`).join('')}</datalist>
@@ -251,44 +297,55 @@
   }
 
   /* ── writing into MMS ────────────────────────────────────── */
-  function setCommand(value) {
-    // MMS (Struts) reads one 'command' parameter; the page's own buttons
-    // set it the same way the bot's payload does.
+  /* MMS's own Add Item button (onclick doAddItem()) — clicking it runs the
+     page's code exactly as a person would. The hidden 'command' post is
+     only the fallback, and is what the bot sends. */
+  function addItem() {
+    const btn = [...document.querySelectorAll('input[type=button],input[type=submit],button')]
+      .find((b) => /doAddItem/.test(b.getAttribute('onclick') || '') || /^add item$/i.test((b.value || b.textContent || '').trim()));
+    if (btn) { btn.click(); return; }
     let cmd = form.querySelector('input[name="command"]');
-    if (cmd && cmd.type === 'submit') {
-      const btn = [...form.querySelectorAll('input[name="command"],button[name="command"]')].find((b) => b.value === value);
-      if (btn) { btn.click(); return true; }
-    }
-    if (!cmd || cmd.type !== 'hidden') {
-      cmd = document.createElement('input'); cmd.type = 'hidden'; cmd.name = 'command'; form.appendChild(cmd);
-    }
-    cmd.value = value;
+    if (!cmd) { cmd = document.createElement('input'); cmd.type = 'hidden'; cmd.name = 'command'; form.appendChild(cmd); }
+    cmd.value = 'additem';
     form.submit();
-    return true;
   }
 
-  function fill(section) {
-    const n = idxOf(section);
-    const q = (name) => form.querySelector(`[name="${name}"]`);
-    const radio = form.querySelector(`input[name="sreq1[${n}].rtype"][value="${state.rtype}"]`);
-    if (radio) radio.checked = true;
-    const bc = q(`reqProductCode[${n}]`);
-    if (bc) bc.value = state.rtype === 'new' ? '' : state.base_code.toUpperCase();
-    section.value = renderNote();   // the browser submits textarea text with CRLF, which is what MMS wants
+  const q = (name) => form.querySelector(`[name="${name}"]`);
+
+  /* Next-action-by and the until-date only exist on an item that has been
+     requested, so they are set on the page MMS returns after Request. */
+  function assign(n) {
     const asg = q(`sreq1[${n}].nextActUserId`);
-    if (asg && state.assignee) asg.value = state.assignee;
+    if (!asg) return false;
+    if (state.assignee) asg.value = state.assignee;
     const pd = q(`sreq1[${n}].prepdateString`);
     let dateNote = '';
     if (pd) {
       const want = prepdate();
       if ([...pd.options].some((o) => o.value === want)) pd.value = want;
-      else dateNote = ` MMS's date list doesn't offer ${want} — pick the nearest in the dropdown.`;
+      else if (want) dateNote = ` MMS's date list doesn't offer ${want} — pick the nearest.`;
     }
+    asg.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    toast(`Item ${n + 1}: next action by and date are set. Check them, then press Save.${dateNote}`);
+    return true;
+  }
+
+  function fill(section) {
+    const n = idxOf(section);
+    const radio = form.querySelector(`input[name="sreq1[${n}].rtype"][value="${state.rtype}"]`);
+    if (radio) radio.checked = true;
+    const bc = q(`reqProductCode[${n}]`);
+    if (bc) bc.value = state.rtype === 'new' ? '' : state.base_code.toUpperCase();
+    section.value = renderNote();   // the browser submits textarea text with CRLF, which is what MMS wants
+    state.writtenTo = n; state.assignPending = n; save();
+    assign(n);                       // in case this item already has the dropdowns
     section.scrollIntoView({ behavior: 'smooth', block: 'center' });
     section.classList.add('nph-flash');
     setTimeout(() => section.classList.remove('nph-flash'), 2400);
-    toast(`Item ${n + 1} is filled in. Check it, then press Save in MMS.${dateNote}`);
-    render();   // the button now reads 'Add item + write' — that item is taken
+    if (!q(`sreq1[${n}].nextActUserId`)) {
+      toast(`Item ${n + 1} is filled in. Check it, then press that item's Request button in MMS — I'll set next action by and the date on the page that comes back.`);
+    }
+    render();
   }
 
   let toastEl = null;
@@ -322,13 +379,13 @@
     if (act === 'copy') { navigator.clipboard.writeText(renderNote()).then(() => toast('Note copied.')); return; }
     if (act === 'write') {
       if (gaps().length) return;
-      const empty = emptySection();
-      if (empty) { fill(empty); return; }
-      // No empty item yet: add one through MMS's own Add Item, then fill it
-      // after the page comes back (the page reloads on every command).
+      const target = openItem();
+      if (target) { fill(target); return; }
+      // No unrequested item yet: add one through MMS's own Add Item, then
+      // fill it after the page comes back (the page reloads on every command).
       state.pendingWrite = true; save();
       toast('Adding an item to the SR…');
-      setCommand('additem');
+      addItem();
     }
   });
 
@@ -338,11 +395,15 @@
       Object.assign(state, keep);
       state.src = { ...state.src, ...(prev.src || {}) };
     }
+    if (state.writtenTo != null && !notes().some((t) => idxOf(t) === state.writtenTo)) state.writtenTo = null;
     render();
     if (state.pendingWrite) {
       state.pendingWrite = false; save();
       const empty = emptySection();
       if (empty) fill(empty); else toast('MMS did not add an empty item — press Add Item in MMS, then Write again.');
+    } else if (state.assignPending != null) {
+      const n = state.assignPending;
+      if (assign(n)) { state.assignPending = null; save(); }
     }
   });
 })();

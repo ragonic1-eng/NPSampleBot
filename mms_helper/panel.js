@@ -274,7 +274,7 @@
     if (radio) radio.checked = true;
     const bc = q(`reqProductCode[${n}]`);
     if (bc) bc.value = state.rtype === 'new' ? '' : state.base_code.toUpperCase();
-    section.value = renderNote().replace(/\n/g, '\r\n');
+    section.value = renderNote();   // the browser submits textarea text with CRLF, which is what MMS wants
     const asg = q(`sreq1[${n}].nextActUserId`);
     if (asg && state.assignee) asg.value = state.assignee;
     const pd = q(`sreq1[${n}].prepdateString`);
@@ -288,6 +288,7 @@
     section.classList.add('nph-flash');
     setTimeout(() => section.classList.remove('nph-flash'), 2400);
     toast(`Item ${n + 1} is filled in. Check it, then press Save in MMS.${dateNote}`);
+    render();   // the button now reads 'Add item + write' — that item is taken
   }
 
   let toastEl = null;
@@ -304,14 +305,11 @@
     if (k === 'need_by') state.src.need_by = 'you';
     else if (k in state.src) state.src[k] = e.target.value ? 'you' : '';
     save();
-    // re-render only the parts that depend on other fields; keep focus
-    const focus = e.target.dataset.k, pos = e.target.selectionStart;
-    if (k === 'method' || k === 'rtype') { render(); return; }
+    // re-render only the parts that depend on this field, so typing keeps focus
     root.querySelector('.nph-gaps').outerHTML = (() => { const g = gaps(); return `<p class="nph-gaps ${g.length ? 'has' : 'ok'}">${g.length ? `<b>Still missing:</b> ${g.map(esc).join(', ')}` : '<b>Everything R&amp;D needs is here.</b>'}</p>`; })();
     root.querySelector('.nph-preview pre').textContent = renderNote();
     const w = root.querySelector('[data-act="write"]'); const g = gaps();
     w.disabled = !!g.length; w.title = g.length ? 'Fill the missing fields first' : '';
-    void focus; void pos;
   });
   root.addEventListener('change', (e) => { if (e.target.dataset.k === 'method' || e.target.dataset.k === 'bag' || e.target.dataset.k === 'assignee') { state[e.target.dataset.k] = e.target.value; save(); render(); } });
   root.addEventListener('click', (e) => {

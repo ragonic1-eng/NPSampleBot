@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "NP Sample Request Helper",
+  "version": "0.1.0",
+  "description": "On an MMS sample request page: shows what the request needs, fills in what the SR already knows (receiver, contact, address, compliance, bag, budget), and writes a clean note into the new item. You still press Save in MMS.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://www.npsin.com/mms3/*"],
+  "content_scripts": [
+    {
+      "matches": ["http://www.npsin.com/mms3/master/sampleRequestUpdate.do*"],
+      "css": ["panel.css"],
+      "js": ["panel.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+/* NP Sample Request Helper — side panel on the MMS page. NP orange on a
+   white card; the old MMS page stays untouched underneath. */
+#nph-root {
+  position: fixed; top: 12px; right: 12px; z-index: 2147483000; width: 380px; max-height: calc(100vh - 24px);
+  display: flex; flex-direction: column; overflow: hidden;
+  font: 13px/1.45 "Segoe UI", Arial, sans-serif; color: #1a1a1a; background: #fff;
+  border: 1px solid #e5e2dd; border-radius: 12px; box-shadow: 0 8px 30px -10px rgba(0,0,0,.35);
+}
+#nph-root.is-min { width: auto; }
+#nph-root.is-min .nph-body { display: none; }
+#nph-root * { box-sizing: border-box; }
+.nph-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: #000; color: #fff; }
+.nph-head b { font-size: 13px; }
+.nph-head span { flex: 1; font-size: 11px; color: #c9c9c9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nph-min { border: 0; background: #333; color: #fff; width: 24px; height: 24px; border-radius: 6px; cursor: pointer; font-size: 15px; line-height: 1; }
+.nph-body { padding: 10px 12px 12px; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+#nph-root label { display: flex; flex-direction: column; gap: 3px; font-weight: 600; font-size: 12px; }
+#nph-root label em { font-style: normal; font-weight: 500; color: #7a7a7a; font-size: 11px; }
+#nph-root input, #nph-root select, #nph-root textarea {
+  font: inherit; font-size: 13px; padding: 6px 8px; border: 1.5px solid #e5e2dd; border-radius: 8px; background: #f6f5f2; width: 100%;
+}
+#nph-root input:focus, #nph-root select:focus, #nph-root textarea:focus { outline: 0; border-color: #f26522; background: #fff; box-shadow: 0 0 0 3px rgba(242,101,34,.15); }
+.nph-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.nph-src { display: inline-block; margin-left: 4px; font-style: normal; font-weight: 600; font-size: 10px; letter-spacing: .04em; text-transform: uppercase; color: #c74a12; background: #fff1ea; border-radius: 999px; padding: 1px 6px; }
+.nph-seg { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.nph-seg button { border: 1.5px solid #e5e2dd; background: #fff; border-radius: 999px; padding: 4px 11px; font: inherit; font-weight: 600; font-size: 12px; cursor: pointer; }
+.nph-seg button[aria-pressed="true"] { background: #1a1a1a; border-color: #1a1a1a; color: #fff; }
+.nph-code { flex: 1; min-width: 150px; text-transform: uppercase; }
+.nph-prev { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.nph-prev > span { width: 100%; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: #7a7a7a; font-weight: 700; }
+.nph-chip { border: 1.5px dashed #e5e2dd; background: #fff; border-radius: 999px; padding: 2px 9px; font: inherit; font-size: 11px; cursor: pointer; }
+.nph-chip:hover { border-style: solid; border-color: #f26522; color: #c74a12; }
+.nph-note { margin: 0; font-size: 12px; color: #555; background: #f6f5f2; border-radius: 8px; padding: 6px 8px; }
+.nph-gaps { margin: 0; font-size: 12px; padding: 7px 9px; border-radius: 8px; }
+.nph-gaps.has { background: #fff1ea; color: #c74a12; }
+.nph-gaps.ok { background: #eaf7ee; color: #1f6b3a; }
+.nph-preview summary { cursor: pointer; font-size: 12px; font-weight: 600; color: #555; }
+.nph-preview pre { margin: 6px 0 0; font: 11.5px/1.4 Consolas, "Courier New", monospace; white-space: pre-wrap; background: #f6f5f2; border-radius: 8px; padding: 8px; max-height: 220px; overflow: auto; }
+.nph-actions { display: flex; gap: 6px; }
+.nph-btn { flex: 1; border: 1.5px solid #1a1a1a; background: #fff; color: #1a1a1a; border-radius: 999px; padding: 8px 10px; font: inherit; font-weight: 700; font-size: 12px; cursor: pointer; }
+.nph-btn:hover { background: #1a1a1a; color: #fff; }
+.nph-primary { background: #f26522; border-color: #f26522; color: #fff; }
+.nph-primary:hover { background: #c74a12; border-color: #c74a12; }
+.nph-btn:disabled { opacity: .45; cursor: not-allowed; }
+.nph-btn:disabled:hover { background: #f26522; color: #fff; }
+.nph-foot { margin: 0; font-size: 11px; color: #7a7a7a; text-align: center; }
+textarea.nph-flash { outline: 3px solid #f26522 !important; transition: outline 200ms; }
+#nph-toast { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); z-index: 2147483001; background: #1a1a1a; color: #fff; padding: 10px 16px; border-radius: 999px; font: 13px "Segoe UI", Arial, sans-serif; opacity: 0; transition: opacity 180ms, transform 180ms; pointer-events: none; max-width: 80vw; }
+#nph-toast.on { opacity: 1; transform: translate(-50%, 0); }
